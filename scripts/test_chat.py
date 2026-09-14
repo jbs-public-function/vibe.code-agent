@@ -1,67 +1,147 @@
+"""Streaming chat-completion test against the OpenAI-compatible gateway.
+
+Talks to the Phase 2 gateway at http://localhost:8080/v1, which serves every
+registered alias at one fixed port (no per-model ports). Start the control
+plane with `make serve` (or `vibe serve`) and load a model first with
+`vibe load <alias>`.
+"""
+
+import argparse
 import json
 import sys
+import urllib.error
 import urllib.request
 
-from openai import OpenAI
+# The gateway serves every registry alias at one fixed port (ADR-4).
+GATEWAY_URL = "http://localhost:8080/v1"
+DEFAULT_MODEL = "qwen2.5-coder-7b"
 
-# Define local ports mapped in your Makefile
-MODEL_ROSTER = {
-    "8010": "DeepSeek-R1 (14B)",
-    "8020": "Llama-3.1 (8B)",
-    "8030": "Qwen-Coder (7B)",
-}
-
-
-def get_active_client():
-    """Scans local ports and dynamically requests the active model ID from vLLM."""
-    import socket
-
-    # Loop through ports to see which one is actively serving vLLM data
-    for port, friendly_name in MODEL_ROSTER.items():
-        # First check if the port is physically open
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("localhost", int(port))) != 0:
-                continue  # Port is closed, skip to next one
-
-        # Port is open! Let's verify it's actually responding with vLLM model data
-        try:
-            url = f"http://localhost:{port}/v1/models"
-            with urllib.request.urlopen(url, timeout=1) as response:
-                data = json.loads(response.read().decode())
-                exact_model_id = data["data"][0][
-                    "id"
-                ]  # Fixed: read first index of the models data array
-
-            print(f"Connected to: [ {friendly_name} ] on port {port}")
-            print(f"Active Model ID: {exact_model_id}\n")
-
-            return OpenAI(
-                base_url=f"http://localhost:{port}/v1", api_key="local"
-            ), exact_model_id
-        except Exception:
-            # Port was open but didn't return valid vLLM data, look at next port
-            continue
-
-    print("ERROR: No active vLLM containers found. Run 'make <model>' first.")
-    sys.exit(1)
-
-
-# Initialize the active connection dynamically
-client, active_model_repo = get_active_client()
-
-# Your testing prompt
-user_prompt = "Write a bullet-point resume entry describing setting up high-performance local LLM inference engines using vLLM and Docker containers on Linux."
-
-# Stream the tokens in real time
-response = client.chat.completions.create(
-    model=active_model_repo,
-    messages=[{"role": "user", "content": user_prompt}],
-    temperature=0.7,
-    stream=True,
+USER_PROMPT = (
+    "Write a bullet-point resume entry describing setting up high-performance "
+    "local LLM inference engines using vLLM and Docker containers on Linux."
 )
 
-for chunk in response:
-    # Ensure choices exist and the list isn't empty before reading the delta
-    if chunk.choices and chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="", flush=True)
-print("\n")
+
+def active_model():
+    """Return the id of the gateway's active model, or None if there isn't one."""
+    with urllib.request.urlopen(f"{GATEWAY_URL}/models", timeout=10) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    for entry in body.get("data") or []:
+        if entry.get("vibe_active"):
+            return entry.get("id")
+    return None
+
+
+def stream_chat(model):
+    """POST a streaming chat completion and print tokens as they arrive."""
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": USER_PROMPT}],
+            "temperature": 0.7,
+            "stream": True,
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{GATEWAY_URL}/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=30) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or []
+            content = ""
+            if choices and choices[0].get("delta"):
+                content = choices[0]["delta"].get("content") or ""
+            if content:
+                print(content, end="", flush=True)
+    print("\n")
+
+
+def report_http_error(exc):
+    """Print the gateway's JSON error message (if any) plus a status hint."""
+    hints = {
+        503: "model not loaded — run 'vibe load <alias>' or enable VIBE_SWAP_ON_REQUEST",
+        404: "unknown model alias",
+    }
+    message = None
+    try:
+        body = json.loads(exc.read().decode("utf-8"))
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    if message:
+        print(f"ERROR ({exc.code}): {message}")
+    else:
+        print(f"ERROR: gateway returned HTTP {exc.code}")
+    hint = hints.get(exc.code)
+    if hint:
+        print(f"hint: {hint}")
+    return 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stream a test chat through the OpenAI gateway "
+            f"({GATEWAY_URL}); run 'vibe serve' first."
+        )
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "model alias to request (default: the gateway's active model, "
+            f"falling back to {DEFAULT_MODEL})"
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    model = args.model
+    if model is None:
+        try:
+            model = active_model()
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            print(f"ERROR: could not query /v1/models ({exc}). Is 'vibe serve' running?")
+            return 1
+        if model is None:
+            model = DEFAULT_MODEL
+            print(
+                f"no active model found; defaulting to {DEFAULT_MODEL} "
+                "(start one with 'vibe load <alias>')"
+            )
+        else:
+            print(f"Using active model: {model}")
+
+    print(f"Connected to: model '{model}' via the gateway\n")
+    try:
+        stream_chat(model)
+    except urllib.error.HTTPError as exc:
+        return report_http_error(exc)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        print(
+            f"ERROR: no response from the gateway ({exc}). "
+            "Run 'make serve' and 'vibe load <alias>' first."
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

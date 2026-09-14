@@ -1,0 +1,198 @@
+syntax = "proto3";
+
+package vibe.v1;
+
+// ModelController is the single control-plane entry point for vibe (ADR-5).
+// Only the controller process talks to Docker and NVML (XR-5).
+// Additive-only: fields are never renumbered or repurposed (NFR-02.1).
+service ModelController {
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc GetStatus(GetStatusRequest) returns (Status);
+  rpc LoadModel(LoadModelRequest) returns (stream JobEvent);
+  rpc UnloadModel(UnloadModelRequest) returns (stream JobEvent);
+  rpc StreamLogs(StreamLogsRequest) returns (stream LogLine);
+  rpc GetGpuStats(GetGpuStatsRequest) returns (GpuStats);
+  rpc Chat(ChatRequest) returns (stream ChatChunk);
+  rpc ListDownloads(ListDownloadsRequest) returns (ListDownloadsResponse);
+  rpc DownloadModel(DownloadModelRequest) returns (stream DownloadProgress);
+  rpc CancelDownload(CancelDownloadRequest) returns (CancelDownloadResponse);
+
+  // Phase 3 (additive): replay buffered events for a job the caller did not start.
+  rpc GetJobEvents(GetJobEventsRequest) returns (stream JobEvent);
+
+  // Phase 4 (additive): registry / HF-cache management.
+  rpc ReloadRegistry(ReloadRegistryRequest) returns (ReloadRegistryResponse);
+  rpc ListCache(ListCacheRequest) returns (ListCacheResponse);
+  rpc RemoveCached(RemoveCachedRequest) returns (RemoveCachedResponse);
+  rpc ProposeRegistration(ProposeRegistrationRequest) returns (ProposeRegistrationResponse);
+  rpc WriteRegistration(WriteRegistrationRequest) returns (WriteRegistrationResponse);
+}
+
+enum ModelState {
+  MODEL_STATE_UNSPECIFIED = 0;
+  AVAILABLE = 1;
+  LOADING = 2;
+  READY = 3;
+  UNLOADING = 4;
+  ERROR = 5;
+}
+
+message ModelInfo {
+  string alias = 1;
+  string display_name = 2;
+  string hf_repo = 3;
+  string quantization = 4;
+  uint32 max_model_len = 5;
+  float gpu_memory_utilization = 6;
+  uint32 host_port = 7;
+  repeated string tags = 8;
+  string use_case = 9;
+  ModelState state = 10;
+  bool cached_locally = 11;
+}
+
+message ListModelsRequest {}
+message ListModelsResponse { repeated ModelInfo models = 1; }
+
+message GetStatusRequest {}
+message Status {
+  string active_alias = 1;
+  ModelState state = 2;
+  string container_id = 3;
+  uint32 host_port = 4;
+  int64 started_at_unix = 5;
+  Job current_job = 6;
+  string last_error = 7;
+}
+
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  LOAD = 1;
+  UNLOAD = 2;
+  DOWNLOAD = 3;
+}
+
+message Job {
+  string id = 1;
+  JobKind kind = 2;
+  string alias = 3;
+  int64 started_at_unix = 4;
+  bool done = 5;
+  bool ok = 6;
+}
+
+message JobEvent {
+  string job_id = 1;
+  int64 ts_unix_ms = 2;
+  string level = 3;
+  string message = 4;
+  ModelState state = 5;
+  float progress = 6;
+  bool terminal = 7;
+}
+
+message LoadModelRequest {
+  string alias = 1;
+  bool force = 2;
+  bool keep_failed = 3;
+  int32 timeout_s = 4;  // 0 = use VIBE_LOAD_TIMEOUT
+}
+message UnloadModelRequest {}
+message GetJobEventsRequest { string job_id = 1; }
+
+message StreamLogsRequest { int32 tail = 1; bool follow = 2; }
+message LogLine { int64 ts_unix_ms = 1; string line = 2; }
+
+message GetGpuStatsRequest {}
+message GpuProcess { uint32 pid = 1; string name = 2; uint32 used_mib = 3; }
+message GpuStats {
+  uint32 used_mib = 1;
+  uint32 total_mib = 2;
+  uint32 utilization_pct = 3;
+  repeated GpuProcess processes = 4;
+}
+
+message ChatMessage { string role = 1; string content = 2; }
+message ChatRequest {
+  string alias = 1;
+  repeated ChatMessage messages = 2;
+  optional float temperature = 3;
+  optional uint32 max_tokens = 4;
+}
+message ChatChunk {
+  string delta = 1;
+  string finish_reason = 2;
+  uint32 prompt_tokens = 3;
+  uint32 completion_tokens = 4;
+}
+
+message ListDownloadsRequest {}
+message DownloadInfo {
+  string id = 1;
+  string hf_repo = 2;
+  repeated string include = 3;
+  float progress = 4;
+  uint64 bytes_done = 5;
+  uint64 bytes_total = 6;
+  bool done = 7;
+  bool ok = 8;
+  string error = 9;
+}
+message ListDownloadsResponse { repeated DownloadInfo downloads = 1; }
+message DownloadModelRequest {
+  string hf_repo = 1;
+  repeated string include = 2;
+  string revision = 3;
+}
+message DownloadProgress {
+  string id = 1;
+  float progress = 2;
+  uint64 bytes_done = 3;
+  uint64 bytes_total = 4;
+  string current_file = 5;
+  bool terminal = 6;
+  string error = 7;
+}
+message CancelDownloadRequest { string id = 1; }
+message CancelDownloadResponse { bool cancelled = 1; }
+
+// --- Phase 4: registry management ---------------------------------------
+
+message ReloadRegistryRequest {}
+message ReloadRegistryResponse { repeated string errors = 1; }
+
+message RegistrationSpec {
+  string hf_repo = 1;
+  string alias = 2;
+  string quantization = 3;
+  uint32 max_model_len = 4;
+  float gpu_memory_utilization = 5;
+  uint32 host_port = 6;
+  string tool_parser = 7;
+  string use_case = 8;
+  repeated string tags = 9;
+  string display_name = 10;
+}
+message ProposeRegistrationRequest { RegistrationSpec spec = 1; }
+message ProposeRegistrationResponse {
+  ModelInfo model = 1;
+  repeated string warnings = 2;
+  repeated string errors = 3;
+}
+message WriteRegistrationRequest { RegistrationSpec spec = 1; }
+message WriteRegistrationResponse { bool ok = 1; repeated string errors = 2; }
+
+message ListCacheRequest {}
+message CacheEntry {
+  string repo_id = 1;
+  uint64 size_bytes = 2;
+  string last_modified = 3;
+  repeated string aliases = 4;
+}
+message ListCacheResponse {
+  repeated CacheEntry entries = 1;
+  uint64 disk_total_bytes = 2;
+  uint64 disk_free_bytes = 3;
+}
+message RemoveCachedRequest { string repo_id = 1; }
+message RemoveCachedResponse { bool removed = 1; string error = 2; }

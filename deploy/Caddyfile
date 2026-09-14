@@ -1,0 +1,10 @@
+# Optional TLS front for VIBE_BIND widened beyond loopback (ADR-4). Off by
+# default; see `make tls`.
+localhost:8443 {
+	tls internal
+	reverse_proxy 127.0.0.1:8080
+}
+localhost:8444 {
+	tls internal
+	reverse_proxy 127.0.0.1:8081
+}

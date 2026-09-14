@@ -1,0 +1,38 @@
+# Model registry (ADR-2 / XR-3): the single source of truth for model parameters.
+# Never duplicate port/repo/len literals elsewhere. Edited by `vibe register` (Phase 4).
+models:
+  - alias: qwen2.5-coder-7b
+    display_name: Qwen2.5 Coder 7B Instruct (AWQ)
+    hf_repo: Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
+    quantization: awq
+    max_model_len: 32768
+    gpu_memory_utilization: 0.70
+    container_name: vibe-qwen2.5-coder-7b
+    host_port: 8030
+    extra_args: ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
+    use_case: Code generation, repository parsing, Zed agent default
+    tags: [code, tools]
+
+  - alias: llama-3.1-8b
+    display_name: Llama 3.1 8B Instruct (AWQ INT4)
+    hf_repo: hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4
+    quantization: awq
+    max_model_len: 16384
+    gpu_memory_utilization: 0.75
+    container_name: vibe-llama-3.1-8b
+    host_port: 8020
+    extra_args: ["--enable-auto-tool-choice", "--tool-call-parser", "llama3_json"]
+    use_case: Writing, brainstorming, general chat
+    tags: [general, tools, gated]
+
+  - alias: deepseek-r1-14b
+    display_name: DeepSeek R1 Distill Qwen 14B (AWQ)
+    hf_repo: casperhansen/DeepSeek-R1-Distill-Qwen-14B-AWQ
+    quantization: awq
+    max_model_len: 7984
+    gpu_memory_utilization: 0.85
+    container_name: vibe-deepseek-r1-14b
+    host_port: 8010
+    extra_args: []
+    use_case: Deep reasoning, logic problems
+    tags: [reasoning]

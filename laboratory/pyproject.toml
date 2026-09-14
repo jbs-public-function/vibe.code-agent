@@ -1,0 +1,9 @@
+# Phase 5 (05-laboratory-workflow.md) will flesh this out with a real package,
+# torch extras, and script entry points. For now this makes `laboratory/` a valid
+# (virtual) uv workspace member so `uv sync` at the repo root succeeds.
+[project]
+name = "vibe-laboratory"
+version = "0.1.0"
+description = "Fine-tuning and distillation experiments for vibe (Phase 5)"
+requires-python = ">=3.12"
+dependencies = []

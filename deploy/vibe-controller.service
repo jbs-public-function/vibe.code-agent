@@ -1,0 +1,20 @@
+# vibe model controller (gRPC) — systemd USER unit.
+#
+# Install and start with:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vibe-controller
+#
+# Follow logs with:   journalctl --user -u vibe-controller -f
+# Check status with:  systemctl --user status vibe-controller
+
+[Unit]
+Description=vibe model controller (gRPC)
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jamesb/projects/vibe.code-agent
+ExecStart=/home/jamesb/projects/vibe.code-agent/.venv/bin/vibe serve --only controller
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
