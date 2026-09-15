@@ -1,6 +1,6 @@
 # 05 — Laboratory Workflow
 
-> Phase 5 · Depends on: 00-foundation, 03-openai-gateway, 04-model-scripts · Status: Planned
+> Phase 5 · Depends on: 00-foundation, 03-openai-gateway, 04-model-scripts · Status: Implemented
 
 ## Summary
 
@@ -146,13 +146,13 @@ Makefile                  # + lab, lab-run, lab-build targets
 
 ## Task breakdown
 
-- [ ] **M5.1 — Workspace + container (M)**: root workspace config, `laboratory/pyproject.toml` with cu12x index, `Dockerfile`, `make lab|lab-run|lab-build`, `.gitignore`/`.dockerignore`, verify root `uv sync` stays torch-free.
-- [ ] **M5.2 — common.py + download.py + inference_hf.py (M)**: run dirs, VRAM guard, serving guard, streaming generate, metrics; validate on Qwen2.5-Coder-1.5B (bf16) and 7B (4-bit).
-- [ ] **M5.3 — inference_gguf.py (S)**: `transformers gguf_file=` path and `llama-cpp-python` path; validate on the Phase 4 Q4_K_M download.
-- [ ] **M5.4 — finetune_lora.py (L)**: TRL SFT with PEFT, QLoRA config (nf4, double quant, bf16 compute), gradient checkpointing, checkpoint resume, JSONL formats; smoke run on 1.5B with 200 samples.
-- [ ] **M5.5 — distill.py (M)**: gateway client with concurrency 4, resumable teacher cache, then SFT via M5.4; `--auto-swap` orchestration through `vibe` CLI.
-- [ ] **M5.6 — export.py (M)**: merge_and_unload → safetensors, optional AWQ via autoawq with CPU offload, `--register` → `vibe register <abs path>`; ensure vLLM container mounts `laboratory/models` read-only when `hf_repo` is a local path (small change in `docker_ctl.start`).
-- [ ] **M5.7 — Docs + examples (S)**: `laboratory/README.md`, an end-to-end example (1.5B QLoRA on a tiny coding-style dataset → export → register → Zed).
+- [x] **M5.1 — Workspace + container (M)**: root workspace config, `laboratory/pyproject.toml` with cu12x index, `Dockerfile`, `make lab|lab-run|lab-build`, `.gitignore`/`.dockerignore`, verify root `uv sync` stays torch-free.
+- [x] **M5.2 — common.py + download.py + inference_hf.py (M)**: run dirs, VRAM guard, serving guard, streaming generate, metrics; validate on Qwen2.5-Coder-1.5B (bf16) and 7B (4-bit).
+- [x] **M5.3 — inference_gguf.py (S)**: `transformers gguf_file=` path and `llama-cpp-python` path; validate on the Phase 4 Q4_K_M download.
+- [x] **M5.4 — finetune_lora.py (L)**: TRL SFT with PEFT, QLoRA config (nf4, double quant, bf16 compute), gradient checkpointing, checkpoint resume, JSONL formats; smoke run on 1.5B with 200 samples.
+- [x] **M5.5 — distill.py (M)**: gateway client with concurrency 4, resumable teacher cache, then SFT via M5.4; `--auto-swap` orchestration through `vibe` CLI.
+- [x] **M5.6 — export.py (M)**: merge_and_unload → safetensors, optional AWQ via autoawq with CPU offload, `--register` → `vibe register <abs path>`; ensure vLLM container mounts `laboratory/models` read-only when `hf_repo` is a local path (small change in `docker_ctl.start`).
+- [x] **M5.7 — Docs + examples (S)**: `laboratory/README.md`, an end-to-end example (1.5B QLoRA on a tiny coding-style dataset → export → register → Zed).
 
 ## Acceptance criteria
 

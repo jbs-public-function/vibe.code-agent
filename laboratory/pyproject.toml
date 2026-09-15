@@ -1,9 +1,30 @@
-# Phase 5 (05-laboratory-workflow.md) will flesh this out with a real package,
-# torch extras, and script entry points. For now this makes `laboratory/` a valid
-# (virtual) uv workspace member so `uv sync` at the repo root succeeds.
 [project]
 name = "vibe-laboratory"
 version = "0.1.0"
-description = "Fine-tuning and distillation experiments for vibe (Phase 5)"
+description = "Fine-tuning, distillation, and model export experiments for vibe (Phase 5)"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "torch",
+    "transformers",
+    "accelerate",
+    "peft",
+    "trl",
+    "datasets",
+    "bitsandbytes",
+    "autoawq==0.2.7.post3",
+    "autoawq-kernels==0.0.9",
+    "huggingface-hub",
+    "safetensors",
+    "httpx",
+]
+
+[project.optional-dependencies]
+llamacpp = ["llama-cpp-python"]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }

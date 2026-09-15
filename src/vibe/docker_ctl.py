@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from pathlib import Path
 
 import docker
 import docker.errors
@@ -54,6 +55,28 @@ class ReadinessTimeout(DockerError):
     def __init__(self, message: str, last_logs: str = "") -> None:
         self.last_logs = last_logs
         super().__init__(message)
+
+
+def volumes_for(spec: ModelSpec, hf_home: Path) -> dict[str, dict[str, str]]:
+    """Bind mounts for a model container (FR-00.9, M5.6).
+
+    Always mounts the shared HF cache read-write at
+    `/root/.cache/huggingface`. When `spec.hf_repo` is an absolute local
+    path (vibe register allows absolute paths under `laboratory/models/`),
+    that exact path is additionally mounted read-only at the same location
+    inside the container so vLLM can read the exported model. Repo ids
+    (`org/name`) and relative/`~` paths are treated as repo ids and get no
+    extra mount.
+    """
+    volumes: dict[str, dict[str, str]] = {
+        str(hf_home): {"bind": "/root/.cache/huggingface", "mode": "rw"}
+    }
+    if spec.hf_repo.startswith("/"):
+        path = Path(spec.hf_repo).resolve()
+        if not path.exists():
+            raise DockerError(f"local model path not found: {path}")
+        volumes[str(path)] = {"bind": str(path), "mode": "ro"}
+    return volumes
 
 
 # -- adapter ------------------------------------------------------------
@@ -176,12 +199,7 @@ class DockerCtl:
                     docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                 ],
                 ipc_mode="host",
-                volumes={
-                    str(self.settings.hf_home): {
-                        "bind": "/root/.cache/huggingface",
-                        "mode": "rw",
-                    }
-                },
+                volumes=volumes_for(spec, self.settings.hf_home),
                 environment=(
                     {"HF_TOKEN": self.settings.hf_token}
                     if self.settings.hf_token

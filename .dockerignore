@@ -1,0 +1,16 @@
+# Build context is the repo root (see `make lab-build`); the image only needs
+# the two pyproject.toml files and uv.lock, so keep everything else out of the
+# context (FR-05.11). Never exclude uv.lock — the build is --frozen.
+.git
+.venv
+.uv-cache
+.pip-cache
+laboratory/models
+laboratory/data
+laboratory/runs
+__pycache__
+*.pyc
+tests
+deploy
+.env
+.zed

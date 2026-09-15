@@ -13,6 +13,13 @@ UV ?= uv run vibe
 # Python entry point for scripts (e.g. scripts/test_chat.py).
 PY ?= uv run python
 
+# Laboratory container (FR-05.2): image name and pinned pytorch base tag
+# (NFR-05.2), both overridable via .env. Host HF cache dir (ADR-8) follows
+# VIBE_DATA_DIR from .env and falls back to ~/.cache/huggingface.
+LAB_IMAGE ?= vibe-lab
+LAB_IMAGE_TAG ?= 2.7.1-cuda12.6-cudnn9-devel
+LAB_HF ?= $(if $(VIBE_DATA_DIR),$(VIBE_DATA_DIR),$(HOME)/.cache/huggingface)
+
 # Default target
 .PHONY: help
 help:
@@ -33,6 +40,9 @@ help:
 	@echo "  make chat        - Stream a test chat through the gateway (8080)"
 	@echo "  make tls         - Optional TLS front; requires Docker"
 	@echo "  make proto       - Regenerate committed gRPC code from proto/vibe/v1/control.proto"
+	@echo "  make lab         - Open a shell in the laboratory container (torch + CUDA)"
+	@echo "  make lab-build   - Build the laboratory image (pinned pytorch base)"
+	@echo "  make lab-run CMD=\"python inference_hf.py --model Qwen/Qwen2.5-Coder-1.5B-Instruct --prompt hi\" - Run a lab script"
 
 # Targets delegate to the vibe CLI (chat/tls run a test script / Caddy).
 .PHONY: qwen llama deepseek stop status logs validate list kill-ghosts serve chat tls admin
@@ -49,6 +59,16 @@ admin:     ; xdg-open http://localhost:8081
 chat:      ; $(PY) scripts/test_chat.py --model qwen2.5-coder-7b
 tls:       ; docker run -d --name vibe-caddy --network host -v $$(pwd)/deploy/Caddyfile:/etc/caddy/Caddyfile caddy:2-alpine
 kill-ghosts: stop
+
+# Laboratory (FR-05.2/05.3): build the pinned pytorch image, drop into a shell
+# or run one lab script with the host laboratory/ bind-mounted at /lab and the
+# shared HF cache mounted at /root/.cache/huggingface (ADR-8). `-e HF_TOKEN`
+# forwards the token only when it is set in make's environment (.env exports
+# it); unset is fine for non-gated repos.
+.PHONY: lab-build lab lab-run
+lab-build: ; docker build -f laboratory/Dockerfile --build-arg LAB_IMAGE_TAG=$(LAB_IMAGE_TAG) -t $(LAB_IMAGE) .
+lab:      ; docker run --rm -it --gpus all --ipc=host -v $$(pwd)/laboratory:/lab -w /lab -e PATH=/workspace/.venv/bin:$$PATH -e HF_TOKEN -v $(LAB_HF):/root/.cache/huggingface $(LAB_IMAGE)
+lab-run:  ; docker run --rm --gpus all --ipc=host -v $$(pwd)/laboratory:/lab -w /lab -e PATH=/workspace/.venv/bin:$$PATH -e HF_TOKEN -v $(LAB_HF):/root/.cache/huggingface $(LAB_IMAGE) $(CMD)
 
 # Regenerate the committed codegen (NFR-02.2). Run this after editing
 # proto/vibe/v1/control.proto; `make proto` must leave the tree clean.
