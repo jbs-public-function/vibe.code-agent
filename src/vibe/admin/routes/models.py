@@ -24,6 +24,7 @@ from vibe.admin.routes import (
     start_background_job,
 )
 from vibe.client import ControllerUnavailable
+from vibe.gen.vibe.v1 import control_pb2
 from vibe.jobs import JobInProgress
 
 router = APIRouter()
@@ -36,6 +37,15 @@ async def models_page(request: Request) -> Response:
     infos = await grpc(client.list_models())
     status = await grpc(client.status())
     controller_down = infos is None or status is None
+    # FR-04.9: uncached, non-loading models get a Download button that POSTs
+    # into the /developer download flow.
+    downloadable: set[str] = set()
+    if infos is not None:
+        downloadable = {
+            info.alias
+            for info in infos
+            if not info.cached_locally and info.state != control_pb2.LOADING
+        }
     return render(
         request,
         "models.html",
@@ -44,6 +54,7 @@ async def models_page(request: Request) -> Response:
             "controller_down": controller_down,
             "infos": infos if infos is not None else [],
             "active_alias": status.active_alias if status is not None else "",
+            "downloadable": downloadable,
         },
     )
 

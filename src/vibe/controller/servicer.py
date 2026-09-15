@@ -1,11 +1,14 @@
-"""gRPC `vibe.v1.ModelController` servicer — the control plane (Phase 1).
+"""gRPC `vibe.v1.ModelController` servicer — the control plane (Phases 1, 4).
 
 Wraps the Phase-0 `JobRunner`, `docker_ctl`, and `gpu` modules in a
-`grpc.aio` service (FR-02.1–FR-02.8). Every blocking Docker call runs
-through `asyncio.to_thread` (NFR-02.3); long job streams emit a debug
-heartbeat at least every 10 s (NFR-02.5); a client cancelling `LoadModel` or
-`UnloadModel` never aborts the job (FR-02.11) — the job runs as an
-independent task and the RPC stream merely subscribes to its fan-out queue.
+`grpc.aio` service (FR-02.1–FR-02.8), plus the Phase-4 download/cache
+managers (M4.1/M4.3) and registry registration/reload RPCs (M4.4). Every
+blocking Docker call runs through `asyncio.to_thread` (NFR-02.3); long job
+streams emit a debug heartbeat at least every 10 s (NFR-02.5); a client
+cancelling `LoadModel` or `UnloadModel` never aborts the job (FR-02.11) —
+the job runs as an independent task and the RPC stream merely subscribes
+to its fan-out queue. Downloads follow the same pattern: they live in the
+`DownloadManager`, never in the RPC stream (FR-04.1).
 
 This module never imports `docker` or `pynvml` (XR-5): the test fakes are
 plain duck-typed stand-ins.
@@ -20,19 +23,21 @@ import sys
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, cast
 
 import grpc
 import httpx
+from pydantic import ValidationError
 
 from vibe.config import Settings
+from vibe.controller.cache import CacheScanner
+from vibe.controller.downloads import DownloadManager
 from vibe.controller.logbuffer import RingBuffer
 from vibe.docker_ctl import DockerCtl, DockerError
 from vibe.gen.vibe.v1 import control_pb2, control_pb2_grpc
 from vibe.gpu import GpuStats
 from vibe.jobs import JobEvent, JobInProgress, JobRunner, JobState
-from vibe.registry import Registry
+from vibe.registry import ModelSpec, Registry
 
 # Job streams emit a debug heartbeat at least this often (NFR-02.5).
 HEARTBEAT_SECONDS = 10.0
@@ -139,12 +144,34 @@ def _container_status_to_proto(status: Any) -> control_pb2.ModelState:
     return control_pb2.ERROR
 
 
-def _cached_flags(hf_home: Path, repos: list[str]) -> list[bool]:
-    """Which HF hub snapshots exist locally (blocking — run in a thread)."""
-    return [
-        (hf_home / "hub" / f"models--{repo.replace('/', '--')}").is_dir()
-        for repo in repos
-    ]
+def _registration_spec_to_dict(spec: control_pb2.RegistrationSpec) -> dict[str, Any]:
+    """Map the proto `RegistrationSpec` to a propose/write dict (FR-04.5).
+
+    Empty strings and zero numbers mean "auto"/unset and are omitted so the
+    registry-side defaults apply.
+    """
+    data: dict[str, Any] = {}
+    if spec.hf_repo:
+        data["hf_repo"] = spec.hf_repo
+    if spec.alias:
+        data["alias"] = spec.alias
+    if spec.quantization:
+        data["quantization"] = spec.quantization
+    if spec.max_model_len:
+        data["max_model_len"] = int(spec.max_model_len)
+    if spec.gpu_memory_utilization:
+        data["gpu_memory_utilization"] = float(spec.gpu_memory_utilization)
+    if spec.host_port:
+        data["host_port"] = int(spec.host_port)
+    if spec.tool_parser:
+        data["tool_parser"] = spec.tool_parser
+    if spec.use_case:
+        data["use_case"] = spec.use_case
+    if spec.tags:
+        data["tags"] = list(spec.tags)
+    if spec.display_name:
+        data["display_name"] = spec.display_name
+    return data
 
 
 class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
@@ -165,6 +192,8 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         self.docker = docker
         self.gpu_fn = gpu_fn
         self.buffer = buffer
+        self.downloads = DownloadManager(settings)
+        self.cache = CacheScanner(settings.hf_home)
         self.last_error = ""
         self._job_events: OrderedDict[str, deque[JobEvent]] = OrderedDict()
 
@@ -191,12 +220,10 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         job = self.runner.current_job()
 
         specs = self.registry.all()
-        cached = await asyncio.to_thread(
-            _cached_flags, self.settings.hf_home, [spec.hf_repo for spec in specs]
-        )
+        cached_ids = await asyncio.to_thread(self._cached_repo_ids)
 
         response = control_pb2.ListModelsResponse()
-        for spec, is_cached in zip(specs, cached):
+        for spec in specs:
             state = control_pb2.AVAILABLE
             if active_alias is not None and spec.alias == active_alias:
                 # `info["alias"]` is the container's `vibe.alias` label.
@@ -218,8 +245,16 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
             model.tags.extend(spec.tags)
             model.use_case = spec.use_case
             model.state = state
-            model.cached_locally = is_cached
+            model.cached_locally = spec.hf_repo in cached_ids
         return response
+
+    def _cached_repo_ids(self) -> set[str]:
+        """HF-hub repo ids with a local snapshot (M4.3, FR-04.9).
+
+        Fed by the same `CacheScanner` used by `ListCache` so the two
+        views never disagree; scan errors degrade to an empty set.
+        """
+        return {repo.repo_id for repo in self.cache.scan()}
 
     async def GetStatus(self, request, context):
         """Active model, container, in-flight job and last error (FR-02.2)."""
@@ -677,44 +712,134 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         for event in events:
             yield to_proto(event, request.job_id)
 
-    # -- deferred RPCs (Phase 4) --------------------------------------------
+    # -- downloads (Phase 4, M4.1) -------------------------------------------
 
     async def ListDownloads(self, request, context):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "downloads land in Phase 4"
-        )
+        """In-flight plus the last 20 completed downloads (FR-04.2)."""
+        response = control_pb2.ListDownloadsResponse()
+        for handle in self.downloads.list():
+            info = response.downloads.add()
+            info.id = handle.id
+            info.hf_repo = handle.hf_repo
+            info.include.extend(handle.include)
+            info.progress = handle.progress
+            info.bytes_done = handle.bytes_done
+            info.bytes_total = handle.bytes_total
+            info.done = handle.done
+            info.ok = handle.ok
+            info.error = handle.error
+        return response
 
     async def DownloadModel(self, request, context):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "downloads land in Phase 4"
-        )
+        """Stream one download's progress until its terminal event (FR-04.1).
+
+        The download lives in the `DownloadManager`, not this RPC: a client
+        disconnect never aborts it (FR-02.11 semantics), and a duplicate
+        request for an in-flight repo attaches to the same download.
+        """
+        try:
+            handle = self.downloads.start(
+                request.hf_repo,
+                list(request.include) or None,
+                request.revision or None,
+            )
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            return
+        async for progress in self.downloads.events(handle):
+            yield control_pb2.DownloadProgress(
+                id=progress.id,
+                progress=progress.progress,
+                bytes_done=progress.bytes_done,
+                bytes_total=progress.bytes_total,
+                current_file=progress.current_file,
+                terminal=progress.terminal,
+                error=progress.error,
+            )
 
     async def CancelDownload(self, request, context):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "downloads land in Phase 4"
+        """Cancel one download cooperatively; partial files stay (FR-04.2)."""
+        return control_pb2.CancelDownloadResponse(
+            cancelled=self.downloads.cancel(request.id)
         )
 
-    async def ReloadRegistry(self, request, context):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "registry management lands in Phase 4"
-        )
+    # -- HF cache (Phase 4, M4.3) -------------------------------------------
 
     async def ListCache(self, request, context):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "cache management lands in Phase 4"
+        """Cached repos, sizes, registry aliases, and disk space (FR-04.4)."""
+        repos = await asyncio.to_thread(self.cache.list, self.registry)
+        total, free = await asyncio.to_thread(self.cache.disk_usage)
+        response = control_pb2.ListCacheResponse(
+            disk_total_bytes=total, disk_free_bytes=free
         )
+        for repo in repos:
+            entry = response.entries.add()
+            entry.repo_id = repo.repo_id
+            entry.size_bytes = repo.size_bytes
+            entry.last_modified = repo.last_modified
+            entry.aliases.extend(repo.aliases)
+        return response
 
     async def RemoveCached(self, request, context):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "cache management lands in Phase 4"
-        )
+        """Remove one repo's cache dir; idempotent (FR-04.4)."""
+        removed, error = await asyncio.to_thread(self.cache.remove, request.repo_id)
+        return control_pb2.RemoveCachedResponse(removed=removed, error=error)
+
+    # -- registry management (Phase 4, M4.4) ---------------------------------
+
+    async def ReloadRegistry(self, request, context):
+        """Re-read models.yaml; errors leave the live registry untouched
+        (FR-04.6, validate-before-swap)."""
+        errors = await asyncio.to_thread(self.registry.reload)
+        return control_pb2.ReloadRegistryResponse(errors=list(errors))
 
     async def ProposeRegistration(self, request, context):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "registration lands in Phase 4"
+        """Dry-run a registration: fill defaults, list warnings/errors
+        (FR-04.5)."""
+        data = _registration_spec_to_dict(request.spec)
+        return await asyncio.to_thread(self._propose, data)
+
+    def _propose(self, data: dict[str, Any]) -> control_pb2.ProposeRegistrationResponse:
+        """Blocking half of `ProposeRegistration` (runs in a worker thread)."""
+        entry, warnings, errors = self.registry.propose(data, self.cache)
+        response = control_pb2.ProposeRegistrationResponse(
+            warnings=list(warnings), errors=list(errors)
         )
+        try:
+            spec = ModelSpec.model_validate(entry)
+        except ValidationError:
+            return response  # incomplete entry — the errors carry the details
+        model = response.model
+        model.alias = spec.alias
+        model.display_name = spec.display_name
+        model.hf_repo = spec.hf_repo
+        model.quantization = spec.quantization
+        model.max_model_len = spec.max_model_len
+        model.gpu_memory_utilization = spec.gpu_memory_utilization
+        model.host_port = spec.host_port
+        model.tags.extend(spec.tags)
+        model.use_case = spec.use_case
+        model.state = control_pb2.AVAILABLE
+        model.cached_locally = self.cache.is_cached(spec.hf_repo)
+        return response
 
     async def WriteRegistration(self, request, context):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "registration lands in Phase 4"
+        """Append a validated entry to models.yaml, then reload it (FR-04.5/
+        FR-04.6) so the controller sees the new alias immediately.
+
+        Defaults are filled exactly like `ProposeRegistration` (the proto
+        spec carries no container_name/port fields), then the completed
+        entry is validated against the on-disk registry and appended
+        atomically.
+        """
+        data = _registration_spec_to_dict(request.spec)
+        entry, warnings, errors = await asyncio.to_thread(
+            self.registry.propose, data, self.cache
+        )
+        if not errors:
+            errors = await asyncio.to_thread(self.registry.write_entry, entry)
+        if not errors:
+            errors.extend(await asyncio.to_thread(self.registry.reload))
+        return control_pb2.WriteRegistrationResponse(
+            ok=not errors, errors=list(errors)
         )

@@ -9,6 +9,7 @@ composed FastAPI app. Streaming assertions drive the ASGI app directly with a
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, cast, override
@@ -66,6 +67,51 @@ def make_event(
     )
 
 
+def make_download_info(
+    download_id: str,
+    repo: str,
+    *,
+    done: bool = False,
+    ok: bool = True,
+    error: str = "",
+    progress: float = 0.5,
+    bytes_done: int = 500,
+    bytes_total: int = 1000,
+) -> control_pb2.DownloadInfo:
+    return control_pb2.DownloadInfo(
+        id=download_id,
+        hf_repo=repo,
+        include=["*.gguf"],
+        progress=progress,
+        bytes_done=bytes_done,
+        bytes_total=bytes_total,
+        done=done,
+        ok=ok,
+        error=error,
+    )
+
+
+def make_download_progress(
+    download_id: str,
+    *,
+    progress: float = 0.5,
+    bytes_done: int = 500,
+    bytes_total: int = 1000,
+    current_file: str = "model-00001.safetensors",
+    terminal: bool = False,
+    error: str = "",
+) -> control_pb2.DownloadProgress:
+    return control_pb2.DownloadProgress(
+        id=download_id,
+        progress=progress,
+        bytes_done=bytes_done,
+        bytes_total=bytes_total,
+        current_file=current_file,
+        terminal=terminal,
+        error=error,
+    )
+
+
 class FakeControllerClient(ControllerClient):
     """Scriptable in-memory controller implementing the whole client contract.
 
@@ -98,6 +144,32 @@ class FakeControllerClient(ControllerClient):
         self.chat_chunks: list[control_pb2.ChatChunk] = []
         self.chat_error: Exception | None = None
         self.chat_calls: list[dict[str, Any]] = []
+        self.download_infos: list[control_pb2.DownloadInfo] = []
+        self.downloads_error: Exception | None = None
+        self.download_script: list[control_pb2.DownloadProgress] = []
+        self.download_error: Exception | None = None
+        self.download_calls: list[tuple[str, list[str], str | None]] = []
+        self.download_consumed: list[control_pb2.DownloadProgress] = []
+        self.cancel_calls: list[str] = []
+        self.cancel_error: Exception | None = None
+        self.cache_value: control_pb2.ListCacheResponse = control_pb2.ListCacheResponse()
+        self.cache_error: Exception | None = None
+        self.remove_calls: list[str] = []
+        self.remove_result: tuple[bool, str] = (True, "")
+        self.remove_error: Exception | None = None
+        self.reload_errors: list[str] = []
+        self.reload_error: Exception | None = None
+        self.reload_calls: int = 0
+        self.propose_response: control_pb2.ProposeRegistrationResponse = (
+            control_pb2.ProposeRegistrationResponse()
+        )
+        self.propose_error: Exception | None = None
+        self.propose_calls: list[control_pb2.RegistrationSpec] = []
+        self.write_response: control_pb2.WriteRegistrationResponse = (
+            control_pb2.WriteRegistrationResponse(ok=True)
+        )
+        self.write_error: Exception | None = None
+        self.write_calls: list[control_pb2.RegistrationSpec] = []
         self.closed = False
 
     @override
@@ -197,6 +269,65 @@ class FakeControllerClient(ControllerClient):
     async def close(self) -> None:
         self.closed = True
         await super().close()
+
+    # Phase 4 client contract (FR-04.3..04.5): added by the controller half;
+    # mirrored here with the exact signatures so the admin routes type-check.
+    async def list_downloads(self) -> list[control_pb2.DownloadInfo]:
+        if self.downloads_error is not None:
+            raise self.downloads_error
+        return list(self.download_infos)
+
+    async def download(
+        self,
+        hf_repo: str,
+        include: Sequence[str] | None = None,
+        revision: str | None = None,
+    ) -> AsyncIterator[control_pb2.DownloadProgress]:
+        self.download_calls.append((hf_repo, list(include or []), revision))
+        if self.download_error is not None:
+            raise self.download_error
+        for event in self.download_script:
+            self.download_consumed.append(event)
+            yield event
+
+    async def cancel_download(self, download_id: str) -> bool:
+        self.cancel_calls.append(download_id)
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        return True
+
+    async def list_cache(self) -> control_pb2.ListCacheResponse:
+        if self.cache_error is not None:
+            raise self.cache_error
+        return self.cache_value
+
+    async def remove_cached(self, repo_id: str) -> tuple[bool, str]:
+        self.remove_calls.append(repo_id)
+        if self.remove_error is not None:
+            raise self.remove_error
+        return self.remove_result
+
+    async def reload_registry(self) -> list[str]:
+        self.reload_calls += 1
+        if self.reload_error is not None:
+            raise self.reload_error
+        return list(self.reload_errors)
+
+    async def propose_registration(
+        self, spec: control_pb2.RegistrationSpec
+    ) -> control_pb2.ProposeRegistrationResponse:
+        self.propose_calls.append(spec)
+        if self.propose_error is not None:
+            raise self.propose_error
+        return self.propose_response
+
+    async def write_registration(
+        self, spec: control_pb2.RegistrationSpec
+    ) -> control_pb2.WriteRegistrationResponse:
+        self.write_calls.append(spec)
+        if self.write_error is not None:
+            raise self.write_error
+        return self.write_response
 
 
 def populated_fake() -> FakeControllerClient:
@@ -669,3 +800,274 @@ async def test_health_reports_controller_state() -> None:
         fake.status_error = ControllerUnavailable("down")
         down = await client.get("/health")
         assert down.json() == {"admin": "ok", "controller": "down"}
+
+
+# -- developer page (FR-04.7, FR-04.9) ---------------------------------------
+
+
+async def test_developer_page_shows_downloads_cache_disk_and_zed(monkeypatch) -> None:
+    fake = populated_fake()
+    fake.download_infos = [
+        make_download_info("dl-1", "org/repo-a"),
+        make_download_info("dl-2", "org/repo-b", done=True, ok=True, progress=1.0),
+    ]
+    fake.cache_value = control_pb2.ListCacheResponse(
+        entries=[
+            control_pb2.CacheEntry(
+                repo_id="org/repo-a",
+                size_bytes=3 * 1024**3,
+                last_modified="2026-09-15 10:00",
+                aliases=["qwen2.5-coder-7b"],
+            )
+        ],
+        disk_total_bytes=512 * 1024**3,
+        disk_free_bytes=100 * 1024**3,
+    )
+    monkeypatch.setattr(
+        "vibe.admin.routes.developer.zed_settings_json",
+        lambda models: json.dumps(
+            {"profiles": {"vibe-local": {"models": [m.alias for m in models]}}}
+        ),
+    )
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/developer")
+    text = response.text
+    assert response.status_code == 200
+    assert "dl-1" in text and "org/repo-a" in text and "org/repo-b" in text
+    assert "DONE" in text and "DOWNLOADING" in text
+    assert "3.0 GiB" in text
+    assert "512.0 GiB total / 100.0 GiB free" in text
+    assert "qwen2.5-coder-7b" in text
+    assert "vibe-local" in text
+    assert "<script" not in text
+
+
+async def test_start_download_redirects_and_background_drains() -> None:
+    fake = FakeControllerClient()
+    fake.download_script = [
+        make_download_progress("dl-9", progress=0.0, bytes_done=0, current_file="a.safetensors"),
+        make_download_progress("dl-9", progress=1.0, bytes_done=1000, terminal=True, current_file=""),
+    ]
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/developer/downloads",
+            data={"repo": "org/repo", "include": "*.gguf\n*.json", "revision": "main"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert response.headers["location"] == "/developer/downloads/dl-9"
+        # The download keeps draining after the HTTP response is done (FR-04.7a).
+        for _ in range(200):
+            if len(fake.download_consumed) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert len(fake.download_consumed) == 2
+        assert fake.download_calls == [("org/repo", ["*.gguf", "*.json"], "main")]
+
+
+async def test_start_download_without_repo_flashes() -> None:
+    fake = FakeControllerClient()
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/developer/downloads", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/developer"
+    assert fake.download_calls == []
+
+
+async def test_download_page_refreshes_until_done_then_cancel() -> None:
+    fake = FakeControllerClient()
+    fake.download_infos = [
+        make_download_info(
+            "dl-1", "org/repo", progress=0.45, bytes_done=450, bytes_total=1000
+        )
+    ]
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        running = await client.get("/developer/downloads/dl-1")
+        assert '<meta http-equiv="refresh" content="2">' in running.text
+        assert "bar-45" in running.text
+        assert "450 / 1,000" in running.text
+        # Once done the refresh stops and the success block shows.
+        fake.download_infos = [
+            make_download_info(
+                "dl-1", "org/repo", done=True, ok=True, progress=1.0,
+                bytes_done=1000, bytes_total=1000,
+            )
+        ]
+        done = await client.get("/developer/downloads/dl-1")
+        assert 'http-equiv="refresh"' not in done.text
+        assert "Download finished successfully" in done.text
+        # Error view: done, ok=False, with the controller's error text.
+        fake.download_infos = [
+            make_download_info(
+                "dl-1", "org/repo", done=True, ok=False, error="boom",
+                progress=0.2, bytes_done=200, bytes_total=1000,
+            )
+        ]
+        failed = await client.get("/developer/downloads/dl-1")
+        assert 'http-equiv="refresh"' not in failed.text
+        assert "download failed: boom" in failed.text
+        # Cancel POSTs back to the same page.
+        cancel = await client.post(
+            "/developer/downloads/dl-1/cancel", follow_redirects=False
+        )
+        assert cancel.status_code == 303
+        assert cancel.headers["location"] == "/developer/downloads/dl-1"
+        assert fake.cancel_calls == ["dl-1"]
+
+
+async def test_download_page_unknown_id_is_not_found() -> None:
+    transport = make_transport(populated_fake())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/developer/downloads/nope")
+    assert response.status_code == 200
+    assert "download not found" in response.text.lower()
+    assert 'http-equiv="refresh"' not in response.text
+
+
+async def test_cache_confirm_and_remove() -> None:
+    fake = FakeControllerClient()
+    fake.cache_value = control_pb2.ListCacheResponse(
+        entries=[
+            control_pb2.CacheEntry(
+                repo_id="org/repo-a", size_bytes=2 * 1024**3, last_modified="2026-09-15"
+            )
+        ]
+    )
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        confirm = await client.get("/developer/cache/org/repo-a/confirm")
+        assert confirm.status_code == 200
+        assert "org/repo-a" in confirm.text
+        assert '/developer/cache/org/repo-a/remove"' in confirm.text
+        removed = await client.post(
+            "/developer/cache/org/repo-a/remove", follow_redirects=False
+        )
+        assert removed.status_code == 303
+        assert removed.headers["location"] == "/developer"
+        assert fake.remove_calls == ["org/repo-a"]
+        followed = await client.get("/developer")
+    assert "removed org/repo-a from the HF cache" in followed.text
+
+
+async def test_register_flow_preview_then_confirm() -> None:
+    fake = FakeControllerClient()
+    fake.propose_response = control_pb2.ProposeRegistrationResponse(
+        model=control_pb2.ModelInfo(
+            alias="qwen2.5-coder-1.5b",
+            display_name="Qwen2.5 Coder 1.5B",
+            hf_repo="Qwen/Qwen2.5-Coder-1.5B-Instruct",
+            quantization="none",
+            max_model_len=32768,
+            gpu_memory_utilization=0.6,
+            host_port=8011,
+            use_case="code gen",
+            tags=["code", "tools"],
+            state=control_pb2.AVAILABLE,
+            cached_locally=True,
+        ),
+        warnings=["vram estimate: 9.4 GiB"],
+    )
+    transport = make_transport(fake)
+    form_data = {
+        "repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+        "alias": "qwen2.5-coder-1.5b",
+        "quantization": "none",
+        "max_model_len": "",
+        "gpu_mem": "",
+        "port": "",
+        "tool_parser": "hermes",
+        "use_case": "code gen",
+        "tags": "code, tools",
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        preview = await client.post("/developer/register", data=form_data)
+        assert preview.status_code == 200
+        assert "<pre" in preview.text
+        assert "container_name: vibe-qwen2.5-coder-1.5b" in preview.text
+        assert "--tool-call-parser" in preview.text
+        assert "warning: vram estimate: 9.4 GiB" in preview.text
+        assert "Confirm and reload registry" in preview.text
+        confirm = await client.post(
+            "/developer/register/confirm", data=form_data, follow_redirects=False
+        )
+        assert confirm.status_code == 303
+        assert confirm.headers["location"] == "/models"
+        followed = await client.get("/models")
+    assert "alias qwen2.5-coder-1.5b added" in followed.text
+    assert [spec.alias for spec in fake.propose_calls] == ["qwen2.5-coder-1.5b"]
+    assert [spec.alias for spec in fake.write_calls] == ["qwen2.5-coder-1.5b"]
+    assert fake.write_calls[0].tool_parser == "hermes"
+    assert list(fake.write_calls[0].tags) == ["code", "tools"]
+    assert fake.reload_calls == 1
+
+
+async def test_register_propose_errors_rerender_form() -> None:
+    fake = FakeControllerClient()
+    fake.propose_response = control_pb2.ProposeRegistrationResponse(
+        errors=["alias 'bad!' must match ^[a-z0-9][a-z0-9.-]*$", "host_port 8020 already in use"]
+    )
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/developer/register", data={"repo": "org/repo", "alias": "bad!"}
+        )
+    assert response.status_code == 200
+    assert "host_port 8020 already in use" in response.text
+    assert 'name="alias"' in response.text  # the form re-renders
+    assert "Confirm and reload registry" not in response.text
+    assert fake.write_calls == []
+    assert fake.reload_calls == 0
+
+
+async def test_models_page_download_button_only_for_uncached() -> None:
+    fake = FakeControllerClient()
+    fake.infos = [
+        make_info("cached-one"),
+        control_pb2.ModelInfo(
+            alias="uncached",
+            display_name="Uncached",
+            hf_repo="org/uncached",
+            quantization="none",
+            max_model_len=4096,
+            host_port=0,
+            state=control_pb2.AVAILABLE,
+            cached_locally=False,
+        ),
+        control_pb2.ModelInfo(
+            alias="loading",
+            display_name="Loading",
+            hf_repo="org/loading",
+            quantization="none",
+            max_model_len=4096,
+            host_port=0,
+            state=control_pb2.LOADING,
+            cached_locally=False,
+        ),
+    ]
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/models")
+    text = response.text
+    assert response.status_code == 200
+    assert text.count('name="repo"') == 1
+    assert 'name="repo" value="org/uncached"' in text
+    assert 'name="repo" value="org/loading"' not in text
+    assert 'name="repo" value="org/cached-one"' not in text
+
+
+async def test_developer_controller_down_banner_not_500() -> None:
+    fake = FakeControllerClient()
+    fake.status_error = ControllerUnavailable("down")
+    fake.downloads_error = ControllerUnavailable("down")
+    fake.cache_error = ControllerUnavailable("down")
+    fake.list_error = ControllerUnavailable("down")
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/developer")
+    assert response.status_code == 200
+    assert "controller unreachable" in response.text.lower()
+    assert "<script" not in response.text

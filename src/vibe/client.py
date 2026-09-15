@@ -201,3 +201,85 @@ class ControllerClient:
             self._raise_translated(exc, alias=alias)
         async for chunk in self._iter_stream(stream, alias=alias):
             yield chunk
+
+    # -- downloads (Phase 4, FR-04.1/FR-04.2) -------------------------------
+
+    async def list_downloads(self) -> list[control_pb2.DownloadInfo]:
+        """In-flight and recently completed downloads (last 20)."""
+        response = await self._unary(
+            self._stub.ListDownloads(control_pb2.ListDownloadsRequest())
+        )
+        return list(response.downloads)
+
+    async def download(
+        self,
+        hf_repo: str,
+        include: Sequence[str] | None = None,
+        revision: str | None = None,
+    ) -> AsyncIterator[control_pb2.DownloadProgress]:
+        """Download an HF repo, streaming `DownloadProgress` until the
+        terminal event (FR-04.1)."""
+        request = control_pb2.DownloadModelRequest(
+            hf_repo=hf_repo,
+            include=list(include or []),
+            revision=revision or "",
+        )
+        try:
+            stream = self._stub.DownloadModel(request)
+        except grpc.aio.AioRpcError as exc:
+            self._raise_translated(exc)
+        async for progress in self._iter_stream(stream):
+            yield progress
+
+    async def cancel_download(self, download_id: str) -> bool:
+        """Request cooperative cancellation of one download (FR-04.2)."""
+        response = await self._unary(
+            self._stub.CancelDownload(
+                control_pb2.CancelDownloadRequest(id=download_id)
+            )
+        )
+        return response.cancelled
+
+    # -- HF cache (Phase 4, FR-04.4) -----------------------------------------
+
+    async def list_cache(self) -> control_pb2.ListCacheResponse:
+        """Cached repos, sizes, alias refs, and disk space."""
+        return await self._unary(
+            self._stub.ListCache(control_pb2.ListCacheRequest())
+        )
+
+    async def remove_cached(self, repo_id: str) -> tuple[bool, str]:
+        """Remove one repo's cache dir; `(removed, error)`; idempotent."""
+        response = await self._unary(
+            self._stub.RemoveCached(control_pb2.RemoveCachedRequest(repo_id=repo_id))
+        )
+        return response.removed, response.error
+
+    # -- registry management (Phase 4, FR-04.5/FR-04.6) ----------------------
+
+    async def reload_registry(self) -> list[str]:
+        """Hot-reload models.yaml; `[]` on success, errors otherwise."""
+        response = await self._unary(
+            self._stub.ReloadRegistry(control_pb2.ReloadRegistryRequest())
+        )
+        return list(response.errors)
+
+    async def propose_registration(
+        self, spec: control_pb2.RegistrationSpec
+    ) -> control_pb2.ProposeRegistrationResponse:
+        """Dry-run a registration: defaults filled, warnings/errors listed."""
+        return await self._unary(
+            self._stub.ProposeRegistration(
+                control_pb2.ProposeRegistrationRequest(spec=spec)
+            )
+        )
+
+    async def write_registration(
+        self, spec: control_pb2.RegistrationSpec
+    ) -> control_pb2.WriteRegistrationResponse:
+        """Append a validated entry to models.yaml and reload it."""
+        return await self._unary(
+            self._stub.WriteRegistration(
+                control_pb2.WriteRegistrationRequest(spec=spec)
+            )
+        )

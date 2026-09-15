@@ -1,6 +1,6 @@
 # 04 — Model Downloads & Developer Page
 
-> Phase 4 · Depends on: 02-grpc-server, 01-admin-ui · Status: Planned
+> Phase 4 · Depends on: 02-grpc-server, 01-admin-ui · Status: Implemented
 
 ## Summary
 
@@ -144,14 +144,14 @@ src/vibe/admin/templates/developer.html, download.html, register_preview.html, c
 
 ## Task breakdown
 
-- [ ] **M4.1 — DownloadManager + RPCs (M)**: thread pool, progress hook (custom `tqdm` subclass forwarding to an asyncio queue), cancel, attach-to-in-flight, `ListDownloads`.
-- [ ] **M4.2 — CLI download/downloads (S)**: streaming progress bar in terminal (`rich` optional).
-- [ ] **M4.3 — Cache scanner + CLI (S)**: `ListCache`/`RemoveCached`, `vibe cache list|rm|du`, feed `cached_locally`.
-- [ ] **M4.4 — Registry write/reload (M)**: `ruamel.yaml` round-trip, atomic write, `ReloadRegistry` with validate-before-swap; `Propose`/`Write` RPCs; heuristics table; `vibe register`.
-- [ ] **M4.5 — `vibe zed-settings` (S)**: JSON generator; unit test against the Phase 2 snippet shape.
-- [ ] **M4.6 — /developer page (M)**: downloads form + progress page, cache table + confirm remove, register preview/confirm, Zed settings `<pre>`, disk usage.
-- [ ] **M4.7 — /models Download button (S)**: for uncached aliases.
-- [ ] **M4.8 — Tests (M)**: fake `snapshot_download` with synthetic progress; registry write preserves comments; heuristics; reload rejects invalid YAML and keeps old registry.
+- [x] **M4.1 — DownloadManager + RPCs (M)**: thread pool, progress hook (custom `tqdm` subclass forwarding to an asyncio queue), cancel, attach-to-in-flight, `ListDownloads`.
+- [x] **M4.2 — CLI download/downloads (S)**: streaming progress bar in terminal (`rich` optional).
+- [x] **M4.3 — Cache scanner + CLI (S)**: `ListCache`/`RemoveCached`, `vibe cache list|rm|du`, feed `cached_locally`.
+- [x] **M4.4 — Registry write/reload (M)**: `ruamel.yaml` round-trip, atomic write, `ReloadRegistry` with validate-before-swap; `Propose`/`Write` RPCs; heuristics table; `vibe register`.
+- [x] **M4.5 — `vibe zed-settings` (S)**: JSON generator; unit test against the Phase 2 snippet shape.
+- [x] **M4.6 — /developer page (M)**: downloads form + progress page, cache table + confirm remove, register preview/confirm, Zed settings `<pre>`, disk usage.
+- [x] **M4.7 — /models Download button (S)**: for uncached aliases.
+- [x] **M4.8 — Tests (M)**: fake `snapshot_download` with synthetic progress; registry write preserves comments; heuristics; reload rejects invalid YAML and keeps old registry.
 
 ## Acceptance criteria
 

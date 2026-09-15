@@ -4,8 +4,81 @@
 <h1>Developer</h1>
 
 <section class="card">
-  <p>Model downloads, cache inspection and guided registration land here in Phase 4.
-     See the spec:
-     <a href="/.zed/docs/fable-5/features/04-model-scripts.md">.zed/docs/fable-5/features/04-model-scripts.md</a>.</p>
+  <h2>Downloads</h2>
+  <form method="post" action="{{ url_for('developer_downloads_post') }}">
+    <div class="inline">
+      <label for="repo">HF repo</label>
+      <input name="repo" id="repo" placeholder="org/repo" required>
+      <label for="revision">Revision</label>
+      <input name="revision" id="revision" placeholder="main">
+    </div>
+    <label for="include">Include patterns (one per line)</label>
+    <textarea name="include" id="include" placeholder="*Q4_K_M.gguf" rows="3"></textarea>
+    <button type="submit">Download</button>
+  </form>
+  {% if downloads %}
+  <table>
+    <thead><tr><th>ID</th><th>Repo</th><th>Progress</th><th>State</th></tr></thead>
+    <tbody>
+    {% for info in downloads %}
+      <tr>
+        <td><a href="{{ url_for('developer_download', download_id=info.id) }}"><code>{{ info.id }}</code></a></td>
+        <td>{{ info.hf_repo }}</td>
+        <td>{{ "%.0f%%"|format(info.progress * 100) }}</td>
+        <td>
+          {% if info.done and info.ok %}<span class="badge badge-ready">DONE</span>
+          {% elif info.done %}<span class="badge badge-error">ERROR</span>
+          {% else %}<span class="badge badge-loading">DOWNLOADING</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="dim">no downloads yet</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>HF cache</h2>
+  <p>disk: {{ disk_total }} total / {{ disk_free }} free</p>
+  {% if cache_entries %}
+  <table>
+    <thead><tr><th>Repo</th><th>Size</th><th>Modified</th><th>Aliases</th><th></th></tr></thead>
+    <tbody>
+    {% for entry in cache_entries %}
+      <tr>
+        <td><code>{{ entry.repo_id }}</code></td>
+        <td>{{ entry.size }}</td>
+        <td>{{ entry.last_modified }}</td>
+        <td>
+          {% for alias in entry.aliases %}<a href="{{ url_for('models') }}">{{ alias }}</a>{% if not loop.last %}, {% endif %}{% else %}—{% endfor %}
+        </td>
+        <td>
+          <a href="/developer/register?repo={{ entry.repo_id }}">Register</a> ·
+          <a href="{{ url_for('developer_cache_confirm', repo=entry.repo_id) }}">Remove</a>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="dim">HF cache is empty</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Register a model</h2>
+  <p>Add a downloaded repo to <code>models.yaml</code> with validation and sensible
+     defaults: <a href="{{ url_for('developer_register_form') }}">guided registration →</a></p>
+</section>
+
+<section class="card">
+  <h2>Zed settings</h2>
+  {% if zed_json %}
+  <pre class="logs">{{ zed_json }}</pre>
+  {% else %}
+  <p class="dim">unavailable — controller down or the Phase 4 settings module is missing</p>
+  {% endif %}
 </section>
 {% endblock content %}
