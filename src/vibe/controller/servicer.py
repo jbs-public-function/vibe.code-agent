@@ -17,6 +17,7 @@ import asyncio
 import json
 import re
 import sys
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,12 @@ HEARTBEAT_MESSAGE = "waiting for the job to make progress"
 # disconnected client can never make the queue grow unbounded (FR-02.11);
 # dropped events are still recorded in the shared ring buffer.
 FANOUT_CAPACITY = 200
+
+# Bounded per-job event history for `GetJobEvents` (FR-01.4): keep the last
+# `JOB_HISTORY_JOBS` jobs and at most `JOB_EVENT_HISTORY` events per job, so
+# memory stays flat no matter how long the controller runs (NFR-01.5).
+JOB_HISTORY_JOBS = 8
+JOB_EVENT_HISTORY = 1000
 
 # Docker `timestamps=True` lines look like
 # "2026-09-10T12:34:56.789123456Z message".
@@ -159,6 +166,7 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         self.gpu_fn = gpu_fn
         self.buffer = buffer
         self.last_error = ""
+        self._job_events: OrderedDict[str, deque[JobEvent]] = OrderedDict()
 
     # -- unary queries -----------------------------------------------------
 
@@ -336,14 +344,30 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         except asyncio.QueueFull:
             pass
 
+    def _record_job_event(self, job_id: str, event: JobEvent) -> None:
+        """Append one event to the per-job history for `GetJobEvents`.
+
+        History is bounded (NFR-01.5): `JOB_EVENT_HISTORY` events per job,
+        `JOB_HISTORY_JOBS` jobs in total with the oldest job evicted first.
+        Events without a job id are dropped.
+        """
+        if not job_id:
+            return
+        self._job_events.setdefault(job_id, deque(maxlen=JOB_EVENT_HISTORY)).append(
+            event
+        )
+        while len(self._job_events) > JOB_HISTORY_JOBS:
+            self._job_events.popitem(last=False)
+
     async def _pump_job(
         self, queue: asyncio.Queue, events: AsyncIterator[JobEvent]
     ) -> None:
         """Consume one runner job generator into the fan-out queue.
 
         Runs as its own task so the job survives client disconnects
-        (FR-02.11). Events are also recorded in the shared ring buffer, and
-        terminal events update `self.last_error`.
+        (FR-02.11). Events are also recorded in the shared ring buffer and
+        the per-job history (`GetJobEvents`), and terminal events update
+        `self.last_error`.
         """
         job_id = ""
         terminal_seen = False
@@ -353,6 +377,7 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
                 if job is not None:
                     job_id = job.id
                 self.buffer.append(event)
+                self._record_job_event(job_id, event)
                 if event.state in _TERMINAL_STATES:
                     terminal_seen = True
                     self._update_last_error(event)
@@ -374,6 +399,7 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
                     state=JobState.ERROR,
                 )
                 self.buffer.append(event)
+                self._record_job_event(job_id, event)
                 self._update_last_error(event)
                 self._offer(queue, ("event", event, job_id))
 
@@ -634,7 +660,24 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
                 f"cannot reach the model server at {url}: {exc}",
             )
 
-    # -- deferred RPCs -------------------------------------------------------
+    # -- job event replay ---------------------------------------------------
+
+    async def GetJobEvents(self, request, context):
+        """Replay the buffered events for one job, oldest first (FR-01.4).
+
+        Replay-and-return only: the admin job page polls every 2 s and each
+        call is a fresh snapshot of the bounded per-job history (NFR-01.5).
+        """
+        events = self._job_events.get(request.job_id)
+        if events is None:
+            await context.abort(
+                grpc.StatusCode.NOT_FOUND, f"unknown job '{request.job_id}'"
+            )
+            return
+        for event in events:
+            yield to_proto(event, request.job_id)
+
+    # -- deferred RPCs (Phase 4) --------------------------------------------
 
     async def ListDownloads(self, request, context):
         await context.abort(
@@ -649,11 +692,6 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
     async def CancelDownload(self, request, context):
         await context.abort(
             grpc.StatusCode.UNIMPLEMENTED, "downloads land in Phase 4"
-        )
-
-    async def GetJobEvents(self, request, context):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "job event replay lands in Phase 3"
         )
 
     async def ReloadRegistry(self, request, context):

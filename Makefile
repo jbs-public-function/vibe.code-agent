@@ -28,13 +28,14 @@ help:
 	@echo "  make validate    - Validate .env + models.yaml (exit 0 ok, 2 on error)"
 	@echo "  make list        - List registered models and their ports"
 	@echo "  make kill-ghosts - Alias for 'make stop'"
-	@echo "  make serve       - Start the control plane (controller + gateway; admin later)"
+	@echo "  make serve       - Start the control plane (controller + gateway + admin)"
+	@echo "  make admin       - Open the admin UI at http://localhost:8081"
 	@echo "  make chat        - Stream a test chat through the gateway (8080)"
 	@echo "  make tls         - Optional TLS front; requires Docker"
 	@echo "  make proto       - Regenerate committed gRPC code from proto/vibe/v1/control.proto"
 
 # Targets delegate to the vibe CLI (chat/tls run a test script / Caddy).
-.PHONY: qwen llama deepseek stop status logs validate list kill-ghosts serve chat tls
+.PHONY: qwen llama deepseek stop status logs validate list kill-ghosts serve chat tls admin
 qwen:      ; $(UV) load qwen2.5-coder-7b
 llama:     ; $(UV) load llama-3.1-8b
 deepseek:  ; $(UV) load deepseek-r1-14b
@@ -44,6 +45,7 @@ logs:      ; $(UV) logs --follow
 validate:  ; $(UV) validate
 list:      ; $(UV) list
 serve:     ; $(UV) serve
+admin:     ; xdg-open http://localhost:8081
 chat:      ; $(PY) scripts/test_chat.py --model qwen2.5-coder-7b
 tls:       ; docker run -d --name vibe-caddy --network host -v $$(pwd)/deploy/Caddyfile:/etc/caddy/Caddyfile caddy:2-alpine
 kill-ghosts: stop

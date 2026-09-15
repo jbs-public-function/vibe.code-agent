@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock title %}
+{% block head %}<meta http-equiv="refresh" content="5">{% endblock head %}
+{% block content %}
+<h1>Logs</h1>
+
+<section class="card">
+  <form method="get" action="{{ url_for('logs') }}" class="inline">
+    <label for="tail">Tail</label>
+    <select name="tail" id="tail">
+      {% for option in tails %}
+      <option value="{{ option }}" {% if option == tail %}selected{% endif %}>{{ option }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">Show</button>
+    <a href="{{ url_for('logs_stream') }}">follow stream</a>
+  </form>
+</section>
+
+<pre class="logs">{% for line in lines %}{{ line.ts_unix_ms|ts }}  {{ line.line }}
+{% endfor %}</pre>
+{% endblock content %}

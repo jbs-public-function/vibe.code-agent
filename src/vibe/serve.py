@@ -1,9 +1,9 @@
 """`vibe serve` composition root (FR-02.9).
 
-Composes the gRPC controller and the OpenAI-compatible gateway into one
-asyncio loop; the admin server lands in Phase 3. To keep imports one-way
-(the controller package must not import the CLI), the composition is done
-here.
+Composes the gRPC controller, the OpenAI-compatible gateway, and the
+Phase-3 admin UI into one asyncio loop; `--only` runs a single component.
+To keep imports one-way (the controller package must not import the CLI),
+the composition is done here.
 """
 
 from __future__ import annotations
@@ -14,8 +14,9 @@ import sys
 import uvicorn
 from pydantic import ValidationError
 
+from vibe.admin.app import build_app as build_admin_app
 from vibe.client import ControllerClient
-from vibe.config import GATEWAY_PORT, Settings
+from vibe.config import ADMIN_PORT, GATEWAY_PORT, Settings
 from vibe.controller.server import build_server, run
 from vibe.errors import EXIT_CONFIG, EXIT_OK, EXIT_RUNTIME
 from vibe.gateway.app import build_app
@@ -47,12 +48,12 @@ def _load_config() -> tuple[Settings, Registry]:
 
 
 async def serve(only: str | None) -> int:
-    """Start the control plane: controller, gateway, or both (default)."""
-    if only not in (None, "controller", "gateway"):
-        if only == "admin":
-            print("admin not implemented until Phase 3", file=sys.stderr)
-        else:
-            print(f"unknown component '{only}'", file=sys.stderr)
+    """Start the control plane: controller, gateway, and admin (FR-02.9)."""
+    if only not in (None, "controller", "gateway", "admin"):
+        print(
+            f"unknown component '{only}' (expected: controller, gateway, or admin)",
+            file=sys.stderr,
+        )
         return EXIT_RUNTIME
 
     settings, registry = _load_config()
@@ -61,6 +62,18 @@ async def serve(only: str | None) -> int:
         print(f"starting controller on {settings.controller_target}")
         server = await build_server(settings, registry)
         await run(server)
+        return EXIT_OK
+
+    if only == "admin":
+        admin_client = ControllerClient(settings)
+        admin_app = build_admin_app(settings, admin_client)
+        print(f"starting admin UI on http://{settings.vibe_bind}:{ADMIN_PORT}")
+        uvc = uvicorn.Server(
+            uvicorn.Config(
+                admin_app, host=settings.vibe_bind, port=ADMIN_PORT, log_level="info"
+            )
+        )
+        await uvc.serve()
         return EXIT_OK
 
     client = ControllerClient(settings)
@@ -74,28 +87,38 @@ async def serve(only: str | None) -> int:
         await uvc.serve()
         return EXIT_OK
 
-    # Default (only is None): run controller and gateway together in one loop.
-    # uvicorn installs a SIGINT handler in the main thread, which raises
-    # KeyboardInterrupt into this loop and aborts wait_for_termination(), so
-    # both servers shut down cleanly; run_serve converts any stray
-    # KeyboardInterrupt to EXIT_OK.
+    # Default (only is None): run controller, gateway, and admin together in
+    # one loop. uvicorn installs SIGINT handlers in the main thread, which
+    # raise KeyboardInterrupt into this loop and abort wait_for_termination();
+    # the finally block stops both HTTP servers before the gRPC server, and
+    # run_serve converts any stray KeyboardInterrupt to EXIT_OK.
+    admin_client = ControllerClient(settings)
+    admin_app = build_admin_app(settings, admin_client)
     grpc_srv = await build_server(settings, registry)
     await grpc_srv.start()
     print(f"vibe controller listening on {settings.controller_target}")
     print(f"starting gateway on http://{settings.vibe_bind}:{GATEWAY_PORT}")
+    print(f"starting admin UI on http://{settings.vibe_bind}:{ADMIN_PORT}")
     uvc = uvicorn.Server(
         uvicorn.Config(app, host=settings.vibe_bind, port=GATEWAY_PORT, log_level="info")
     )
+    admin_uvc = uvicorn.Server(
+        uvicorn.Config(
+            admin_app, host=settings.vibe_bind, port=ADMIN_PORT, log_level="info"
+        )
+    )
     uvc_task = asyncio.create_task(uvc.serve())
+    admin_task = asyncio.create_task(admin_uvc.serve())
     try:
         await grpc_srv.wait_for_termination()
     finally:
-        uvc.should_exit = True
-        uvc_task.cancel()
-        try:
-            await uvc_task
-        except asyncio.CancelledError:
-            pass
+        for server, task in ((uvc, uvc_task), (admin_uvc, admin_task)):
+            server.should_exit = True
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await grpc_srv.stop(grace=2)
     return EXIT_OK
 

@@ -318,7 +318,7 @@ def serve(
     only: str | None = typer.Option(
         None,
         "--only",
-        help="Run a single component: controller or gateway (admin lands in Phase 3)",
+        help="Run a single component: controller, gateway, or admin",
     ),
 ) -> None:
     """Start the control plane: controller, gateway, and admin (FR-02.9)."""

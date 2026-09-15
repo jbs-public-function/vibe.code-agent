@@ -1,6 +1,6 @@
 # 01 — Admin UI
 
-> Phase 3 · Depends on: 02-grpc-server, 03-openai-gateway · Status: Planned
+> Phase 3 · Depends on: 02-grpc-server, 03-openai-gateway · Status: Implemented
 
 ## Summary
 
@@ -160,14 +160,14 @@ src/vibe/admin/static/pico.min.css (or vibe.css)
 
 ## Task breakdown
 
-- [ ] **M3.1 — App shell (S)**: FastAPI app, Jinja2 env, `base.html` with nav/footer, vendored CSS, CSP middleware, `/health`, `vibe serve --only admin`.
-- [ ] **M3.2 — Dashboard (S)**: state badge, GPU bar, health, current job link, 5 s refresh; "controller unreachable" banner path.
-- [ ] **M3.3 — Models + load/unload (M)**: table, form, background job start, 303 redirect, in-progress-job handling, flash.
-- [ ] **M3.4 — Job page (M)**: `GetJobEvents` RPC (proto additive + servicer), event list, conditional refresh, terminal error view with last-50 logs.
-- [ ] **M3.5 — Chat (M)**: session store, streamed HTML response, escaping, reset, no-model state, temperature/max_tokens fields.
-- [ ] **M3.6 — Logs (S)**: tail page + chunked follow endpoint.
-- [ ] **M3.7 — Tests (M)**: `httpx.AsyncClient` against the app with a fake `ControllerClient`; assert no `<script>` in any rendered template; assert chunked chat response yields escaped text incrementally; redirect semantics.
-- [ ] **M3.8 — Docs (S)**: repo README section "Admin UI" with screenshots-free walkthrough; `make admin` opens `xdg-open http://localhost:8081`.
+- [x] **M3.1 — App shell (S)**: FastAPI app, Jinja2 env, `base.html` with nav/footer, vendored CSS, CSP middleware, `/health`, `vibe serve --only admin`.
+- [x] **M3.2 — Dashboard (S)**: state badge, GPU bar, health, current job link, 5 s refresh; "controller unreachable" banner path.
+- [x] **M3.3 — Models + load/unload (M)**: table, form, background job start, 303 redirect, in-progress-job handling, flash.
+- [x] **M3.4 — Job page (M)**: `GetJobEvents` RPC (proto additive + servicer), event list, conditional refresh, terminal error view with last-50 logs.
+- [x] **M3.5 — Chat (M)**: session store, streamed HTML response, escaping, reset, no-model state, temperature/max_tokens fields.
+- [x] **M3.6 — Logs (S)**: tail page + chunked follow endpoint.
+- [x] **M3.7 — Tests (M)**: `httpx.AsyncClient` against the app with a fake `ControllerClient`; assert no `<script>` in any rendered template; assert chunked chat response yields escaped text incrementally; redirect semantics.
+- [x] **M3.8 — Docs (S)**: repo README section "Admin UI" with screenshots-free walkthrough; `make admin` opens `xdg-open http://localhost:8081`.
 
 ## Acceptance criteria
 

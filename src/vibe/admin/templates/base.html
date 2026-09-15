@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}vibe{% endblock title %} · vibe</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='vibe.css') }}">
+  {% block head %}{% endblock head %}
+</head>
+<body>
+  <nav class="nav" aria-label="site">
+    <span class="brand">vibe</span>
+    <a href="{{ url_for('dashboard') }}" {% if page == 'dashboard' %}class="active"{% endif %}>Dashboard</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ url_for('models') }}" {% if page == 'models' %}class="active"{% endif %}>Models</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ url_for('chat') }}" {% if page == 'chat' %}class="active"{% endif %}>Chat</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ url_for('logs') }}" {% if page == 'logs' %}class="active"{% endif %}>Logs</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ url_for('developer') }}" {% if page == 'developer' %}class="active"{% endif %}>Developer</a>
+  </nav>
+  {% if flash %}<div class="flash">{{ flash }}</div>{% endif %}
+  {% if controller_down %}<div class="banner">Controller unreachable — is <code>vibe serve</code> running? Live data is paused; pages retry automatically.</div>{% endif %}
+  <main>
+    {% block content %}{% endblock content %}
+  </main>
+  <footer>
+    <span>gateway <code>http://localhost:8080/v1</code></span>
+    <span aria-hidden="true">·</span>
+    <span>active <code>{{ active_alias or "none" }}</code></span>
+  </footer>
+</body>
+</html>

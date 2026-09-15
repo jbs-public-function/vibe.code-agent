@@ -170,3 +170,16 @@ Notes:
 *   The API key can be any non-empty string (e.g. `local`); the gateway does not check it.
 *   `VIBE_SWAP_ON_REQUEST=false` is the default, so swap to the model you want with `vibe load <alias>` (or `make qwen` / `make llama` / `make deepseek`) before selecting it in Zed.
 *   `make tls` + [`deploy/Caddyfile`](deploy/Caddyfile) provide an optional TLS front and only matter if `VIBE_BIND` is widened beyond loopback.
+
+## Admin UI
+
+The Phase 3 admin UI runs at `http://localhost:8081`, served by `vibe serve` (or `vibe serve --only admin`; `make admin` opens it in a browser). It is deliberately **zero-JS**: live views auto-refresh with `<meta http-equiv="refresh">`, actions are plain HTML forms with POST-redirect-GET, and chat streams as chunked HTML, so everything works with JavaScript disabled.
+
+*   **Dashboard** — active alias + state, GPU usage, controller/gateway health, and a link to the current job.
+*   **Models** — registry table with Load / Force reload / Unload buttons.
+*   **Job pages** — live progress for loads and unloads, auto-refreshing every 2 s until the job reaches a terminal state.
+*   **Chat** — a quick sanity check against the active model, streamed token-by-token.
+*   **Logs** — the container log tail in the browser, plus `curl -N http://localhost:8081/logs/stream` for a plain-text follow stream.
+*   **Developer** — placeholder in Phase 3 (downloads/registry management land in Phase 4).
+
+All state comes from the controller over gRPC; when the controller is stopped, pages degrade gracefully to a "controller unreachable" banner instead of erroring.

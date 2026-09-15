@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Models{% endblock title %}
+{% block content %}
+<h1>Models</h1>
+
+<section class="card">
+  <h2>Load / unload</h2>
+  <form method="post" action="{{ url_for('models_load') }}" class="inline">
+    <label for="alias">Model</label>
+    <select name="alias" id="alias">
+      {% for info in infos %}
+      <option value="{{ info.alias }}" {% if info.alias == active_alias %}selected{% endif %}>{{ info.alias }}</option>
+      {% endfor %}
+    </select>
+    <label><input type="checkbox" name="force" value="on"> Force reload</label>
+    <button type="submit">Load</button>
+  </form>
+  <form method="post" action="{{ url_for('models_unload') }}" class="inline">
+    <button type="submit">Unload</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Registry</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Display name</th><th>Alias</th><th>Repo</th><th>Quant</th>
+        <th>Max len</th><th>Port</th><th>State</th><th>Cached locally</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for info in infos %}
+      <tr>
+        <td>{{ info.display_name }}</td>
+        <td><code>{{ info.alias }}</code>{% if info.alias == active_alias %} <span class="badge">active</span>{% endif %}</td>
+        <td>{{ info.hf_repo }}</td>
+        <td>{{ info.quantization }}</td>
+        <td>{{ info.max_model_len|mib }}</td>
+        <td>{{ info.host_port }}</td>
+        <td><span class="badge badge-{{ info.state|statename|lower }}">{{ info.state|statename }}</span></td>
+        <td>{{ "yes" if info.cached_locally else "no" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock content %}

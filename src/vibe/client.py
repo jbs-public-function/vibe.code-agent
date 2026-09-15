@@ -5,7 +5,8 @@ Gateway and admin import *only* this module for controller access (02-grpc-serve
 CLI expects:
 
 - `UNAVAILABLE`           → `ControllerUnavailable`
-- `NOT_FOUND`             → `KeyError` (unknown alias)
+- `NOT_FOUND`             → `KeyError` (unknown alias or job id)
+- `FAILED_PRECONDITION`   → `jobs.JobInProgress`
 - `FAILED_PRECONDITION`   → `jobs.JobInProgress`
 - anything else           → `RuntimeError` with the server's details
 """
@@ -159,6 +160,21 @@ class ControllerClient:
             self._raise_translated(exc)
         async for line in self._iter_stream(stream):
             yield line
+
+    async def job_events(self, job_id: str) -> AsyncIterator[control_pb2.JobEvent]:
+        """Replay buffered events for a job the caller did not start (Phase 3).
+
+        The controller keeps a bounded per-job history, so this is a snapshot
+        of the events recorded so far, oldest first. Raises `KeyError` for an
+        unknown job id (NOT_FOUND).
+        """
+        request = control_pb2.GetJobEventsRequest(job_id=job_id)
+        try:
+            stream = self._stub.GetJobEvents(request)
+        except grpc.aio.AioRpcError as exc:
+            self._raise_translated(exc)
+        async for event in self._iter_stream(stream):
+            yield event
 
     async def gpu(self) -> control_pb2.GpuStats:
         """Return current GPU memory/utilization/process stats (FR-02.7)."""

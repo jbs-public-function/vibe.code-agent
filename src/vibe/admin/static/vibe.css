@@ -1,0 +1,96 @@
+/* vibe admin stylesheet (NFR-01.2) — handwritten, no external requests.
+   Classless-friendly: bare elements look sane, .card/.badge/.bar add chrome. */
+
+:root {
+  --bg: #f6f7f9; --fg: #1d2430; --muted: #6b7280; --card: #ffffff;
+  --line: #d9dee5; --accent: #2f6fed; --accent-fg: #ffffff;
+  --warn: #b45309; --warn-bg: #fef3c7; --err: #b91c1c; --err-bg: #fee2e2;
+  --ok-bg: #dcfce7; --ok: #166534;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181f; --fg: #e5e9f0; --muted: #8b93a1; --card: #1d232d;
+    --line: #2e3744; --accent: #6ea1ff; --accent-fg: #10151c;
+    --warn: #fbbf24; --warn-bg: #3a2f10; --err: #fca5a5; --err-bg: #3f1d1d;
+    --ok-bg: #14331f; --ok: #86efac;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; padding: 0 1rem 2rem; background: var(--bg); color: var(--fg); font: 15px/1.55 system-ui, sans-serif; }
+
+main { max-width: 72rem; margin: 0 auto; }
+
+h1 { font-size: 1.5rem; margin: 1.2rem 0 0.8rem; }
+h2 { font-size: 1.1rem; margin: 0.9rem 0 0.5rem; }
+h3 { font-size: 0.95rem; margin: 0.7rem 0 0.4rem; }
+
+a { color: var(--accent); }
+
+code { font: 0.9em ui-monospace, monospace; background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: 0.05em 0.35em; }
+
+.nav { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; padding: 0.8rem 0; border-bottom: 1px solid var(--line); margin-bottom: 0.6rem; }
+.nav .brand { font-weight: 700; margin-right: 0.4rem; }
+.nav a { text-decoration: none; padding: 0.15rem 0.5rem; border-radius: 4px; }
+.nav a:hover { background: var(--card); }
+.nav a.active { background: var(--accent); color: var(--accent-fg); }
+
+.flash, .banner { padding: 0.6rem 0.9rem; border-radius: 6px; margin: 0.8rem 0; }
+.flash { background: var(--warn-bg); color: var(--warn); }
+.banner { background: var(--err-bg); color: var(--err); }
+
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 0.9rem 1.1rem; margin: 0.8rem 0; }
+
+.grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); }
+
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 1rem; margin: 0.4rem 0; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+.inline-dl { display: flex; flex-wrap: wrap; gap: 0.3rem 2rem; }
+
+table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
+th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; }
+
+.badge { display: inline-block; padding: 0.05em 0.5em; border-radius: 999px; font-size: 0.82rem; background: var(--line); }
+.badge-ready, .badge-available { background: var(--ok-bg); color: var(--ok); }
+.badge-loading, .badge-unloading { background: var(--warn-bg); color: var(--warn); }
+.badge-error { background: var(--err-bg); color: var(--err); }
+
+/* Width classes in 5 % steps — inline `style="width"` would violate the
+   `style-src 'self'` CSP (NFR-01.1), so the bar steps width via classes. */
+.bar { height: 0.9rem; background: var(--line); border-radius: 999px; overflow: hidden; margin: 0.4rem 0; }
+.fill { height: 100%; background: var(--accent); }
+.bar-0 { width: 0; } .bar-5 { width: 5%; } .bar-10 { width: 10%; } .bar-15 { width: 15%; }
+.bar-20 { width: 20%; } .bar-25 { width: 25%; } .bar-30 { width: 30%; } .bar-35 { width: 35%; }
+.bar-40 { width: 40%; } .bar-45 { width: 45%; } .bar-50 { width: 50%; } .bar-55 { width: 55%; }
+.bar-60 { width: 60%; } .bar-65 { width: 65%; } .bar-70 { width: 70%; } .bar-75 { width: 75%; }
+.bar-80 { width: 80%; } .bar-85 { width: 85%; } .bar-90 { width: 90%; } .bar-95 { width: 95%; }
+.bar-100 { width: 100%; }
+
+.events { list-style: none; padding: 0; margin: 0.4rem 0; }
+.events li { padding: 0.25rem 0.4rem; border-bottom: 1px solid var(--line); font: 0.85rem/1.5 ui-monospace, monospace; }
+.events .ts { color: var(--muted); margin-right: 0.6rem; }
+.events .level { margin-right: 0.6rem; }
+
+.turn { margin: 0.7rem 0; }
+.turn .role { font-weight: 600; margin-bottom: 0.15rem; }
+.turn pre { margin: 0.2rem 0; padding: 0.6rem 0.8rem; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; background: var(--card); white-space: pre-wrap; word-wrap: break-word; font: 0.9rem/1.5 ui-monospace, monospace; }
+.turn-user .role { color: var(--accent); }
+
+pre.logs { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 0.8rem; overflow-x: auto; white-space: pre-wrap; font: 0.85rem/1.5 ui-monospace, monospace; }
+
+label { color: var(--muted); margin-right: 0.4rem; }
+input, select, textarea { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 0.35rem 0.5rem; }
+textarea { width: 100%; max-width: 46rem; display: block; margin: 0.2rem 0 0.5rem; }
+button { font: inherit; color: var(--accent-fg); background: var(--accent); border: none; border-radius: 6px; padding: 0.4rem 0.9rem; cursor: pointer; }
+button:hover { filter: brightness(1.08); }
+
+.inline { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.6rem 0; }
+
+.dim { color: var(--muted); }
+.error { color: var(--err); }
+
+footer { max-width: 72rem; margin: 1.5rem auto 0; padding-top: 0.6rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.85rem; }
