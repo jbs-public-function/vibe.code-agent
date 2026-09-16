@@ -1,7 +1,7 @@
 # vibe admin UI (HTTP) — systemd USER unit.
 #
-# Talks to the controller over gRPC at 127.0.0.1:50051, so the controller
-# unit (vibe-controller.service) must be running first.
+# Talks to the controller over gRPC at 127.0.0.1:50051; `Wants=` starts the
+# controller with this unit so the dependency is pulled in, not just ordered.
 #
 # Install and start with:
 #   systemctl --user daemon-reload
@@ -13,12 +13,15 @@
 [Unit]
 Description=vibe admin UI (HTTP)
 After=vibe-controller.service
+Wants=vibe-controller.service
 
 [Service]
 Type=simple
-WorkingDirectory=/home/jamesb/projects/vibe.code-agent
-ExecStart=/home/jamesb/projects/vibe.code-agent/.venv/bin/vibe serve --only admin
-Restart=on-failure
+WorkingDirectory=%h/projects/vibe.code-agent
+EnvironmentFile=%h/projects/vibe.code-agent/.env
+ExecStart=%h/projects/vibe.code-agent/.venv/bin/vibe serve --only admin
+Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=default.target

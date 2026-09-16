@@ -14,12 +14,18 @@ import urllib.request
 
 # The gateway serves every registry alias at one fixed port (ADR-4).
 GATEWAY_URL = "http://localhost:8080/v1"
-DEFAULT_MODEL = "qwen2.5-coder-7b"
 
 USER_PROMPT = (
     "Write a bullet-point resume entry describing setting up high-performance "
     "local LLM inference engines using vLLM and Docker containers on Linux."
 )
+
+
+def list_models():
+    """Return the gateway's registered aliases, or [] if it is unreachable."""
+    with urllib.request.urlopen(f"{GATEWAY_URL}/models", timeout=10) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    return [entry.get("id") for entry in body.get("data") or []]
 
 
 def active_model():
@@ -33,7 +39,11 @@ def active_model():
 
 
 def stream_chat(model):
-    """POST a streaming chat completion and print tokens as they arrive."""
+    """POST a streaming chat completion and print tokens as they arrive.
+
+    The read timeout is disabled: slow first tokens on a cold swap-on-request
+    (VIBE_SWAP_TIMEOUT can be minutes) must not abort the stream (IMP-06.7).
+    """
     payload = json.dumps(
         {
             "model": model,
@@ -50,7 +60,9 @@ def stream_chat(model):
         method="POST",
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
+    # No per-read timeout: first-token latency on a 14B AWQ model routinely
+    # exceeds 30 s, and swap-on-request may block for VIBE_SWAP_TIMEOUT.
+    with urllib.request.urlopen(request, timeout=None) as response:
         for raw_line in response:
             line = raw_line.decode("utf-8").strip()
             if not line.startswith("data:"):
@@ -107,8 +119,8 @@ def main(argv=None):
         "--model",
         default=None,
         help=(
-            "model alias to request (default: the gateway's active model, "
-            f"falling back to {DEFAULT_MODEL})"
+            "model alias to request (default: the gateway's active model; "
+            "if none is loaded, list the registered aliases and exit 1)"
         ),
     )
     args = parser.parse_args(argv)
@@ -121,13 +133,20 @@ def main(argv=None):
             print(f"ERROR: could not query /v1/models ({exc}). Is 'vibe serve' running?")
             return 1
         if model is None:
-            model = DEFAULT_MODEL
-            print(
-                f"no active model found; defaulting to {DEFAULT_MODEL} "
-                "(start one with 'vibe load <alias>')"
-            )
-        else:
-            print(f"Using active model: {model}")
+            try:
+                aliases = list_models()
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+                aliases = []
+            print("no active model loaded.")
+            if aliases:
+                print("Registered aliases:")
+                for alias in aliases:
+                    print(f"  {alias}")
+                print("Load one first: 'vibe load <alias>' (or 'make qwen') (XR-3).")
+            else:
+                print("No registered aliases — check models.yaml and 'vibe serve'.")
+            return 1
+        print(f"Using active model: {model}")
 
     print(f"Connected to: model '{model}' via the gateway\n")
     try:

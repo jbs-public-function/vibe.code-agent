@@ -26,20 +26,23 @@ help:
 	@echo "vibe.code-agent - vLLM Model Controller (vibe CLI)"
 	@echo "=================================================="
 	@echo "Usage:"
-	@echo "  make deepseek    - Load DeepSeek-R1-Distill-Qwen-14B on port 8010"
-	@echo "  make qwen        - Load Qwen2.5-Coder-7B on port 8030"
-	@echo "  make llama       - Load Llama-3.1-8B on port 8020"
+	@echo "  make deepseek    - Load the deepseek-r1-14b alias"
+	@echo "  make qwen        - Load the qwen2.5-coder-7b alias"
+	@echo "  make llama       - Load the llama-3.1-8b alias"
 	@echo "  make stop        - Stop and remove all managed vLLM containers"
 	@echo "  make status      - Show active model state and GPU usage"
 	@echo "  make logs        - Follow the active container's logs"
 	@echo "  make validate    - Validate .env + models.yaml (exit 0 ok, 2 on error)"
-	@echo "  make list        - List registered models and their ports"
+	@echo "  make list        - List registered models (aliases and ports)"
 	@echo "  make kill-ghosts - Alias for 'make stop'"
 	@echo "  make serve       - Start the control plane (controller + gateway + admin)"
 	@echo "  make admin       - Open the admin UI at http://localhost:8081"
 	@echo "  make chat        - Stream a test chat through the gateway (8080)"
 	@echo "  make tls         - Optional TLS front; requires Docker"
+	@echo "  make tls-stop    - Stop the optional TLS front"
 	@echo "  make proto       - Regenerate committed gRPC code from proto/vibe/v1/control.proto"
+	@echo "  make typecheck   - Run pyright over src/ and tests/"
+	@echo "  make check       - Full pre-commit gate: lock, tests, pyright, torch-free sync"
 	@echo "  make lab         - Open a shell in the laboratory container (torch + CUDA)"
 	@echo "  make lab-build   - Build the laboratory image (pinned pytorch base)"
 	@echo "  make lab-run CMD=\"python inference_hf.py --model Qwen/Qwen2.5-Coder-1.5B-Instruct --prompt hi\" - Run a lab script"
@@ -56,8 +59,9 @@ validate:  ; $(UV) validate
 list:      ; $(UV) list
 serve:     ; $(UV) serve
 admin:     ; xdg-open http://localhost:8081
-chat:      ; $(PY) scripts/test_chat.py --model qwen2.5-coder-7b
-tls:       ; docker run -d --name vibe-caddy --network host -v $$(pwd)/deploy/Caddyfile:/etc/caddy/Caddyfile caddy:2-alpine
+chat:      ; $(PY) scripts/test_chat.py
+tls:       ; docker run -d --name vibe-caddy --network host -v vibe-caddy-data:/data -v $$(pwd)/deploy/Caddyfile:/etc/caddy/Caddyfile caddy:2-alpine
+tls-stop:  ; docker rm -f vibe-caddy
 kill-ghosts: stop
 
 # Laboratory (FR-05.2/05.3): build the pinned pytorch image, drop into a shell
@@ -74,6 +78,20 @@ lab-run:  ; docker run --rm --gpus all --ipc=host -v $$(pwd)/laboratory:/lab -w 
 # proto/vibe/v1/control.proto; `make proto` must leave the tree clean.
 .PHONY: proto
 proto:
-	.venv/bin/python -m grpc_tools.protoc -I proto \
+	$(PY) -m grpc_tools.protoc -I proto \
 		--python_out=src/vibe/gen --grpc_python_out=src/vibe/gen --pyi_out=src/vibe/gen \
 		proto/vibe/v1/control.proto
+
+# Static type check over src/ and tests/ (pyright is a dev dependency, IMP-06.1).
+.PHONY: typecheck
+typecheck:
+	uv run pyright
+
+# Pre-commit gate (XR-8, IMP-06.10): lock is in sync, tests pass, pyright is
+# clean, and the root environment stays torch-free (NFR-05.1).
+.PHONY: check
+check:
+	uv lock --check
+	uv run --offline pytest -q
+	uv run pyright
+	uv sync --dry-run --offline

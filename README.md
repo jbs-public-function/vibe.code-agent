@@ -101,15 +101,42 @@ The `Makefile` loads your `.env` variables and exports them, then delegates ever
 | Command | Action / Description |
 | :--- | :--- |
 | `make` / `make help` | Displays the help menu and usage instructions. |
-| `make deepseek` | Loads **DeepSeek-R1 (14B AWQ)** (`deepseek-r1-14b`, container `vibe-deepseek-r1-14b`) on port `8010`. |
-| `make qwen` | Loads **Qwen-2.5-Coder (7B AWQ)** (`qwen2.5-coder-7b`, container `vibe-qwen2.5-coder-7b`) on port `8030`. |
-| `make llama` | Loads **Llama-3.1 (8B AWQ)** (`llama-3.1-8b`, container `vibe-llama-3.1-8b`) on port `8020`. |
+| `make deepseek` | Loads **DeepSeek-R1 (14B AWQ)** (`vibe load deepseek-r1-14b`). |
+| `make qwen` | Loads **Qwen-2.5-Coder (7B AWQ)** (`vibe load qwen2.5-coder-7b`). |
+| `make llama` | Loads **Llama-3.1 (8B AWQ)** (`vibe load llama-3.1-8b`). |
 | `make stop` | Stops and removes all managed vLLM containers, freeing GPU memory (`vibe unload`). |
 | `make status` | Prints the active model state and current GPU usage (`vibe status`). |
 | `make logs` | Follows the active container's logs (`vibe logs --follow`). |
 | `make validate` | Validates `.env` + `models.yaml` (exits 0 on success, 2 on error). |
-| `make list` | Lists registered models and their ports (`vibe list`). |
+| `make list` | Lists registered models with their aliases and ports (`vibe list`). |
+| `make serve` | Starts the control plane — controller + gateway + admin (`vibe serve`). |
+| `make admin` | Opens the admin UI at `http://localhost:8081` in a browser. |
+| `make chat` | Streams a test chat through the gateway (active model; lists aliases when none is loaded). |
+| `make tls` / `make tls-stop` | Start / stop the optional Caddy TLS front (requires Docker; persistent `vibe-caddy-data` volume). |
+| `make proto` | Regenerates committed gRPC code from `proto/vibe/v1/control.proto`. |
+| `make typecheck` | Runs pyright over `src/` and `tests/`. |
+| `make check` | Full pre-commit gate: lock check, tests, pyright, torch-free sync (XR-8). |
+| `make lab-build` | Builds the pinned pytorch laboratory image (`vibe-lab`). |
+| `make lab` | Opens a shell in the laboratory container (torch + CUDA). |
+| `make lab-run CMD="…"` | Runs one laboratory script in the container. |
 | `make kill-ghosts` | Alias for `make stop`. |
+
+### 3. `.env` keys (ADR-10)
+
+Every key is optional; defaults are in parentheses. See [`.env.example`](.env.example) for a copy-paste template.
+
+| Key | Default | Purpose |
+| :--- | :--- | :--- |
+| `HF_TOKEN` | _(empty)_ | Hugging Face read token for gated repos (Llama 3.1, …). |
+| `VIBE_DATA_DIR` | `~/.cache/huggingface` | Shared HF cache for vLLM containers and `laboratory/` — also `HF_HOME`. |
+| `VIBE_BIND` | `127.0.0.1` | Bind address for controller/gateway/admin (XR-1). |
+| `VIBE_SWAP_ON_REQUEST` | `false` | Gateway loads a non-active model on request instead of returning 503. |
+| `VIBE_SWAP_TIMEOUT` | `180` | How long (s) the gateway waits for a swap-on-request. |
+| `VIBE_LOAD_TIMEOUT` | `600` | Load readiness timeout (s). |
+| `VIBE_LOG_LEVEL` | `info` | Level for the shared structured logger. |
+| `VIBE_LOG_JSON` | _(unset)_ | `1` for JSON log lines instead of key=value. |
+| `VLLM_IMAGE_TAG` | _(required)_ | Pinned vLLM image tag — never `latest` (XR-6). |
+| `LAB_IMAGE_TAG` | `2.7.1-cuda12.6-cudnn9-devel` | pytorch base image for `make lab-build` (NFR-05.2). |
 
 ### 3. Workflow Examples
 
@@ -118,6 +145,16 @@ To hot-swap from your default reasoning model to your code assistant and monitor
 make qwen
 make status
 ```
+
+### 4. Troubleshooting
+
+| Symptom | Fix |
+| :--- | :--- |
+| `vibe status` says "controller unreachable" | Start it: `make serve` (or `vibe serve`). |
+| Chat returns `503 model_not_loaded` | `vibe load <alias>` first, or set `VIBE_SWAP_ON_REQUEST=true`. |
+| A load fails instantly / ports collide | `make kill-ghosts` purges stale managed and legacy containers, then retry. |
+| Admin UI links break behind `make tls` | Ensure Caddy forwards `X-Forwarded-Proto/Host` (default `reverse_proxy` does) and trust the CA with `caddy trust`. |
+| `uv sync` removes `pyright` | It is a dev dependency now — run `uv sync` once from a clean clone; `make check` is the gate. |
 
 ## Gateway & Zed integration
 

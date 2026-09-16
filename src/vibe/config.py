@@ -34,13 +34,14 @@ class Settings(BaseSettings):
     vibe_swap_on_request: bool = False
     vibe_swap_timeout: int = 180
     vibe_load_timeout: int = 600
+    vibe_log_level: str = "info"
     vllm_image_tag: str = ""
 
     @field_validator("vllm_image_tag")
     @classmethod
     def _check_image_tag(cls, v: str) -> str:
         tag = (v or "").strip()
-        if not tag or tag == "latest":
+        if not tag or tag.lower() == "latest":
             raise ValueError(
                 f"VLLM_IMAGE_TAG must be a pinned tag (e.g. {SUGGESTED_IMAGE_TAG}); "
                 "'latest' is rejected (XR-6)"
