@@ -1,6 +1,6 @@
 # 02 — Controller, Jobs, Docker, Registry Hardening
 
-> Priority: P1 · Depends on: 01-proto-additions (for IMP-02.2 only) · Status: Planned
+> Priority: P1 · Depends on: 01-proto-additions (for IMP-02.2 only) · Status: Implemented
 
 ## Summary
 
@@ -108,18 +108,26 @@ doc 01 already adds fields).
 
 ## Task breakdown
 
-- [ ] IMP-02.1, 02.5, 02.6 — `servicer.py` pump lifecycle.
-- [ ] IMP-02.2, 02.3 — `_effective_state`, unified `cached_locally`.
-- [ ] IMP-02.4 — `RemoveCached` in-flight guard (+ test).
-- [ ] IMP-02.7, 02.8 — `jobs.py` terminal no-op unload, broad cleanup catch.
-- [ ] IMP-02.9, 02.10, 02.11 — `docker_ctl.py` `to_thread` in `wait_ready`, `_call` helper, local-path policy.
-- [ ] IMP-02.12–02.15 — `downloads.py` ordering, attach key, close(), cancel notes.
-- [ ] IMP-02.16–02.18 — `cache.py` lock, newest-snapshot size, UTC.
-- [ ] IMP-02.19 — `server.py` signal handlers.
-- [ ] IMP-02.20–02.24 — `registry.py` writer lock + re-validate, GGUF detection, zero-weights error, fsync/mode, on-disk auto-port.
-- [ ] IMP-02.25, 02.26 — `client.py` exceptions; update admin `chat.py` and CLI `chat` handlers.
-- [ ] IMP-02.27, 02.28 — config/gpu polish.
-- [ ] Tests listed in `07-testing-and-acceptance.md` §Controller.
+- [x] IMP-02.1, 02.5, 02.6 — `servicer.py` pump lifecycle.
+- [x] IMP-02.2, 02.3 — `_effective_state`, unified `cached_locally`.
+- [x] IMP-02.4 — `RemoveCached` in-flight guard (+ test).
+- [x] IMP-02.7, 02.8 — `jobs.py` terminal no-op unload, broad cleanup catch.
+- [x] IMP-02.9, 02.10, 02.11 — `docker_ctl.py` `to_thread` in `wait_ready`, `_call` helper, local-path policy.
+- [x] IMP-02.12–02.15 — `downloads.py` ordering, attach key, close(), cancel notes.
+- [x] IMP-02.16–02.18 — `cache.py` lock, newest-snapshot size, UTC.
+- [x] IMP-02.19 — `server.py` signal handlers (`install_signals` param; IMP-03.1 composition root passes False).
+- [x] IMP-02.20–02.24 — `registry.py` writer lock + re-validate, GGUF detection, zero-weights error, fsync/mode, on-disk auto-port.
+- [x] IMP-02.25, 02.26 — `client.py` exceptions; update admin `chat.py` and CLI `chat` handlers.
+- [x] IMP-02.27, 02.28 — config/gpu polish.
+- [x] Tests listed in `07-testing-and-acceptance.md` §Controller.
+
+## Implementation notes
+
+- IMP-02.27 was already implemented (`_check_image_tag` compares `tag.lower() == "latest"` after `.strip()`); verified, no change.
+- IMP-02.25: the new `NoModelLoaded`/`UpstreamError` classes are `RuntimeError` subclasses with readable messages, so any generic `except Exception` handler (CLI, admin) displays them correctly. The CLI has no `chat` command; the admin `chat.py` UI is doc 04's scope and needs no change beyond its existing `except` path. `tests/test_admin.py::FakeControllerClient.job_events` must gain the new `follow` keyword when the admin worker adopts follow polling (see doc 01's note).
+- IMP-02.15: `max_workers=1` on `snapshot_download` + a comment explaining cooperative cancel; deleting partial `.incomplete` blobs on cancel was left out (they stay resumable, per FR-04.2).
+- IMP-02.20: lock/re-validate/copymode/fsync all in `write_entry`; the process-local `threading.Lock` comment cites XR-2/XR-3 (the controller is the only writer).
+- `wait_ready` now accepts `timeout_s: int | float` (sub-second timeouts are useful to tests; the deadline math was float already).
 
 ## Acceptance criteria
 

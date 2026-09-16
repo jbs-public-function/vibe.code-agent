@@ -9,6 +9,7 @@ real Docker daemon or NVML is touched (mirrors `test_client.py`).
 
 from __future__ import annotations
 
+import asyncio
 import socket
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
@@ -205,3 +206,89 @@ async def test_job_event_history_is_bounded(
     assert "job-0" not in servicer._job_events
     assert "job-8" in servicer._job_events
     assert len(servicer._job_events) == 8
+
+
+async def test_replayed_events_carry_kind_and_alias(controller: SimpleNamespace) -> None:
+    """IMP-01.1: every streamed and replayed event identifies its job."""
+    collected = await _drain(controller.client.load("qwen2.5-coder-7b"))
+    job_id = collected[0].job_id
+    assert all(event.kind == control_pb2.LOAD for event in collected)
+    assert all(event.alias == "qwen2.5-coder-7b" for event in collected)
+
+    replayed = await _replay(controller, job_id)
+    assert replayed
+    assert all(event.kind == control_pb2.LOAD for event in replayed)
+    assert all(event.alias == "qwen2.5-coder-7b" for event in replayed)
+
+    unload = await _drain(controller.client.unload())
+    unload_replayed = await _replay(controller, unload[0].job_id)
+    assert unload_replayed
+    assert all(event.kind == control_pb2.UNLOAD for event in unload_replayed)
+    assert all(event.alias == "" for event in unload_replayed)
+
+
+async def test_get_job_not_found_after_eviction(
+    settings: Settings, registry: Registry, fake_docker: Any
+) -> None:
+    """IMP-01.2: GetJob serves the bounded history; evicted jobs are
+    NOT_FOUND (KeyError)."""
+    ns = await _start(settings, registry, fake_docker, fake_gpu)
+    try:
+        job_ids: list[str] = []
+        for _ in range(9):  # JOB_HISTORY_JOBS = 8
+            events = await _drain(ns.client.load("qwen2.5-coder-7b"))
+            job_ids.append(events[0].job_id)
+        assert len(set(job_ids)) == 9
+
+        with pytest.raises(KeyError):
+            await ns.client.get_job(job_ids[0])
+        latest = await ns.client.get_job(job_ids[-1])
+        assert latest.terminal is True
+        assert latest.ok is True
+    finally:
+        await _stop(ns)
+
+
+async def test_job_events_follow_tails_live_events(
+    settings: Settings, registry: Registry, fake_docker: Any
+) -> None:
+    """IMP-01.7: follow=true replays and then tails until the terminal
+    event — no polling required."""
+    gate = asyncio.Event()
+
+    async def gated_wait_ready(spec: object, timeout_s: int) -> None:
+        await gate.wait()
+
+    fake_docker.wait_ready = gated_wait_ready
+    ns = await _start(settings, registry, fake_docker, fake_gpu)
+    try:
+        load_task = asyncio.create_task(
+            _drain(ns.client.load("qwen2.5-coder-7b"))
+        )
+        current = None
+        for _ in range(200):
+            current = ns.runner.current_job()
+            if current is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert current is not None
+
+        follower = ControllerClient(target=f"127.0.0.1:{ns.port}")
+        try:
+            stream = follower.job_events(current.id, follow=True)
+            first = await anext(stream)
+            assert first.job_id == current.id
+            assert first.kind == control_pb2.LOAD
+            assert first.alias == "qwen2.5-coder-7b"
+
+            gate.set()
+            remaining = [event async for event in stream]
+            assert remaining
+            assert remaining[-1].terminal is True
+            assert remaining[-1].state == control_pb2.READY
+        finally:
+            await follower.close()
+        collected = await load_task
+        assert collected[-1].state == control_pb2.READY
+    finally:
+        await _stop(ns)

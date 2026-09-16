@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import socket
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import grpc
@@ -17,6 +18,8 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from vibe.config import Settings
 from vibe.controller import RingBuffer, build_server
+from vibe.controller import servicer as servicer_mod
+from vibe.controller.server import run as controller_run
 from vibe.docker_ctl import DockerUnavailableError
 from vibe.gen.vibe.v1 import control_pb2, control_pb2_grpc
 from vibe.gpu import GpuProcess, GpuStats
@@ -362,7 +365,8 @@ async def test_concurrent_load_fails_precondition(settings, registry):
 
 
 async def test_client_cancel_does_not_abort_job(settings, registry):
-    """FR-02.11: cancelling LoadModel mid-stream keeps the job running."""
+    """FR-02.11: cancelling LoadModel mid-stream keeps the job running,
+    and GetStatus reports LOADING meanwhile (IMP-02.1/02.2)."""
     hold = asyncio.Event()
     events = job_events(JobState.UNLOADING, JobState.LOADING, JobState.READY)
     runner = FakeJobRunner(load_events=events, hold=hold, hold_at=1)
@@ -378,12 +382,23 @@ async def test_client_cancel_does_not_abort_job(settings, registry):
         first = await call.read()
         assert first.state == control_pb2.UNLOADING
 
+        # GetStatus reflects the in-flight job (IMP-02.2).
+        status = await stub.GetStatus(control_pb2.GetStatusRequest())
+        assert status.state == control_pb2.LOADING
+        assert status.HasField("current_job")
+        assert status.current_job.kind == control_pb2.LOAD
+        assert status.current_job.alias == "qwen2.5-coder-7b"
+        assert status.current_job.terminal is False
+
         call.cancel()
         await asyncio.sleep(0.1)  # let the server process the cancellation
 
-        # The job is still in flight after the client went away.
+        # The job is still in flight after the client went away, and
+        # GetStatus still shows LOADING.
         assert runner.current_job() is not None
         assert not runner.load_consumed
+        status = await stub.GetStatus(control_pb2.GetStatusRequest())
+        assert status.state == control_pb2.LOADING
 
         hold.set()
         for _ in range(200):
@@ -398,6 +413,266 @@ async def test_client_cancel_does_not_abort_job(settings, registry):
         assert any(
             event.state is JobState.READY for event in buffered
         )
+    finally:
+        await channel.close()
+        await server.stop(grace=0)
+
+
+async def test_keyerror_after_first_event_is_terminal_error(settings, registry):
+    """IMP-02.5: a KeyError after events started flowing is an escaped
+    exception (terminal ERROR event), not a NOT_FOUND startup error."""
+    events = job_events(JobState.UNLOADING, JobState.LOADING)
+    runner = FakeJobRunner(load_events=events, load_exc=KeyError("vanished"))
+    server, port = await start_server(
+        settings, registry, runner, FakeDocker(), RingBuffer()
+    )
+    channel, stub = await controller_stub(port)
+    try:
+        received = [
+            event
+            async for event in stub.LoadModel(
+                control_pb2.LoadModelRequest(alias="qwen2.5-coder-7b")
+            )
+        ]
+        assert [event.state for event in received] == [
+            control_pb2.UNLOADING,
+            control_pb2.LOADING,
+            control_pb2.ERROR,
+        ]
+        assert received[-1].terminal is True
+        assert "unexpected error" in received[-1].message
+    finally:
+        await channel.close()
+        await server.stop(grace=0)
+
+
+async def test_heartbeat_debug_events_during_hold(settings, registry, monkeypatch):
+    """NFR-02.5: a held job stream emits debug heartbeats every
+    HEARTBEAT_SECONDS."""
+    monkeypatch.setattr(servicer_mod, "HEARTBEAT_SECONDS", 0.05)
+    hold = asyncio.Event()
+    events = job_events(JobState.UNLOADING, JobState.LOADING, JobState.READY)
+    runner = FakeJobRunner(load_events=events, hold=hold, hold_at=1)
+    server, port = await start_server(
+        settings, registry, runner, FakeDocker(), RingBuffer()
+    )
+    channel, stub = await controller_stub(port)
+    try:
+        stream = stub.LoadModel(
+            control_pb2.LoadModelRequest(alias="qwen2.5-coder-7b")
+        ).__aiter__()
+        first = await anext(stream)
+        assert first.state == control_pb2.UNLOADING
+
+        heartbeats: list[control_pb2.JobEvent] = []
+
+        async def collect() -> None:
+            async for event in stream:
+                heartbeats.append(event)
+
+        collector = asyncio.create_task(collect())
+        for _ in range(200):
+            if any(
+                event.level == "debug"
+                and event.message == servicer_mod.HEARTBEAT_MESSAGE
+                for event in heartbeats
+            ):
+                break
+            await asyncio.sleep(0.01)
+        assert any(
+            event.level == "debug"
+            and event.message == servicer_mod.HEARTBEAT_MESSAGE
+            for event in heartbeats
+        )
+
+        hold.set()
+        await collector
+        assert heartbeats[-1].state == control_pb2.READY
+    finally:
+        await channel.close()
+        await server.stop(grace=0)
+
+
+# -- Chat proxy tests (FR-02.6) ----------------------------------------------
+
+
+class FakeChatResponse:
+    """Scriptable httpx response for the Chat proxy's SSE loop."""
+
+    def __init__(
+        self,
+        status_code: int = 200,
+        lines: list[str] | None = None,
+        body: bytes = b"",
+    ) -> None:
+        self.status_code = status_code
+        self._lines = list(lines or [])
+        self._body = body
+        self.aclose_calls = 0
+
+    async def __aenter__(self) -> "FakeChatResponse":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        pass
+
+    async def aread(self) -> bytes:
+        return self._body
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+    def aiter_lines(self):
+        async def _lines():
+            for line in self._lines:
+                yield line
+
+        return _lines()
+
+
+class FakeChatClient:
+    """Scriptable `httpx.AsyncClient`: one scripted `stream` response."""
+
+    def __init__(self, response: FakeChatResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> "FakeChatClient":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        pass
+
+    def stream(self, method: str, url: str, json=None) -> FakeChatResponse:
+        return self._response
+
+
+def _chat_docker() -> FakeDocker:
+    """FakeDocker with one running container for alias qwen2.5-coder-7b."""
+    docker = FakeDocker()
+    container = SimpleNamespace(name="vibe-qwen2.5-coder-7b", id="c" * 12)
+    docker.managed = [container]
+    docker.info_by_name[container.name] = {
+        "name": container.name,
+        "id": "c" * 12,
+        "status": "running",
+        "started_at": "2026-01-01T00:00:00Z",
+        "host_port": 8030,
+        "image": "vllm/vllm-openai:v0.11.2",
+        "alias": "qwen2.5-coder-7b",
+    }
+    return docker
+
+
+def _chat_request() -> control_pb2.ChatRequest:
+    return control_pb2.ChatRequest(
+        alias="qwen2.5-coder-7b",
+        messages=[control_pb2.ChatMessage(role="user", content="hi")],
+    )
+
+
+async def test_chat_sse_parsing(settings, registry, monkeypatch):
+    """Chat parses `data:` SSE lines into ChatChunks (FR-02.6)."""
+    response = FakeChatResponse(
+        lines=[
+            ": keep-alive",
+            'data: {"choices":[{"delta":{"content":"Hi"},'
+            '"finish_reason":null}],"usage":{}}',
+            "data: not-json",
+            'data: {"choices":[{"delta":{"content":"!"},"finish_reason":"stop"}],'
+            '"usage":{"prompt_tokens":7,"completion_tokens":2}}',
+            "data: [DONE]",
+        ]
+    )
+    monkeypatch.setattr(
+        servicer_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: FakeChatClient(response),
+    )
+    server, port = await start_server(
+        settings, registry, FakeJobRunner(), _chat_docker(), RingBuffer()
+    )
+    channel, stub = await controller_stub(port)
+    try:
+        chunks = [chunk async for chunk in stub.Chat(_chat_request())]
+        assert [chunk.delta for chunk in chunks] == ["Hi", "!"]
+        assert chunks[-1].finish_reason == "stop"
+        assert chunks[-1].prompt_tokens == 7
+        assert chunks[-1].completion_tokens == 2
+    finally:
+        await channel.close()
+        await server.stop(grace=0)
+
+
+async def test_chat_no_container_fails_precondition(settings, registry):
+    """Chat with no running container aborts FAILED_PRECONDITION (FR-02.6)."""
+    server, port = await start_server(
+        settings, registry, FakeJobRunner(), FakeDocker(), RingBuffer()
+    )
+    channel, stub = await controller_stub(port)
+    try:
+        call = stub.Chat(_chat_request())
+        with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+            await call.read()
+        assert excinfo.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        assert "no model loaded" in (excinfo.value.details() or "")
+    finally:
+        await channel.close()
+        await server.stop(grace=0)
+
+
+async def test_chat_upstream_500_becomes_unavailable(
+    settings, registry, monkeypatch
+):
+    """An upstream vLLM error surfaces as UNAVAILABLE with the status line."""
+    response = FakeChatResponse(status_code=500, body=b'{"error": "oom"}')
+    monkeypatch.setattr(
+        servicer_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: FakeChatClient(response),
+    )
+    server, port = await start_server(
+        settings, registry, FakeJobRunner(), _chat_docker(), RingBuffer()
+    )
+    channel, stub = await controller_stub(port)
+    try:
+        call = stub.Chat(_chat_request())
+        with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+            await call.read()
+        assert excinfo.value.code() == grpc.StatusCode.UNAVAILABLE
+        assert "model server returned 500" in (excinfo.value.details() or "")
+    finally:
+        await channel.close()
+        await server.stop(grace=0)
+
+
+async def test_chat_cancel_acloses_upstream(settings, registry, monkeypatch):
+    """Cancelling the Chat RPC closes the upstream response (FR-02.11)."""
+    response = FakeChatResponse(
+        lines=[
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+            'data: {"choices":[{"delta":{"content":"there"}}]}',
+            'data: {"choices":[{"delta":{"content":"more"}}]}',
+        ]
+    )
+    monkeypatch.setattr(
+        servicer_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: FakeChatClient(response),
+    )
+    server, port = await start_server(
+        settings, registry, FakeJobRunner(), _chat_docker(), RingBuffer()
+    )
+    channel, stub = await controller_stub(port)
+    try:
+        call = stub.Chat(_chat_request())
+        first = await call.read()
+        assert first.delta == "Hi"
+        call.cancel()
+        for _ in range(200):
+            if response.aclose_calls:
+                break
+            await asyncio.sleep(0.01)
+        assert response.aclose_calls == 1
     finally:
         await channel.close()
         await server.stop(grace=0)
@@ -514,3 +789,27 @@ async def test_stream_logs_replays_buffer(settings, registry):
     finally:
         await channel.close()
         await server.stop(grace=0)
+
+
+async def test_run_returns_on_stop_and_closes_downloads(settings, registry):
+    """IMP-02.19/02.14: `run(server, install_signals=False)` blocks until
+    the server stops, then closes the download executor."""
+    port = free_port()
+    runner: Any = FakeJobRunner()
+    docker: Any = FakeDocker()
+    server = await build_server(
+        settings,
+        registry,
+        runner=runner,
+        docker=docker,
+        gpu_fn=lambda: FAKE_GPU_STATS,
+        buffer=RingBuffer(),
+        port=port,
+    )
+    task = asyncio.create_task(controller_run(server, install_signals=False))
+    for _ in range(200):
+        if getattr(server, "_state", None) is not None:
+            break
+        await asyncio.sleep(0.01)
+    await server.stop(grace=0)
+    await asyncio.wait_for(task, timeout=5)

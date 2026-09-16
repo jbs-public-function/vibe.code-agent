@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import threading
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -247,6 +248,35 @@ def test_load_rejects_bad_yaml_in_any_document(tmp_path):
     assert any("not valid YAML" in error for error in excinfo.value.errors)
 
 
+def test_load_rejects_duplicate_alias_across_documents(tmp_path):
+    """Uniqueness is enforced on the merged stream, not per document."""
+    path = tmp_path / "models.yaml"
+    first = {"models": [_entry("dup", host_port=8001, container_name="vibe-dup-1")]}
+    second = {"models": [_entry("dup", host_port=8002, container_name="vibe-dup-2")]}
+    path.write_text(
+        yaml.safe_dump(first, sort_keys=False)
+        + "\n---\n"
+        + yaml.safe_dump(second, sort_keys=False)
+    )
+    with pytest.raises(RegistryError) as excinfo:
+        Registry.load(path)
+    assert any("duplicate alias: dup" in error for error in excinfo.value.errors)
+
+
+def test_load_rejects_duplicate_port_across_documents(tmp_path):
+    path = tmp_path / "models.yaml"
+    first = {"models": [_entry("a", host_port=8001, container_name="vibe-a")]}
+    second = {"models": [_entry("b", host_port=8001, container_name="vibe-b")]}
+    path.write_text(
+        yaml.safe_dump(first, sort_keys=False)
+        + "\n---\n"
+        + yaml.safe_dump(second, sort_keys=False)
+    )
+    with pytest.raises(RegistryError) as excinfo:
+        Registry.load(path)
+    assert any("duplicate host_port: 8001" in error for error in excinfo.value.errors)
+
+
 def test_load_rejects_non_mapping_document(tmp_path):
     path = tmp_path / "models.yaml"
     good = yaml.safe_dump(
@@ -444,6 +474,44 @@ def test_propose_rejects_gguf_only_repo(tmp_path, registry):
         {"hf_repo": "org/gguf", "alias": "gguf"}, CacheScanner(tmp_path)
     )
     assert any("laboratory/inference_gguf.py" in error for error in errors)
+
+
+def test_propose_rejects_realistic_gguf_repo(tmp_path, registry):
+    """IMP-02.21: real GGUF repos ship README + config.json alongside the
+    .gguf weights, so 'every file is .gguf' never matches them."""
+    _make_hub_repo(
+        tmp_path,
+        "org/gguf-real",
+        {
+            "README.md": b"# gguf repo",
+            "config.json": b"{}",
+            "model-Q4_K_M.gguf": b"gguf",
+        },
+    )
+    entry, warnings, errors = registry.propose(
+        {"hf_repo": "org/gguf-real", "alias": "gguf-real"}, CacheScanner(tmp_path)
+    )
+    assert any("laboratory/inference_gguf.py" in error for error in errors)
+    # The GGUF hint replaces the generic weightless-refusal (IMP-02.22).
+    assert all("no *.safetensors" not in error for error in errors)
+
+
+def test_propose_zero_weights_rejected(tmp_path, registry):
+    """IMP-02.22: cached but weightless repos are refused, never bucketed
+    into the ≤3 GiB heuristic."""
+    _make_hub_repo(tmp_path, "org/empty", {"config.json": b"{}"})
+    entry, warnings, errors = registry.propose(
+        {"hf_repo": "org/empty", "alias": "empty"}, CacheScanner(tmp_path)
+    )
+    assert any("no *.safetensors" in error for error in errors)
+
+
+def test_propose_rejects_unexpanded_tilde(tmp_path, registry):
+    """IMP-02.11: vLLM cannot see an unexpanded `~` — demand the full path."""
+    entry, warnings, errors = registry.propose(
+        {"hf_repo": "~/models/x", "alias": "x"}, CacheScanner(tmp_path)
+    )
+    assert any("unexpanded" in error for error in errors)
 
 
 def test_propose_allows_mixed_gguf_and_safetensors(tmp_path, registry):
@@ -718,6 +786,122 @@ def test_write_entry_missing_file(tmp_path):
     assert any("not found" in e for e in errors)
 
 
+def test_write_entry_round_trips_special_characters(tmp_path):
+    """`use_case`/`display_name` with quotes, semicolons and unicode survive
+    the append → reload round-trip (IMP-02.20 re-validation path)."""
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"models": [_entry("first", host_port=8001, container_name="vibe-first")]},
+            sort_keys=False,
+        )
+    )
+    registry = Registry.load(path)
+    entry = _entry(
+        "special",
+        host_port=8002,
+        container_name="vibe-special",
+        use_case='quotes " and ; semicolons',
+        display_name='Display "special" — 中文 🎉',
+    )
+    assert registry.write_entry(entry) == []
+    on_disk = Registry.load(path)
+    spec = on_disk.get("special")
+    assert spec.use_case == entry["use_case"]
+    assert spec.display_name == entry["display_name"]
+
+
+def test_write_entry_preserves_file_mode(tmp_path):
+    """IMP-02.23: the atomic replace keeps the file's mode."""
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"models": [_entry("first", host_port=8001, container_name="vibe-first")]},
+            sort_keys=False,
+        )
+    )
+    path.chmod(0o640)
+    registry = Registry.load(path)
+    assert (
+        registry.write_entry(
+            _entry("second", host_port=8002, container_name="vibe-second")
+        )
+        == []
+    )
+    assert path.stat().st_mode & 0o777 == 0o640
+
+
+def test_write_entry_concurrent_single_winner(tmp_path):
+    """IMP-02.20: two concurrent writes of the same entry — exactly one
+    succeeds, the other reports the duplicate, and the file re-loads."""
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"models": [_entry("first", host_port=8001, container_name="vibe-first")]},
+            sort_keys=False,
+        )
+    )
+    registry = Registry.load(path)
+    entry = _entry("second", host_port=8002, container_name="vibe-second")
+    barrier = threading.Barrier(2)
+    results: list[list[str]] = []
+
+    def attempt() -> None:
+        barrier.wait()
+        results.append(registry.write_entry(dict(entry)))
+
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(results) == [
+        [],
+        [
+            "duplicate alias: second",
+            "duplicate host_port: 8002",
+            "duplicate container_name: vibe-second",
+        ],
+    ]
+    on_disk = Registry.load(path)
+    assert on_disk.aliases == ["first", "second"]
+    assert "added by vibe register" in path.read_text()
+
+
+def test_propose_auto_port_from_on_disk_registry(tmp_path):
+    """IMP-02.24: with `self.path` set, the auto-port comes from the on-disk
+    registry so it matches what `write_entry` re-checks."""
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"models": [_entry("first", host_port=8001, container_name="vibe-first")]},
+            sort_keys=False,
+        )
+    )
+    registry = Registry.load(path)
+    # The file grows an entry (port 8010) the in-memory snapshot does not know.
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "models": [
+                    _entry("first", host_port=8001, container_name="vibe-first"),
+                    _entry("second", host_port=8010, container_name="vibe-second"),
+                ]
+            },
+            sort_keys=False,
+        )
+    )
+    repo_dir = _make_hub_repo(tmp_path, "org/small", {"config.json": b"{}"})
+    _weights(repo_dir, 2)
+    entry, warnings, errors = registry.propose(
+        {"hf_repo": "org/small", "alias": "small"}, CacheScanner(tmp_path)
+    )
+    assert errors == []
+    # Memory-only would answer 8010; the on-disk registry says 8011.
+    assert entry["host_port"] == 8011
+
+
 # -- Phase 4: in-process registry RPCs ----------------------------------------
 
 
@@ -839,6 +1023,11 @@ async def test_propose_and_write_registration_rpc(tmp_path, fake_docker):
         assert proposed.model.gpu_memory_utilization == pytest.approx(0.60)
         assert proposed.model.state == control_pb2.AVAILABLE
         assert proposed.model.cached_locally is True
+        # IMP-01.5: the response round-trips a full registry entry.
+        assert proposed.model.container_name == "vibe-small"
+        assert list(proposed.model.extra_args) == []
+        assert "# --- added by vibe register" in proposed.model.yaml_preview
+        assert "alias: small" in proposed.model.yaml_preview
 
         written = await ns.client.write_registration(spec)
         assert written.ok is True

@@ -6,6 +6,7 @@ import types
 
 import pytest
 
+from vibe.docker_ctl import ContainerExited
 from vibe.gpu import GpuProcess, GpuStats
 from vibe.jobs import JobInProgress, JobRunner, JobState
 
@@ -96,8 +97,9 @@ async def test_unload_nothing_to_unload(settings, registry, fake_docker):
 
     assert events[0].state == JobState.UNLOADING
     assert any("nothing to unload" in event.message for event in events)
-    # nothing purged -> no AVAILABLE-state event, only the message
-    assert all(event.state != JobState.AVAILABLE for event in events)
+    # IMP-02.7: the no-op unload ends with a terminal AVAILABLE event so
+    # clients can tell "done" from "disconnected" (FR-02.4).
+    assert events[-1].state == JobState.AVAILABLE
     assert runner.current_job() is None
 
 
@@ -112,6 +114,48 @@ async def test_unload_removes_containers(settings, registry, fake_docker):
     )
     assert events[-1].state == JobState.AVAILABLE
     assert runner.current_job() is None
+
+
+async def test_load_container_exited_reports_last_logs(settings, registry, fake_docker):
+    """ContainerExited surfaces the tail logs and cleans up (FR-00.11,
+    IMP-02.8). The generator re-raises after the ERROR event by design."""
+    fake_docker.wait_ready_error = ContainerExited(
+        "container vibe-x exited before becoming ready",
+        last_logs="line-1\nline-2",
+    )
+    runner = make_runner(settings, registry, fake_docker)
+    events = []
+    with pytest.raises(ContainerExited):
+        async for event in runner.load("qwen2.5-coder-7b"):
+            events.append(event)
+
+    assert events[-1].state == JobState.ERROR
+    assert "line-1" in events[-1].message
+    # Best-effort cleanup ran (keep_failed defaults to False).
+    assert len(fake_docker.stopped) == 1
+    assert runner.current_job() is None
+
+
+async def test_load_container_exited_cleanup_failure_keeps_cause(
+    settings, registry, fake_docker
+):
+    """IMP-02.8: a cleanup failure never masks the readiness error."""
+    fake_docker.wait_ready_error = ContainerExited(
+        "container vibe-x exited before becoming ready"
+    )
+
+    def boom(container) -> None:
+        raise RuntimeError("docker SDK APIError during stop")
+
+    fake_docker.stop = boom
+    runner = make_runner(settings, registry, fake_docker)
+    events = []
+    with pytest.raises(ContainerExited):
+        async for event in runner.load("qwen2.5-coder-7b"):
+            events.append(event)
+
+    assert events[-1].state == JobState.ERROR
+    assert "vibe-x exited" in events[-1].message
 
 
 # -- status ------------------------------------------------------------------------

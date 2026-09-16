@@ -70,6 +70,9 @@ class JobEvent:
 class JobInProgress(RuntimeError):
     """A job is already running; a second concurrent one is rejected."""
 
+    def __init__(self, message: str = "a job is already running") -> None:
+        super().__init__(message)
+
 
 def _now() -> datetime:
     """Current UTC timestamp for every job and event timestamp."""
@@ -199,8 +202,11 @@ class JobRunner:
             if not keep_failed and container is not None:
                 try:
                     await asyncio.to_thread(self.docker.stop, container)
-                except DockerError:
-                    pass  # best-effort cleanup; never mask the real error
+                except Exception:  # noqa: BLE001
+                    # IMP-02.8: best-effort cleanup — an SDK APIError (or
+                    # anything else) during `stop` must never mask the real
+                    # cause of the failure.
+                    pass
             yield JobEvent(_now(), "error", message, state=JobState.ERROR)
             raise
         except DockerError as exc:
@@ -237,10 +243,14 @@ class JobRunner:
                     _now(), "info", "all models unloaded", state=JobState.AVAILABLE
                 )
             else:
+                # IMP-02.7: the no-op unload must still terminate — with
+                # state=AVAILABLE so clients can tell "done" from
+                # "disconnected" (FR-02.4).
                 yield JobEvent(
                     _now(),
                     "info",
                     "nothing to unload — no managed or legacy containers found",
+                    state=JobState.AVAILABLE,
                 )
             outcome = JobState.AVAILABLE
         except DockerError as exc:

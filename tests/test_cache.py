@@ -138,11 +138,16 @@ def test_scan_without_registry_has_no_aliases(tmp_path: Path) -> None:
 # -- weights -----------------------------------------------------------------
 
 
-def test_weights_bytes_sums_across_snapshots(tmp_path: Path) -> None:
+def test_weights_bytes_newest_snapshot_only(tmp_path: Path) -> None:
+    """Only the snapshot the `main` ref points at is measured (IMP-02.17)."""
     make_cache_layout(tmp_path, "org/repo", {"model.safetensors": b"x" * 300})
-    make_cache_layout(tmp_path, "org/repo", {"model.safetensors": b"x" * 100}, rev="b" * 40)
+    make_cache_layout(
+        tmp_path, "org/repo", {"model.safetensors": b"x" * 100}, rev="b" * 40
+    )
     scanner = CacheScanner(tmp_path)
-    assert scanner.weights_bytes("org/repo") == 400
+    # refs/main points at the second revision; the first is ignored so
+    # weights are never double-counted across revisions.
+    assert scanner.weights_bytes("org/repo") == 100
     assert scanner.weights_bytes("org/missing") is None
 
 
@@ -205,6 +210,21 @@ def test_is_cached(tmp_path: Path) -> None:
     model_dir.mkdir()
     assert scanner.is_cached(str(model_dir)) is True
     assert scanner.is_cached(str(tmp_path / "nope")) is False
+
+
+def test_is_cached_case_insensitive(tmp_path: Path) -> None:
+    """IMP-02.3: hub repo ids compare case-insensitively."""
+    make_cache_layout(tmp_path, "org/repo", {"model.safetensors": b"x"})
+    scanner = CacheScanner(tmp_path)
+    assert scanner.is_cached("ORG/Repo") is True
+
+
+def test_is_cached_tilde_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """IMP-02.11: `~` paths are expanded before the local-dir check."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    assert CacheScanner(tmp_path).is_cached("~/models") is True
 
 
 # -- disk usage --------------------------------------------------------------

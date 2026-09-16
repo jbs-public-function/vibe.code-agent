@@ -20,6 +20,9 @@ service ModelController {
   // Phase 3 (additive): replay buffered events for a job the caller did not start.
   rpc GetJobEvents(GetJobEventsRequest) returns (stream JobEvent);
 
+  // Phase 3 (additive): one job's summary from the bounded history (IMP-01.2).
+  rpc GetJob(GetJobRequest) returns (Job);
+
   // Phase 4 (additive): registry / HF-cache management.
   rpc ReloadRegistry(ReloadRegistryRequest) returns (ReloadRegistryResponse);
   rpc ListCache(ListCacheRequest) returns (ListCacheResponse);
@@ -49,6 +52,9 @@ message ModelInfo {
   string use_case = 9;
   ModelState state = 10;
   bool cached_locally = 11;
+  string container_name = 12;
+  repeated string extra_args = 13;
+  string yaml_preview = 14;
 }
 
 message ListModelsRequest {}
@@ -79,7 +85,13 @@ message Job {
   int64 started_at_unix = 4;
   bool done = 5;
   bool ok = 6;
+  bool terminal = 7;
+  string last_error = 8;
+  int64 started_at_unix_ms = 9;
+  int64 finished_at_unix_ms = 10;
 }
+
+message GetJobRequest { string job_id = 1; }
 
 message JobEvent {
   string job_id = 1;
@@ -89,6 +101,8 @@ message JobEvent {
   ModelState state = 5;
   float progress = 6;
   bool terminal = 7;
+  JobKind kind = 8;
+  string alias = 9;
 }
 
 message LoadModelRequest {
@@ -98,7 +112,7 @@ message LoadModelRequest {
   int32 timeout_s = 4;  // 0 = use VIBE_LOAD_TIMEOUT
 }
 message UnloadModelRequest {}
-message GetJobEventsRequest { string job_id = 1; }
+message GetJobEventsRequest { string job_id = 1; bool follow = 2; }
 
 message StreamLogsRequest { int32 tail = 1; bool follow = 2; }
 message LogLine { int64 ts_unix_ms = 1; string line = 2; }
@@ -137,6 +151,10 @@ message DownloadInfo {
   bool done = 7;
   bool ok = 8;
   string error = 9;
+  string current_file = 10;
+  string revision = 11;
+  int64 started_at_unix_ms = 12;
+  int64 finished_at_unix_ms = 13;
 }
 message ListDownloadsResponse { repeated DownloadInfo downloads = 1; }
 message DownloadModelRequest {
@@ -152,6 +170,7 @@ message DownloadProgress {
   string current_file = 5;
   bool terminal = 6;
   string error = 7;
+  bool ok = 8;
 }
 message CancelDownloadRequest { string id = 1; }
 message CancelDownloadResponse { bool cancelled = 1; }
@@ -172,6 +191,8 @@ message RegistrationSpec {
   string use_case = 8;
   repeated string tags = 9;
   string display_name = 10;
+  string container_name = 11;
+  repeated string extra_args = 12;
 }
 message ProposeRegistrationRequest { RegistrationSpec spec = 1; }
 message ProposeRegistrationResponse {

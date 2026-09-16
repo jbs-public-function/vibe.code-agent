@@ -18,7 +18,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import textwrap
+import threading
 import uuid
 from collections import Counter
 from collections.abc import Iterator
@@ -37,6 +39,13 @@ PORT_MIN, PORT_MAX = 1, 65535
 
 # `vibe register` defaults allocate host ports in this range (FR-04.5).
 REGISTER_PORT_MIN, REGISTER_PORT_MAX = 8010, 8099
+
+# IMP-02.20: serialize `write_entry` end-to-end (load → duplicate checks →
+# append → os.replace) so two concurrent `WriteRegistration` calls cannot
+# both pass the checks (e.g. the same auto-port) and produce a file that
+# fails to reload. A process-local lock suffices: the controller is the
+# only writer of models.yaml (XR-2/XR-3); everything else only reads it.
+_WRITE_LOCK = threading.Lock()
 
 QUANTIZATIONS = {"awq", "gptq", "none"}
 TOOL_PARSERS = ("hermes", "llama3_json")
@@ -267,6 +276,13 @@ class Registry:
         alias = str(raw.get("alias") or "").strip()
         if not hf_repo:
             errors.append("hf_repo is required")
+        elif hf_repo.startswith("~"):
+            # IMP-02.11: vLLM cannot see an unexpanded `~` (there is no
+            # mount for it) — require the absolute path instead.
+            errors.append(
+                f"hf_repo must be an absolute path, not an unexpanded '~' — "
+                f"vLLM cannot see '{hf_repo}'; use the full path"
+            )
         elif not _is_local_path(hf_repo) and "/" not in hf_repo:
             errors.append(
                 f"hf_repo must be 'org/repo' or an absolute path, got '{hf_repo}'"
@@ -297,7 +313,10 @@ class Registry:
                     f"host_port must be in [{PORT_MIN}, {PORT_MAX}], got {host_port}"
                 )
         else:
-            host_port = self._next_free_port()
+            # IMP-02.24: compute the auto-port from the on-disk registry
+            # when a path is set, so the port `propose` suggests is the one
+            # `write_entry` re-checks against the freshly loaded file.
+            host_port = self._next_free_port(self.path)
             if host_port is None:
                 errors.append(
                     f"no free port in {REGISTER_PORT_MIN}–{REGISTER_PORT_MAX}"
@@ -340,10 +359,24 @@ class Registry:
                 errors.append(
                     f"download the repo first: `vibe download {hf_repo}`"
                 )
-            if files and all(path.suffix == ".gguf" for path in files):
+            # IMP-02.21: real GGUF repos ship a README and config.json, so
+            # "every file is .gguf" never matches them — detect GGUF repos
+            # as "has .gguf weights and no .safetensors/.bin weights".
+            has_gguf = any(path.suffix == ".gguf" for path in files)
+            has_weights = any(
+                path.suffix in {".safetensors", ".bin"} for path in files
+            )
+            if has_gguf and not has_weights:
                 errors.append(
                     "GGUF-only repos are not served by vLLM in v1 — "
                     "use laboratory/inference_gguf.py (Phase 5)"
+                )
+            elif weights == 0:
+                # IMP-02.22: cached but weightless — taking the ≤3 GiB
+                # bucket would produce an unservable vLLM entry.
+                errors.append(
+                    f"no *.safetensors weights found in '{hf_repo}' — "
+                    "vLLM cannot serve it"
                 )
             config = _read_config_json(files)
 
@@ -449,53 +482,95 @@ class Registry:
         }
         return entry, warnings, errors
 
+    def render_entry(self, entry: dict[str, Any]) -> str:
+        """The exact YAML document `write_entry` would append (IMP-01.5).
+
+        `ProposeRegistration` fills `ModelInfo.yaml_preview` from this so the
+        admin can print the controller's YAML instead of re-implementing the
+        serialisation (XR-3).
+        """
+        return _registration_document(entry)
+
     def write_entry(self, entry: dict[str, Any]) -> list[str]:
         """Append one validated entry to `models.yaml` atomically (FR-04.5).
 
         The entry is validated as a `ModelSpec` and against the current
         on-disk registry; nothing is written unless every check passes
         (NFR-04.4). The block is appended with a `vibe register` marker
-        comment (NFR-04.3); the write is a temp file + `os.replace`.
+        comment (NFR-04.3); the write is a temp file + `os.replace` under a
+        process-local lock, and the merged text is re-validated before the
+        replace (IMP-02.20).
         """
         try:
             spec = ModelSpec.model_validate(entry)
         except ValidationError as exc:
             return _format_validation_errors(exc, prefix="models[0]")
 
-        path = self.path or self.default_path()
-        try:
-            current = Registry.load(path)
-        except RegistryError as exc:
-            return exc.errors
-        errors: list[str] = []
-        if spec.alias in current:
-            errors.append(f"duplicate alias: {spec.alias}")
-        if current.by_port(spec.host_port) is not None:
-            errors.append(f"duplicate host_port: {spec.host_port}")
-        if any(s.container_name == spec.container_name for s in current.all()):
-            errors.append(f"duplicate container_name: {spec.container_name}")
-        if errors:
-            return errors
+        with _WRITE_LOCK:
+            path = self.path or self.default_path()
+            try:
+                current = Registry.load(path)
+            except RegistryError as exc:
+                return exc.errors
+            errors: list[str] = []
+            if spec.alias in current:
+                errors.append(f"duplicate alias: {spec.alias}")
+            if current.by_port(spec.host_port) is not None:
+                errors.append(f"duplicate host_port: {spec.host_port}")
+            if any(s.container_name == spec.container_name for s in current.all()):
+                errors.append(f"duplicate container_name: {spec.container_name}")
+            if errors:
+                return errors
 
-        try:
-            original = path.read_text()
-        except OSError as exc:
-            return [f"cannot read {path}: {exc}"]
-        if original and not original.endswith("\n"):
-            original += "\n"
-        document = _registration_document(entry)
-        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
-        try:
-            tmp.write_text(original + document)
-            os.replace(tmp, path)
-        except OSError as exc:
-            tmp.unlink(missing_ok=True)
-            return [f"cannot write {path}: {exc}"]
+            try:
+                original = path.read_text()
+            except OSError as exc:
+                return [f"cannot read {path}: {exc}"]
+            if original and not original.endswith("\n"):
+                original += "\n"
+            merged = original + self.render_entry(entry)
+            try:
+                # IMP-02.20: re-validate the exact bytes that will land on
+                # disk — a concurrent hand-edit can invalidate the merge
+                # between the check above and the replace below.
+                documents = yaml.safe_load_all(merged)
+                merged_models = [
+                    model
+                    for document in documents
+                    if isinstance(document, dict)
+                    for model in document.get("models", [])
+                ]
+                Registry.from_dict({"models": merged_models})
+            except RegistryError as exc:
+                return exc.errors
+            tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+            try:
+                tmp.write_text(merged)
+                # IMP-02.23: keep the file's mode across the replace and
+                # fsync the temp before renaming so a crash cannot leave a
+                # truncated models.yaml.
+                shutil.copymode(path, tmp)
+                with tmp.open("rb") as fh:
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+            except OSError as exc:
+                tmp.unlink(missing_ok=True)
+                return [f"cannot write {path}: {exc}"]
         return []
 
-    def _next_free_port(self) -> int | None:
-        """First unused port in `REGISTER_PORT_MIN`-`REGISTER_PORT_MAX`."""
+    def _next_free_port(self, path: Path | None = None) -> int | None:
+        """First unused port in `REGISTER_PORT_MIN`-`REGISTER_PORT_MAX`.
+
+        With a `path`, the in-memory snapshot is refreshed from the on-disk
+        registry first (IMP-02.24); a broken file degrades to the live
+        snapshot so `propose` still answers.
+        """
         used = {spec.host_port for spec in self._by_alias.values()}
+        if path is not None:
+            try:
+                used |= {spec.host_port for spec in Registry.load(path)}
+            except RegistryError:
+                pass
         for port in range(REGISTER_PORT_MIN, REGISTER_PORT_MAX + 1):
             if port not in used:
                 return port
@@ -567,8 +642,12 @@ def _humanize_repo(hf_repo: str) -> str:
 
 
 def _is_local_path(repo: str) -> bool:
-    """Whether `repo` is an absolute local path (Phase 5 round-trip)."""
-    return repo.startswith(("/", "~"))
+    """Whether `repo` is an absolute local path (Phase 5 round-trip).
+
+    IMP-02.11: `~` paths are rejected by `propose` before this runs — vLLM
+    cannot see an unexpanded tilde, and only absolute paths get a mount.
+    """
+    return repo.startswith("/")
 
 
 def _to_int(value: Any) -> int | None:

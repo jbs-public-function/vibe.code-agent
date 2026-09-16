@@ -9,9 +9,18 @@ from __future__ import annotations
 import csv
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 
 _MIB = 1024 * 1024
+
+# IMP-02.28: the admin dashboard refreshes GPU stats every few seconds and
+# each refresh spawns ~2 `nvidia-smi` processes; cache the fallback for 1 s
+# so bursts of callers (dashboard + `vibe status`) share one pair of reads.
+_SMI_TTL_SECONDS = 1.0
+
+# (monotonic timestamp, stats) — only ever written by the nvidia-smi path.
+_smi_cache: tuple[float, GpuStats] | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,18 @@ def get_gpu_stats() -> GpuStats:
             "no GPU stats available: NVML failed and nvidia-smi is not installed"
         )
 
+    global _smi_cache
+    now = time.monotonic()
+    cached = _smi_cache
+    if cached is not None and now - cached[0] < _SMI_TTL_SECONDS:
+        return cached[1]
+    stats = _smi_stats()
+    _smi_cache = (now, stats)
+    return stats
+
+
+def _smi_stats() -> GpuStats:
+    """One fresh pair of `nvidia-smi` reads, parsed into `GpuStats`."""
     gpu_stats = parse_gpu_csv(
         _run_smi(
             [

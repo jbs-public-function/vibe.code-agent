@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import time
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
@@ -83,6 +84,7 @@ class DownloadProgress:
     current_file: str
     terminal: bool
     error: str
+    ok: bool
 
 
 @dataclass
@@ -105,6 +107,8 @@ class DownloadHandle:
     bytes_done: int = 0
     bytes_total: int = 0
     current_file: str = ""
+    started_at_unix_ms: int = 0
+    finished_at_unix_ms: int = 0
     cancel_event: Event = field(default_factory=Event)
     subscribers: set[asyncio.Queue[DownloadProgress]] = field(
         default_factory=set
@@ -122,6 +126,17 @@ def _repo_key(hf_repo: str) -> str:
     if repo.startswith(("/", "~")):
         return str(Path(repo).expanduser().resolve())
     return repo.lower()
+
+
+def _download_key(
+    hf_repo: str, revision: str, include: Sequence[str]
+) -> tuple[str, str, tuple[str, ...]]:
+    """Attach-to-in-flight identity (IMP-02.13): repo, revision, include."""
+    return (_repo_key(hf_repo), revision.strip(), tuple(sorted(include)))
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def _friendly_hf_error(exc: Exception, repo: str) -> str:
@@ -154,10 +169,18 @@ class DownloadManager:
         self._hf_token = settings.hf_token
         self._cache_dir = settings.hf_home / "hub"
         self._executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-        self._inflight: dict[str, DownloadHandle] = {}
+        self._inflight: dict[tuple[str, str, tuple[str, ...]], DownloadHandle] = {}
         self._history: deque[DownloadHandle] = deque(maxlen=HISTORY_LIMIT)
 
     # -- lifecycle ---------------------------------------------------------
+
+    def close(self) -> None:
+        """Shut the executor down without waiting (IMP-02.14).
+
+        `cancel_futures=True` drops queued downloads; an already-running
+        worker finishes its current file and its handle stays in history.
+        """
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def start(
         self,
@@ -168,15 +191,26 @@ class DownloadManager:
         """Start a download, or attach to an in-flight one (FR-04.1).
 
         Must be called on the event loop so the progress-push loop can be
-        captured. Raises `ValueError` for an empty repo id.
+        captured. Raises `ValueError` for an empty repo id, and for a repo
+        that is already downloading a different revision/include set
+        (IMP-02.13) — attaching silently would report the wrong files.
         """
         repo = hf_repo.strip()
         if not repo:
             raise ValueError("hf_repo is required")
+        include_list = list(include or [])
+        revision_clean = (revision or "").strip()
+        key = _download_key(repo, revision_clean, include_list)
         self._reap_done()
-        existing = self._inflight.get(_repo_key(repo))
+        existing = self._inflight.get(key)
         if existing is not None:
             return existing  # FR-04.1: duplicates attach to the running one
+        for handle in self._inflight.values():
+            if _repo_key(handle.hf_repo) == _repo_key(repo):
+                raise ValueError(
+                    f"a download for '{repo}' is already in flight with "
+                    "different files — cancel it or wait for it to finish"
+                )
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -184,13 +218,22 @@ class DownloadManager:
         handle = DownloadHandle(
             id=uuid.uuid4().hex[:8],
             hf_repo=repo,
-            include=list(include or []),
-            revision=(revision or "").strip(),
+            include=include_list,
+            revision=revision_clean,
+            started_at_unix_ms=_now_ms(),
             loop=loop,
         )
-        self._inflight[_repo_key(repo)] = handle
+        self._inflight[key] = handle
         self._executor.submit(self._run, handle)
         return handle
+
+    def is_inflight(self, hf_repo: str) -> bool:
+        """Whether a download for this repo is currently running (IMP-02.4)."""
+        self._reap_done()
+        return any(
+            _repo_key(handle.hf_repo) == _repo_key(hf_repo)
+            for handle in self._inflight.values()
+        )
 
     def cancel(self, download_id: str) -> bool:
         """Request cooperative cancellation; False when unknown or done."""
@@ -249,7 +292,7 @@ class DownloadManager:
                 self._reap(handle)
 
     def _reap(self, handle: DownloadHandle) -> None:
-        key = _repo_key(handle.hf_repo)
+        key = _download_key(handle.hf_repo, handle.revision, handle.include)
         if self._inflight.get(key) is handle:
             del self._inflight[key]
         if not any(h.id == handle.id for h in self._history):
@@ -278,6 +321,9 @@ class DownloadManager:
                     token=self._hf_token or None,
                     cache_dir=str(self._cache_dir),
                     tqdm_class=cast(Any, _progress_tqdm_class(self, handle)),
+                    # IMP-02.15: one file at a time keeps the cooperative
+                    # cancel check in tqdm.update() on the critical path.
+                    max_workers=1,
                 )
             except _Cancelled:
                 self._fail(handle, CANCELLED_ERROR)
@@ -300,14 +346,19 @@ class DownloadManager:
             handle.error = ""
             handle.ok = True
             handle.progress = 1.0
+            handle.finished_at_unix_ms = _now_ms()
             handle.done = True
         finally:
             self._push(handle)
 
     def _fail(self, handle: DownloadHandle, error: str) -> None:
-        handle.done = True
+        # IMP-02.12: `error`/`ok` are written BEFORE `done` — `events()`
+        # polls `done` on the loop thread and a terminal event published
+        # between `done=True` and `error=...` would look like a success.
         handle.ok = False
         handle.error = error
+        handle.finished_at_unix_ms = _now_ms()
+        handle.done = True
 
     def _preflight_total(self, handle: DownloadHandle) -> int:
         """Sum the sizes of the matched files via model_info (spec risk)."""
@@ -364,8 +415,14 @@ class DownloadManager:
             current_file=handle.current_file,
             terminal=False,
             error=handle.error,
+            ok=handle.ok,
         )
-        loop.call_soon_threadsafe(self._offer_to_subscribers, handle, snapshot)
+        try:
+            loop.call_soon_threadsafe(self._offer_to_subscribers, handle, snapshot)
+        except RuntimeError:
+            # IMP-02.14: the loop closed between the is_closed() check and
+            # the schedule (teardown race) — the worker keeps finishing.
+            pass
 
     def _offer_to_subscribers(
         self, handle: DownloadHandle, snapshot: DownloadProgress
@@ -387,6 +444,7 @@ class DownloadManager:
             current_file=handle.current_file,
             terminal=True,
             error=handle.error,
+            ok=handle.ok,
         )
 
 
@@ -417,6 +475,10 @@ def _progress_tqdm_class(
             self._is_transfer_bar = desc.endswith("downloading bytes")
 
         def update(self, n: float | None = 1) -> bool | None:
+            # IMP-02.15: cancellation is cooperative — observed only here,
+            # inside tqdm's update hook; `snapshot_download` never checks
+            # the flag itself. Raising unwinds the worker via the HF
+            # progress callback (max_workers=1 keeps this prompt).
             if handle.cancel_event.is_set():
                 raise _Cancelled()
             if self._is_bytes_bar and not self._is_transfer_bar:

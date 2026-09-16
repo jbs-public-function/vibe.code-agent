@@ -27,7 +27,7 @@ uses the same client. This is the only process that talks to Docker or NVML.
 
 | ID | Requirement |
 | --- | --- |
-| FR-02.1 | `proto/vibe/v1/control.proto`, package `vibe.v1`, service `ModelController` with RPCs: `ListModels`, `GetStatus`, `LoadModel` (stream), `UnloadModel` (stream), `StreamLogs` (stream), `GetGpuStats`, `Chat` (stream), `ListDownloads`, `DownloadModel` (stream), `CancelDownload`. |
+| FR-02.1 | `proto/vibe/v1/control.proto`, package `vibe.v1`, service `ModelController` with RPCs: `ListModels`, `GetStatus`, `LoadModel` (stream), `UnloadModel` (stream), `StreamLogs` (stream), `GetGpuStats`, `Chat` (stream), `ListDownloads`, `DownloadModel` (stream), `CancelDownload`, `GetJobEvents` (stream), `GetJob`, `ReloadRegistry`, `ListCache`, `RemoveCached`, `ProposeRegistration`, `WriteRegistration`. |
 | FR-02.2 | Model states: `AVAILABLE, LOADING, READY, UNLOADING, ERROR`. `GetStatus` returns the active alias, its state, container info, and the current job (if any). |
 | FR-02.3 | `LoadModel(alias, force)` streams `JobEvent`s until terminal state; a concurrent load returns `FAILED_PRECONDITION` with the in-flight job id. Unknown alias → `NOT_FOUND`. |
 | FR-02.4 | `UnloadModel` streams `JobEvent`s; idempotent (no container → single `READY→AVAILABLE` no-op event). |
@@ -68,6 +68,13 @@ service ModelController {
   rpc ListDownloads(ListDownloadsRequest) returns (ListDownloadsResponse);
   rpc DownloadModel(DownloadModelRequest) returns (stream DownloadProgress);
   rpc CancelDownload(CancelDownloadRequest) returns (CancelDownloadResponse);
+  rpc GetJobEvents(GetJobEventsRequest) returns (stream JobEvent);
+  rpc GetJob(GetJobRequest) returns (Job);
+  rpc ReloadRegistry(ReloadRegistryRequest) returns (ReloadRegistryResponse);
+  rpc ListCache(ListCacheRequest) returns (ListCacheResponse);
+  rpc RemoveCached(RemoveCachedRequest) returns (RemoveCachedResponse);
+  rpc ProposeRegistration(ProposeRegistrationRequest) returns (ProposeRegistrationResponse);
+  rpc WriteRegistration(WriteRegistrationRequest) returns (WriteRegistrationResponse);
 }
 
 enum ModelState { MODEL_STATE_UNSPECIFIED = 0; AVAILABLE = 1; LOADING = 2; READY = 3; UNLOADING = 4; ERROR = 5; }
@@ -76,6 +83,7 @@ message ModelInfo {
   string alias = 1; string display_name = 2; string hf_repo = 3; string quantization = 4;
   uint32 max_model_len = 5; float gpu_memory_utilization = 6; uint32 host_port = 7;
   repeated string tags = 8; string use_case = 9; ModelState state = 10; bool cached_locally = 11;
+  string container_name = 12; repeated string extra_args = 13; string yaml_preview = 14;
 }
 message ListModelsRequest {}
 message ListModelsResponse { repeated ModelInfo models = 1; }
@@ -87,14 +95,21 @@ message Status {
 }
 
 enum JobKind { JOB_KIND_UNSPECIFIED = 0; LOAD = 1; UNLOAD = 2; DOWNLOAD = 3; }
-message Job { string id = 1; JobKind kind = 2; string alias = 3; int64 started_at_unix = 4; bool done = 5; bool ok = 6; }
+message Job {
+  string id = 1; JobKind kind = 2; string alias = 3; int64 started_at_unix = 4;
+  bool done = 5; bool ok = 6; bool terminal = 7; string last_error = 8;
+  int64 started_at_unix_ms = 9; int64 finished_at_unix_ms = 10;
+}
+message GetJobRequest { string job_id = 1; }
 message JobEvent {
   string job_id = 1; int64 ts_unix_ms = 2; string level = 3; string message = 4;
   ModelState state = 5; float progress = 6; bool terminal = 7;
+  JobKind kind = 8; string alias = 9;
 }
 
-message LoadModelRequest { string alias = 1; bool force = 2; }
+message LoadModelRequest { string alias = 1; bool force = 2; bool keep_failed = 3; int32 timeout_s = 4; }
 message UnloadModelRequest {}
+message GetJobEventsRequest { string job_id = 1; bool follow = 2; }
 
 message StreamLogsRequest { int32 tail = 1; bool follow = 2; }
 message LogLine { int64 ts_unix_ms = 1; string line = 2; }
@@ -104,14 +119,22 @@ message GpuProcess { uint32 pid = 1; string name = 2; uint32 used_mib = 3; }
 message GpuStats { uint32 used_mib = 1; uint32 total_mib = 2; uint32 utilization_pct = 3; repeated GpuProcess processes = 4; }
 
 message ChatMessage { string role = 1; string content = 2; }
-message ChatRequest { string alias = 1; repeated ChatMessage messages = 2; float temperature = 3; uint32 max_tokens = 4; }
+message ChatRequest { string alias = 1; repeated ChatMessage messages = 2; optional float temperature = 3; optional uint32 max_tokens = 4; }
 message ChatChunk { string delta = 1; string finish_reason = 2; uint32 prompt_tokens = 3; uint32 completion_tokens = 4; }
 
 message ListDownloadsRequest {}
-message DownloadInfo { string id = 1; string hf_repo = 2; repeated string include = 3; float progress = 4; uint64 bytes_done = 5; uint64 bytes_total = 6; bool done = 7; bool ok = 8; string error = 9; }
+message DownloadInfo {
+  string id = 1; string hf_repo = 2; repeated string include = 3; float progress = 4;
+  uint64 bytes_done = 5; uint64 bytes_total = 6; bool done = 7; bool ok = 8; string error = 9;
+  string current_file = 10; string revision = 11; int64 started_at_unix_ms = 12;
+  int64 finished_at_unix_ms = 13;
+}
 message ListDownloadsResponse { repeated DownloadInfo downloads = 1; }
 message DownloadModelRequest { string hf_repo = 1; repeated string include = 2; string revision = 3; }
-message DownloadProgress { string id = 1; float progress = 2; uint64 bytes_done = 3; uint64 bytes_total = 4; string current_file = 5; bool terminal = 6; string error = 7; }
+message DownloadProgress {
+  string id = 1; float progress = 2; uint64 bytes_done = 3; uint64 bytes_total = 4;
+  string current_file = 5; bool terminal = 6; string error = 7; bool ok = 8;
+}
 message CancelDownloadRequest { string id = 1; }
 message CancelDownloadResponse { bool cancelled = 1; }
 ```
@@ -162,8 +185,8 @@ src/vibe/serve.py                   # `vibe serve [--only ...]` composition root
 
 ### Interfaces
 
-- `ControllerClient(target="127.0.0.1:50051")` exposes `list_models()`, `status()`, `load(alias, force) -> AsyncIterator[JobEvent]`, `unload()`, `logs(tail, follow)`, `gpu()`, `chat(req) -> AsyncIterator[ChatChunk]`. Gateway and admin import **only** this.
-- `jobs.JobEvent` ↔ `vibe.v1.JobEvent` mapping lives in `servicer.py` (`to_proto(event)`).
+- `ControllerClient(target="127.0.0.1:50051")` exposes `list_models()`, `status()`, `load(alias, force) -> AsyncIterator[JobEvent]`, `unload()`, `logs(tail, follow)`, `gpu()`, `chat(req) -> AsyncIterator[ChatChunk]`, `job_events(job_id, *, follow=False)`, `get_job(job_id)`, plus the Phase-4 download/cache/registry RPCs. Gateway and admin import **only** this.
+- `jobs.JobEvent` ↔ `vibe.v1.JobEvent` mapping lives in `servicer.py` (`to_proto(event, job_id, kind, alias)`).
 
 ## Task breakdown
 

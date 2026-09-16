@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import docker
 import docker.errors
 import docker.models.containers
 import docker.types
 import httpx
+import requests
 
 from vibe.config import Settings
 from vibe.registry import ModelSpec
@@ -55,6 +57,26 @@ class ReadinessTimeout(DockerError):
     def __init__(self, message: str, last_logs: str = "") -> None:
         self.last_logs = last_logs
         super().__init__(message)
+
+
+def _call[T](fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Run one docker SDK call, mapping SDK/transport errors to `DockerError`.
+
+    IMP-02.10: a mid-session daemon restart must degrade per spec, never
+    surface as an `UNKNOWN` gRPC status. `NotFound`/`ImageNotFound` pass
+    through unchanged so callers can react to "doesn't exist"; every other
+    `docker.errors.DockerException` and `requests.RequestException` (the
+    SDK's HTTP transport) becomes a `DockerError` naming the original
+    class for debugging.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except (docker.errors.NotFound, docker.errors.ImageNotFound):
+        raise
+    except docker.errors.DockerException as exc:
+        raise DockerError(f"{type(exc).__name__}: {exc}") from exc
+    except requests.RequestException as exc:
+        raise DockerError(f"{type(exc).__name__}: {exc}") from exc
 
 
 def volumes_for(spec: ModelSpec, hf_home: Path) -> dict[str, dict[str, str]]:
@@ -107,15 +129,17 @@ class DockerCtl:
 
     def find_managed(self) -> list[docker.models.containers.Container]:
         """Containers labelled `vibe.managed=true` (ADR-3)."""
-        return self.client.containers.list(
-            all=True, filters={"label": f"{MANAGED_LABEL}=true"}
+        return _call(
+            self.client.containers.list,
+            all=True,
+            filters={"label": f"{MANAGED_LABEL}=true"},
         )
 
     def find_legacy(self) -> list[docker.models.containers.Container]:
         """v0 containers named `vllm-*` (vllm-deepseek / vllm-llama / vllm-qwen)."""
         return [
             container
-            for container in self.client.containers.list(all=True)
+            for container in _call(self.client.containers.list, all=True)
             if (container.name or "").startswith(LEGACY_NAME_PREFIX)
         ]
 
@@ -123,14 +147,15 @@ class DockerCtl:
         """Force-remove every managed and legacy container; return names found.
 
         Race-tolerant: containers that vanish between listing and removal are
-        ignored. Legacy containers are purged first (FR-00.5).
+        ignored (the `_call`-mapped DockerError covers the SDK's NotFound /
+        APIError). Legacy containers are purged first (FR-00.5).
         """
         names: list[str] = []
         for container in [*self.find_legacy(), *self.find_managed()]:
             names.append(container.name or "<unnamed>")
             try:
-                container.remove(force=True)
-            except (docker.errors.NotFound, docker.errors.APIError):
+                _call(lambda: container.remove(force=True))
+            except DockerError:
                 continue
         return names
 
@@ -145,8 +170,8 @@ class DockerCtl:
         except docker.errors.ImageNotFound:
             # Image vanished between ensure and run (rare race): pull once, retry.
             try:
-                self.client.images.pull(self.settings.image)
-            except docker.errors.DockerException as exc:
+                _call(self.client.images.pull, self.settings.image)
+            except DockerError as exc:
                 raise ImagePullError(
                     f"failed to pull {self.settings.image}: {exc}"
                 ) from exc
@@ -160,17 +185,17 @@ class DockerCtl:
     def _ensure_image(self) -> None:
         """Pull the pinned image if it is not cached locally."""
         try:
-            self.client.images.get(self.settings.image)
+            _call(self.client.images.get, self.settings.image)
             return
         except docker.errors.ImageNotFound:
-            pass
-        except docker.errors.DockerException as exc:
+            pass  # not cached — fall through to the pull
+        except DockerError as exc:
             raise DockerError(
                 f"failed to inspect image {self.settings.image}: {exc}"
             ) from exc
         try:
-            self.client.images.pull(self.settings.image)
-        except docker.errors.DockerException as exc:
+            _call(self.client.images.pull, self.settings.image)
+        except DockerError as exc:
             raise ImagePullError(
                 f"failed to pull {self.settings.image}: {exc}"
             ) from exc
@@ -233,21 +258,30 @@ class DockerCtl:
         Blocking: callers must wrap this in `asyncio.to_thread`; with
         `follow=True` the generator never terminates on its own.
         """
-        stream = container.logs(
-            stream=True,
-            follow=follow,
-            tail=tail if tail is not None else "all",
-            timestamps=True,
-        )
+
+        def open_stream() -> Iterator[bytes | str]:
+            return container.logs(
+                stream=True,
+                follow=follow,
+                tail=tail if tail is not None else "all",
+                timestamps=True,
+            )
+
+        stream = _call(open_stream)
         for chunk in stream:
-            if isinstance(chunk, bytes):
-                yield chunk.decode("utf-8", errors="replace").rstrip("\n")
-            else:
-                yield str(chunk).rstrip("\n")
+            try:
+                if isinstance(chunk, bytes):
+                    yield chunk.decode("utf-8", errors="replace").rstrip("\n")
+                else:
+                    yield str(chunk).rstrip("\n")
+            except requests.RequestException as exc:
+                # The stream is consumed lazily; the daemon can die between
+                # chunks (follow mode) — degrade like any other DockerError.
+                raise DockerError(f"{type(exc).__name__}: {exc}") from exc
 
     def container_info(self, container: docker.models.containers.Container) -> dict:
         """Runtime snapshot of the container for `vibe status` (FR-00.3)."""
-        attrs = container.attrs
+        attrs = _call(lambda: container.attrs)
         ports = attrs.get("NetworkSettings", {}).get("Ports", {})
         binding = ports.get(f"{CONTAINER_PORT}/tcp")
         host_port = int(binding[0]["HostPort"]) if binding else None
@@ -267,20 +301,26 @@ class DockerCtl:
     ) -> str:
         """Tail of the container's logs for failure messages (FR-00.11)."""
         try:
-            text = container.logs(tail=n, timestamps=True).decode("utf-8", "replace")
+            text = _call(
+                lambda: container.logs(tail=n, timestamps=True)
+            ).decode("utf-8", "replace")
         except docker.errors.NotFound:
             return ""
+        except DockerError:
+            return ""  # daemon gone — no logs to show
         if len(text) > _LAST_LOGS_CHARS:
             return text[-_LAST_LOGS_CHARS:]
         return text
 
     # -- readiness --------------------------------------------------------
 
-    async def wait_ready(self, spec: ModelSpec, timeout_s: int) -> None:
+    async def wait_ready(self, spec: ModelSpec, timeout_s: int | float) -> None:
         """Poll `/health` then `/v1/models` until the alias is served (FR-00.10).
 
         Raises `ContainerExited` if the container dies and `ReadinessTimeout`
-        at the deadline; both carry the last log lines (FR-00.11).
+        at the deadline; both carry the last log lines (FR-00.11). Every
+        docker SDK call runs in a worker thread (IMP-02.9): a 2 s poll for
+        up to 600 s must never block the event loop on daemon round-trips.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
@@ -293,14 +333,21 @@ class DockerCtl:
                     break
 
                 try:
-                    container = self.client.containers.get(spec.container_name)
+                    container = await asyncio.to_thread(
+                        _call,
+                        self.client.containers.get,
+                        spec.container_name,
+                    )
                 except docker.errors.NotFound:
                     raise ContainerExited(
                         f"container {spec.container_name} exited before becoming ready"
                     ) from None
 
-                if container.attrs["State"]["Status"] in ("exited", "dead"):
-                    last_logs = self._last_logs(container)
+                state = await asyncio.to_thread(
+                    _call, lambda: container.attrs["State"]["Status"]
+                )
+                if state in ("exited", "dead"):
+                    last_logs = await asyncio.to_thread(self._last_logs, container)
                     message = (
                         f"container {spec.container_name} exited before becoming ready"
                     )
@@ -323,10 +370,12 @@ class DockerCtl:
                 await asyncio.sleep(min(READINESS_POLL_SECONDS, max(remaining, 0.05)))
 
         try:
-            container = self.client.containers.get(spec.container_name)
-            last_logs = self._last_logs(container)
-        except docker.errors.NotFound:
-            last_logs = ""
+            container = await asyncio.to_thread(
+                _call, self.client.containers.get, spec.container_name
+            )
+            last_logs = await asyncio.to_thread(self._last_logs, container)
+        except (docker.errors.NotFound, DockerError):
+            last_logs = ""  # container or daemon gone — the timeout still stands
         message = (
             f"{spec.alias} not ready within {timeout_s}s "
             f"at http://127.0.0.1:{spec.host_port}"

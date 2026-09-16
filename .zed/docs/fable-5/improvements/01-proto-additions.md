@@ -1,6 +1,6 @@
 # 01 — Proto Additions (additive-only)
 
-> Priority: P1 · Depends on: — · Status: Planned
+> Priority: P1 · Depends on: — · Status: Implemented
 
 ## Summary
 
@@ -43,13 +43,19 @@ This plan lists the **additive** fields and one new RPC that remove those workar
 
 ## Task breakdown
 
-- [ ] Add fields/RPC to `proto/vibe/v1/control.proto`; regenerate; commit `gen/`.
-- [ ] `servicer.py`: populate `JobEvent.kind/alias`; implement `GetJob`; `_effective_state` helper; `DownloadInfo` timestamps + `current_file`; `DownloadProgress.ok`.
-- [ ] `registry.py`: expose `render_entry(entry) -> str` so `ProposeRegistration` can fill `yaml_preview` and `write_entry` uses the same function.
-- [ ] `client.py`: `get_job`, `follow` param; exception translation unchanged.
-- [ ] `cli.py`: `vibe jobs <id>` (or `vibe status --job <id>`) prints kind/alias/terminal; `vibe download` shows `current_file` from `DownloadInfo` when attaching.
-- [ ] Tests: replayed events carry kind/alias; `GetJob` NOT_FOUND after eviction; `GetStatus` LOADING while a fake job is in flight; `DownloadProgress.ok` true exactly once on success.
-- [ ] Update `features/02-grpc-server.md` and `04-model-scripts.md` message tables.
+- [x] Add fields/RPC to `proto/vibe/v1/control.proto`; regenerate; commit `gen/`.
+- [x] `servicer.py`: populate `JobEvent.kind/alias`; implement `GetJob`; `_effective_state` helper; `DownloadInfo` timestamps + `current_file`; `DownloadProgress.ok`.
+- [x] `registry.py`: expose `render_entry(entry) -> str` so `ProposeRegistration` can fill `yaml_preview` and `write_entry` uses the same function.
+- [x] `client.py`: `get_job`, `follow` param; exception translation unchanged.
+- [x] `cli.py`: `vibe jobs <id>` (or `vibe status --job <id>`) prints kind/alias/terminal; `vibe download` shows `current_file` from `DownloadInfo` when attaching.
+- [x] Tests: replayed events carry kind/alias; `GetJob` NOT_FOUND after eviction; `GetStatus` LOADING while a fake job is in flight; `DownloadProgress.ok` true exactly once on success.
+- [x] Update `features/02-grpc-server.md` and `04-model-scripts.md` message tables.
+
+## Implementation notes
+
+- **IMP-01.6 (downloads-as-jobs) skipped** — it is marked optional in the plan. `ListDownloads` remains the primary API and `DownloadInfo` now carries `started_at_unix_ms`/`finished_at_unix_ms`, so the elapsed-time need it addressed is already met. Surfacing downloads as `Status.current_job` would also make the admin job page point at a job with no `GetJobEvents` history (downloads do not flow through `_pump_job`) — worth doing properly together with doc 04's job-page work if ever needed.
+- `client.job_events(job_id, *, follow=False)` adds a keyword-only parameter. The admin worker owns `tests/test_admin.py`, whose `FakeControllerClient.job_events(self, job_id)` override must gain the `follow` parameter when it adopts the follow stream (pyright flags the override until then).
+- `GetJob` serves `Job` from the bounded per-job history (`JOB_HISTORY_JOBS`, `_job_meta` in lockstep with `_job_events`); a still-running current job is served even before its first event arrives. `NOT_FOUND` otherwise.
 
 ## Acceptance criteria
 

@@ -92,6 +92,11 @@ class ModelControllerStub:
                 request_serializer=vibe_dot_v1_dot_control__pb2.GetJobEventsRequest.SerializeToString,
                 response_deserializer=vibe_dot_v1_dot_control__pb2.JobEvent.FromString,
                 _registered_method=True)
+        self.GetJob = channel.unary_unary(
+                '/vibe.v1.ModelController/GetJob',
+                request_serializer=vibe_dot_v1_dot_control__pb2.GetJobRequest.SerializeToString,
+                response_deserializer=vibe_dot_v1_dot_control__pb2.Job.FromString,
+                _registered_method=True)
         self.ReloadRegistry = channel.unary_unary(
                 '/vibe.v1.ModelController/ReloadRegistry',
                 request_serializer=vibe_dot_v1_dot_control__pb2.ReloadRegistryRequest.SerializeToString,
@@ -192,6 +197,13 @@ class ModelControllerServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetJob(self, request, context):
+        """Phase 3 (additive): one job's summary from the bounded history (IMP-01.2).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ReloadRegistry(self, request, context):
         """Phase 4 (additive): registry / HF-cache management.
         """
@@ -280,6 +292,11 @@ def add_ModelControllerServicer_to_server(servicer, server):
                     servicer.GetJobEvents,
                     request_deserializer=vibe_dot_v1_dot_control__pb2.GetJobEventsRequest.FromString,
                     response_serializer=vibe_dot_v1_dot_control__pb2.JobEvent.SerializeToString,
+            ),
+            'GetJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetJob,
+                    request_deserializer=vibe_dot_v1_dot_control__pb2.GetJobRequest.FromString,
+                    response_serializer=vibe_dot_v1_dot_control__pb2.Job.SerializeToString,
             ),
             'ReloadRegistry': grpc.unary_unary_rpc_method_handler(
                     servicer.ReloadRegistry,
@@ -607,6 +624,33 @@ class ModelController:
             '/vibe.v1.ModelController/GetJobEvents',
             vibe_dot_v1_dot_control__pb2.GetJobEventsRequest.SerializeToString,
             vibe_dot_v1_dot_control__pb2.JobEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vibe.v1.ModelController/GetJob',
+            vibe_dot_v1_dot_control__pb2.GetJobRequest.SerializeToString,
+            vibe_dot_v1_dot_control__pb2.Job.FromString,
             options,
             channel_credentials,
             insecure,

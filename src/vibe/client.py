@@ -4,10 +4,11 @@ Gateway and admin import *only* this module for controller access (02-grpc-serve
 "Interfaces"). All `AioRpcError`s are translated into the Python exceptions the
 CLI expects:
 
-- `UNAVAILABLE`           → `ControllerUnavailable`
+- `UNAVAILABLE`           → `ControllerUnavailable` (or `UpstreamError` for
+  `Chat` when the model server itself answered with an error, IMP-02.25)
 - `NOT_FOUND`             → `KeyError` (unknown alias or job id)
-- `FAILED_PRECONDITION`   → `jobs.JobInProgress`
-- `FAILED_PRECONDITION`   → `jobs.JobInProgress`
+- `FAILED_PRECONDITION`   → `jobs.JobInProgress` (`NoModelLoaded` for `Chat`,
+  IMP-02.25)
 - anything else           → `RuntimeError` with the server's details
 """
 
@@ -25,6 +26,20 @@ from vibe.jobs import JobInProgress
 
 class ControllerUnavailable(RuntimeError):
     """The controller is not reachable at the configured target (FR-02.10)."""
+
+
+class NoModelLoaded(RuntimeError):
+    """`Chat`: no running container serves the requested alias (IMP-02.25)."""
+
+    def __init__(
+        self,
+        message: str = "no model loaded — run `vibe load <alias>` first",
+    ) -> None:
+        super().__init__(message)
+
+
+class UpstreamError(RuntimeError):
+    """`Chat`: the model server answered with an error status (IMP-02.25)."""
 
 
 class ControllerClient:
@@ -56,13 +71,30 @@ class ControllerClient:
 
     # -- error translation -------------------------------------------------
 
+    # -- error translation -------------------------------------------------
+
     def _raise_translated(
-        self, exc: grpc.aio.AioRpcError, *, alias: str | None = None
+        self,
+        exc: grpc.aio.AioRpcError,
+        *,
+        alias: str | None = None,
+        failed_precondition: type[Exception] = JobInProgress,
+        unavailable_with: str | None = None,
     ) -> NoReturn:
-        """Convert an `AioRpcError` into the Python exception the CLI expects."""
+        """Convert an `AioRpcError` into the Python exception the CLI expects.
+
+        IMP-02.25: translation is per-RPC, not global-by-code. Chat passes
+        `failed_precondition=NoModelLoaded` (its FAILED_PRECONDITION means
+        "no model loaded") and `unavailable_with="model server returned"`
+        (an UNAVAILABLE whose details start with that prefix means the
+        vLLM upstream answered with an error, not that the controller is
+        down).
+        """
         code = exc.code()
         details = exc.details() or ""
         if code is grpc.StatusCode.UNAVAILABLE:
+            if unavailable_with and details.startswith(unavailable_with):
+                raise UpstreamError(details) from exc
             message = (
                 f"controller unreachable at {self.target} — "
                 "start it with `vibe serve --only controller`"
@@ -73,7 +105,9 @@ class ControllerClient:
         if code is grpc.StatusCode.NOT_FOUND:
             raise KeyError(alias if alias is not None else details) from exc
         if code is grpc.StatusCode.FAILED_PRECONDITION:
-            raise JobInProgress(details or "a job is already running") from exc
+            if details:
+                raise failed_precondition(details) from exc
+            raise failed_precondition() from exc
         raise RuntimeError(details or str(exc)) from exc
 
     async def _unary[T](
@@ -86,18 +120,20 @@ class ControllerClient:
             self._raise_translated(exc, alias=alias)
 
     async def _iter_stream[T](
-        self, stream: AsyncIterable[T], *, alias: str | None = None
+        self, stream: AsyncIterable[T], *, alias: str | None = None, **translate
     ) -> AsyncIterator[T]:
         """Iterate a server stream, translating `AioRpcError`.
 
-        Streaming RPCs can surface their error status either when the call is
-        made or when the stream is first iterated, so callers wrap both.
+        Streaming RPCs surface their error status when the stream is first
+        iterated (creating the stream never raises, IMP-02.26), so callers
+        wrap the iteration. Extra keywords are forwarded to
+        `_raise_translated` for per-RPC mappings.
         """
         try:
             async for item in stream:
                 yield item
         except grpc.aio.AioRpcError as exc:
-            self._raise_translated(exc, alias=alias)
+            self._raise_translated(exc, alias=alias, **translate)
 
     # -- RPCs --------------------------------------------------------------
 
@@ -132,20 +168,15 @@ class ControllerClient:
             keep_failed=keep_failed,
             timeout_s=timeout_s or 0,  # 0 = use VIBE_LOAD_TIMEOUT
         )
-        try:
-            stream = self._stub.LoadModel(request)
-        except grpc.aio.AioRpcError as exc:
-            self._raise_translated(exc, alias=alias)
+        # IMP-02.26: creating the stub stream never raises — errors surface
+        # on iteration, where `_iter_stream` translates them.
+        stream = self._stub.LoadModel(request)
         async for event in self._iter_stream(stream, alias=alias):
             yield event
 
     async def unload(self) -> AsyncIterator[control_pb2.JobEvent]:
         """Unload every model, streaming `JobEvent`s (idempotent, FR-02.4)."""
-        request = control_pb2.UnloadModelRequest()
-        try:
-            stream = self._stub.UnloadModel(request)
-        except grpc.aio.AioRpcError as exc:
-            self._raise_translated(exc)
+        stream = self._stub.UnloadModel(control_pb2.UnloadModelRequest())
         async for event in self._iter_stream(stream):
             yield event
 
@@ -154,27 +185,31 @@ class ControllerClient:
     ) -> AsyncIterator[control_pb2.LogLine]:
         """Stream the active container's logs; fall back to the ring buffer."""
         request = control_pb2.StreamLogsRequest(tail=tail or 0, follow=follow)
-        try:
-            stream = self._stub.StreamLogs(request)
-        except grpc.aio.AioRpcError as exc:
-            self._raise_translated(exc)
+        stream = self._stub.StreamLogs(request)
         async for line in self._iter_stream(stream):
             yield line
 
-    async def job_events(self, job_id: str) -> AsyncIterator[control_pb2.JobEvent]:
+    async def job_events(
+        self, job_id: str, *, follow: bool = False
+    ) -> AsyncIterator[control_pb2.JobEvent]:
         """Replay buffered events for a job the caller did not start (Phase 3).
 
         The controller keeps a bounded per-job history, so this is a snapshot
-        of the events recorded so far, oldest first. Raises `KeyError` for an
-        unknown job id (NOT_FOUND).
+        of the events recorded so far, oldest first. With `follow` the stream
+        tails live events after the replay until the terminal event
+        (IMP-01.7). Raises `KeyError` for an unknown job id (NOT_FOUND).
         """
-        request = control_pb2.GetJobEventsRequest(job_id=job_id)
-        try:
-            stream = self._stub.GetJobEvents(request)
-        except grpc.aio.AioRpcError as exc:
-            self._raise_translated(exc)
+        request = control_pb2.GetJobEventsRequest(job_id=job_id, follow=follow)
+        stream = self._stub.GetJobEvents(request)
         async for event in self._iter_stream(stream):
             yield event
+
+    async def get_job(self, job_id: str) -> control_pb2.Job:
+        """One job's summary; `KeyError` once it was evicted from history
+        (IMP-01.2)."""
+        return await self._unary(
+            self._stub.GetJob(control_pb2.GetJobRequest(job_id=job_id))
+        )
 
     async def gpu(self) -> control_pb2.GpuStats:
         """Return current GPU memory/utilization/process stats (FR-02.7)."""
@@ -189,17 +224,25 @@ class ControllerClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[control_pb2.ChatChunk]:
-        """Stream chat completions from the active model (FR-02.6)."""
+        """Stream chat completions from the active model (FR-02.6).
+
+        IMP-02.25: Chat's error translation differs from the other RPCs —
+        FAILED_PRECONDITION means "no model loaded" (`NoModelLoaded`) and
+        UNAVAILABLE details beginning with "model server returned" mean the
+        vLLM upstream answered with an error (`UpstreamError`).
+        """
         request = control_pb2.ChatRequest(alias=alias, messages=list(messages))
         if temperature is not None:
             request.temperature = temperature
         if max_tokens is not None:
             request.max_tokens = max_tokens
-        try:
-            stream = self._stub.Chat(request)
-        except grpc.aio.AioRpcError as exc:
-            self._raise_translated(exc, alias=alias)
-        async for chunk in self._iter_stream(stream, alias=alias):
+        stream = self._stub.Chat(request)
+        async for chunk in self._iter_stream(
+            stream,
+            alias=alias,
+            failed_precondition=NoModelLoaded,
+            unavailable_with="model server returned",
+        ):
             yield chunk
 
     # -- downloads (Phase 4, FR-04.1/FR-04.2) -------------------------------
@@ -224,10 +267,7 @@ class ControllerClient:
             include=list(include or []),
             revision=revision or "",
         )
-        try:
-            stream = self._stub.DownloadModel(request)
-        except grpc.aio.AioRpcError as exc:
-            self._raise_translated(exc)
+        stream = self._stub.DownloadModel(request)
         async for progress in self._iter_stream(stream):
             yield progress
 

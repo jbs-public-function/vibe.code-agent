@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
-import sys
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -36,8 +37,12 @@ from vibe.controller.logbuffer import RingBuffer
 from vibe.docker_ctl import DockerCtl, DockerError
 from vibe.gen.vibe.v1 import control_pb2, control_pb2_grpc
 from vibe.gpu import GpuStats
-from vibe.jobs import JobEvent, JobInProgress, JobRunner, JobState
+from vibe.jobs import Job, JobEvent, JobInProgress, JobRunner, JobState
 from vibe.registry import ModelSpec, Registry
+
+# Structured logs land on stdout via `vibe.logging.configure()` (installed by
+# the composition root, never here); extra={...} fields render as k=v pairs.
+log = logging.getLogger("vibe.controller")
 
 # Job streams emit a debug heartbeat at least this often (NFR-02.5).
 HEARTBEAT_SECONDS = 10.0
@@ -74,6 +79,22 @@ _STATE_TO_PROTO: dict[JobState, control_pb2.ModelState] = {
 }
 
 
+@dataclass
+class _JobMeta:
+    """Per-job summary kept alongside the event history for `GetJob`.
+
+    Populated by `_pump_job` as events flow (the runner knows kind/alias when
+    it yields), evicted in lockstep with `_job_events` (NFR-01.5).
+    """
+
+    kind: str  # "load" | "unload"
+    alias: str
+    started_at_unix_ms: int
+    finished_at_unix_ms: int = 0
+    terminal: bool = False
+    last_error: str = ""
+
+
 def model_state_from_job_state(job_state: JobState | str) -> control_pb2.ModelState:
     """Map a `jobs.JobState` (or its string value) to the proto `ModelState`.
 
@@ -93,8 +114,17 @@ def job_kind_to_proto(kind: str) -> control_pb2.JobKind:
     raise ValueError(f"unknown job kind: {kind!r}")
 
 
-def to_proto(event: JobEvent, job_id: str) -> control_pb2.JobEvent:
-    """Map a `jobs.JobEvent` to the proto `JobEvent`."""
+def to_proto(
+    event: JobEvent,
+    job_id: str,
+    kind: control_pb2.JobKind = control_pb2.JOB_KIND_UNSPECIFIED,
+    alias: str = "",
+) -> control_pb2.JobEvent:
+    """Map a `jobs.JobEvent` to the proto `JobEvent`.
+
+    `kind`/`alias` are populated on every event so streams and replays
+    identify their job without external state (IMP-01.1).
+    """
     return control_pb2.JobEvent(
         job_id=job_id,
         ts_unix_ms=int(event.ts.timestamp() * 1000),
@@ -107,7 +137,29 @@ def to_proto(event: JobEvent, job_id: str) -> control_pb2.JobEvent:
         ),
         progress=event.progress if event.progress is not None else 0.0,
         terminal=event.state in _TERMINAL_STATES,
+        kind=kind,
+        alias=alias,
     )
+
+
+def _effective_state(
+    container_state: str | None,
+    job: Job | None,
+    alias: str | None = None,
+) -> control_pb2.ModelState:
+    """Model state shared by `GetStatus` and `ListModels` (IMP-01.3/02.2).
+
+    While a job is in flight it dominates: a load maps to LOADING and an
+    unload to UNLOADING. `alias` scopes the job check to one model
+    (`ListModels`): a load job affects only its own alias, while an unload
+    job (no alias) affects every model. `alias=None` means "the whole
+    controller" (`GetStatus`): any in-flight job dominates. Otherwise the
+    state derives from the container status string (READY/ERROR), or
+    MODEL_STATE_UNSPECIFIED when there is neither.
+    """
+    if job is not None and (alias is None or job.alias is None or job.alias == alias):
+        return control_pb2.LOADING if job.kind == "load" else control_pb2.UNLOADING
+    return _container_status_to_proto(container_state)
 
 
 def _parse_log_line(line: str) -> control_pb2.LogLine:
@@ -171,6 +223,10 @@ def _registration_spec_to_dict(spec: control_pb2.RegistrationSpec) -> dict[str, 
         data["tags"] = list(spec.tags)
     if spec.display_name:
         data["display_name"] = spec.display_name
+    if spec.container_name:
+        data["container_name"] = spec.container_name
+    if spec.extra_args:
+        data["extra_args"] = list(spec.extra_args)
     return data
 
 
@@ -196,6 +252,15 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         self.cache = CacheScanner(settings.hf_home)
         self.last_error = ""
         self._job_events: OrderedDict[str, deque[JobEvent]] = OrderedDict()
+        self._job_meta: OrderedDict[str, _JobMeta] = OrderedDict()
+        # IMP-02.1: strong references to every pump task so a client
+        # disconnect can never let a running job be garbage-collected
+        # mid-run (FR-02.11).
+        self._tasks: set[asyncio.Task] = set()
+        # Per-follower wakeup events for `GetJobEvents(follow=true)`;
+        # `Event.set()` is safe to call from `_record_job_event` without
+        # holding a lock (unlike `Condition.notify`).
+        self._job_wakeup: set[asyncio.Event] = set()
 
     # -- unary queries -----------------------------------------------------
 
@@ -220,20 +285,18 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         job = self.runner.current_job()
 
         specs = self.registry.all()
-        cached_ids = await asyncio.to_thread(self._cached_repo_ids)
 
         response = control_pb2.ListModelsResponse()
         for spec in specs:
-            state = control_pb2.AVAILABLE
+            container_state = None
             if active_alias is not None and spec.alias == active_alias:
-                # `info["alias"]` is the container's `vibe.alias` label.
-                state = control_pb2.READY if active_running else control_pb2.ERROR
-            if job is not None and job.alias == spec.alias:
-                state = (
-                    control_pb2.LOADING
-                    if job.kind == "load"
-                    else control_pb2.UNLOADING
-                )
+                # `info["alias"]` is the container's `vibe.alias` label;
+                # "running"-shaped statuses map to READY, anything else
+                # (incl. an unreadable container) to ERROR.
+                container_state = "running" if active_running else "error"
+            state = _effective_state(container_state, job, alias=spec.alias)
+            if state == control_pb2.MODEL_STATE_UNSPECIFIED:
+                state = control_pb2.AVAILABLE
             model = response.models.add()
             model.alias = spec.alias
             model.display_name = spec.display_name
@@ -244,17 +307,16 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
             model.host_port = spec.host_port
             model.tags.extend(spec.tags)
             model.use_case = spec.use_case
+            model.container_name = spec.container_name
+            model.extra_args.extend(spec.extra_args)
             model.state = state
-            model.cached_locally = spec.hf_repo in cached_ids
+            # IMP-02.3: one cache check for every RPC (local paths included);
+            # off the loop like `ProposeRegistration` so a cold scan never
+            # blocks the event loop (NFR-04.2).
+            model.cached_locally = await asyncio.to_thread(
+                self.cache.is_cached, spec.hf_repo
+            )
         return response
-
-    def _cached_repo_ids(self) -> set[str]:
-        """HF-hub repo ids with a local snapshot (M4.3, FR-04.9).
-
-        Fed by the same `CacheScanner` used by `ListCache` so the two
-        views never disagree; scan errors degrade to an empty set.
-        """
-        return {repo.repo_id for repo in self.cache.scan()}
 
     async def GetStatus(self, request, context):
         """Active model, container, in-flight job and last error (FR-02.2)."""
@@ -297,23 +359,47 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         current_job = None
         job = self.runner.current_job()
         if job is not None:
-            current_job = control_pb2.Job(
-                id=job.id,
-                kind=job_kind_to_proto(job.kind),
-                alias=job.alias or "",
-                started_at_unix=int(job.started_at.timestamp()),
-                done=False,
-                ok=False,
-            )
+            current_job = self._inflight_job_proto(job)
 
         return control_pb2.Status(
             active_alias=status.get("active_alias") or "",
-            state=_container_status_to_proto(status.get("state")),
+            state=_effective_state(status.get("state"), job),
             container_id=container_id,
             host_port=host_port,
             started_at_unix=started_at_unix,
             current_job=current_job,
             last_error=self.last_error,
+        )
+
+    def _inflight_job_proto(self, job: Job) -> control_pb2.Job:
+        """`Status.current_job` for a still-running job (IMP-01.2 fields)."""
+        started_ms = int(job.started_at.timestamp() * 1000)
+        return control_pb2.Job(
+            id=job.id,
+            kind=job_kind_to_proto(job.kind),
+            alias=job.alias or "",
+            started_at_unix=started_ms // 1000,
+            done=False,
+            ok=False,
+            terminal=False,
+            last_error="",
+            started_at_unix_ms=started_ms,
+            finished_at_unix_ms=0,
+        )
+
+    def _history_job_proto(self, job_id: str, meta: _JobMeta) -> control_pb2.Job:
+        """`GetJob` response from the bounded per-job history (IMP-01.2)."""
+        return control_pb2.Job(
+            id=job_id,
+            kind=job_kind_to_proto(meta.kind),
+            alias=meta.alias,
+            started_at_unix=meta.started_at_unix_ms // 1000,
+            done=meta.terminal,
+            ok=meta.terminal and not meta.last_error,
+            terminal=meta.terminal,
+            last_error=meta.last_error,
+            started_at_unix_ms=meta.started_at_unix_ms,
+            finished_at_unix_ms=meta.finished_at_unix_ms,
         )
 
     async def GetGpuStats(self, request, context):
@@ -383,8 +469,9 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         """Append one event to the per-job history for `GetJobEvents`.
 
         History is bounded (NFR-01.5): `JOB_EVENT_HISTORY` events per job,
-        `JOB_HISTORY_JOBS` jobs in total with the oldest job evicted first.
-        Events without a job id are dropped.
+        `JOB_HISTORY_JOBS` jobs in total with the oldest job evicted first
+        (its `_JobMeta` goes with it, so `GetJob` returns NOT_FOUND for
+        evicted jobs). Events without a job id are dropped.
         """
         if not job_id:
             return
@@ -392,7 +479,10 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
             event
         )
         while len(self._job_events) > JOB_HISTORY_JOBS:
-            self._job_events.popitem(last=False)
+            evicted_id, _ = self._job_events.popitem(last=False)
+            self._job_meta.pop(evicted_id, None)
+        for wakeup in list(self._job_wakeup):
+            wakeup.set()  # GetJobEvents(follow=true) waiters
 
     async def _pump_job(
         self, queue: asyncio.Queue, events: AsyncIterator[JobEvent]
@@ -401,42 +491,97 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
 
         Runs as its own task so the job survives client disconnects
         (FR-02.11). Events are also recorded in the shared ring buffer and
-        the per-job history (`GetJobEvents`), and terminal events update
-        `self.last_error`.
+        the per-job history (`GetJobEvents`), terminal events update
+        `self.last_error`, and every event carries the job's kind/alias
+        (IMP-01.1).
         """
         job_id = ""
+        kind = control_pb2.JOB_KIND_UNSPECIFIED
+        alias = ""
         terminal_seen = False
+        saw_event = False
         try:
             async for event in events:
+                saw_event = True
                 job = self.runner.current_job()
                 if job is not None:
                     job_id = job.id
+                    kind = job_kind_to_proto(job.kind)
+                    alias = job.alias or ""
+                    if job_id not in self._job_meta:
+                        self._job_meta[job_id] = _JobMeta(
+                            kind=job.kind,
+                            alias=alias,
+                            started_at_unix_ms=int(
+                                job.started_at.timestamp() * 1000
+                            ),
+                        )
                 self.buffer.append(event)
                 self._record_job_event(job_id, event)
                 if event.state in _TERMINAL_STATES:
                     terminal_seen = True
                     self._update_last_error(event)
-                self._offer(queue, ("event", event, job_id))
-        except (JobInProgress, KeyError) as exc:
-            # Raised by the runner's acquire/alias lookup before any event.
+                    meta = self._job_meta.get(job_id)
+                    if meta is not None:
+                        meta.terminal = True
+                        meta.finished_at_unix_ms = int(event.ts.timestamp() * 1000)
+                        meta.last_error = (
+                            event.message if event.state is JobState.ERROR else ""
+                        )
+                self._offer(queue, ("event", event, job_id, kind, alias))
+        except JobInProgress as exc:
+            # Raised by the runner's acquire before any event.
             self._offer(queue, ("startup_error", exc))
+        except KeyError as exc:
+            # IMP-02.5: an alias lookup failure before the first event is a
+            # startup error (same status as the upfront check); after events
+            # started flowing, treat it like any other escaped exception and
+            # record a terminal ERROR event.
+            if not saw_event:
+                self._offer(queue, ("startup_error", exc))
+                return
+            self._unexpected_error(queue, job_id, terminal_seen, exc, kind, alias)
         except asyncio.CancelledError:
             raise  # server shutdown — never mask task cancellation
         except Exception as exc:  # noqa: BLE001
-            # An error that escaped the runner's own ERROR-event handling:
-            # surface it as a terminal ERROR event instead of dying silently.
-            print(f"vibe controller: job stream failed: {exc}", file=sys.stderr)
-            if not terminal_seen:
-                event = JobEvent(
-                    datetime.now(UTC),
-                    "error",
-                    f"unexpected error: {exc}",
-                    state=JobState.ERROR,
-                )
-                self.buffer.append(event)
-                self._record_job_event(job_id, event)
-                self._update_last_error(event)
-                self._offer(queue, ("event", event, job_id))
+            self._unexpected_error(queue, job_id, terminal_seen, exc, kind, alias)
+
+    def _unexpected_error(
+        self,
+        queue: asyncio.Queue,
+        job_id: str,
+        terminal_seen: bool,
+        exc: Exception,
+        kind: control_pb2.JobKind,
+        alias: str,
+    ) -> None:
+        """Handle an exception that escaped the runner's own ERROR handling.
+
+        With no terminal event seen, surface a terminal ERROR event instead
+        of dying silently. When the job already reported its terminal state,
+        the trailing failure is a teardown artifact — debug-log it rather
+        than alarming the operator (IMP-02.5).
+        """
+        if terminal_seen:
+            log.debug(
+                "job stream failed after terminal event",
+                extra={"job_id": job_id or "-", "error": str(exc)},
+            )
+            return
+        log.warning(
+            "job stream failed",
+            extra={"job_id": job_id or "-", "error": str(exc)},
+        )
+        event = JobEvent(
+            datetime.now(UTC),
+            "error",
+            f"unexpected error: {exc}",
+            state=JobState.ERROR,
+        )
+        self.buffer.append(event)
+        self._record_job_event(job_id, event)
+        self._update_last_error(event)
+        self._offer(queue, ("event", event, job_id, kind, alias))
 
     def _update_last_error(self, event: JobEvent) -> None:
         """Track the last terminal error for `GetStatus` (cleared on success)."""
@@ -484,6 +629,10 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
             return
 
         task = asyncio.create_task(self._pump_job(queue, events))
+        # IMP-02.1: keep a strong reference until the pump finishes — a
+        # cancelled stream must never let the running job be GC'd (FR-02.11).
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         job_id = ""
         while True:
             if task.done() and queue.empty():
@@ -491,9 +640,9 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
                 # idempotent no-op unload): the stream simply ends here.
                 exception = task.exception()
                 if exception is not None:
-                    print(
-                        f"vibe controller: job pump crashed: {exception}",
-                        file=sys.stderr,
+                    log.error(
+                        "job pump crashed",
+                        extra={"job_id": job_id or "-", "error": str(exception)},
                     )
                     yield control_pb2.JobEvent(
                         job_id=job_id,
@@ -510,8 +659,13 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
                     queue.get(), timeout=HEARTBEAT_SECONDS
                 )
             except TimeoutError:
+                # grpc.aio raises CancelledError directly on client
+                # disconnect, so this check normally never fires; it just
+                # avoids yielding a heartbeat to a half-dead context. Either
+                # way the detached pump task keeps the job running
+                # (FR-02.11).
                 if context.cancelled():
-                    return  # FR-02.11: client gone — the job keeps running
+                    return
                 current = self.runner.current_job()
                 if current is not None:
                     job_id = current.id
@@ -520,6 +674,12 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
                     ts_unix_ms=int(datetime.now(UTC).timestamp() * 1000),
                     level="debug",
                     message=HEARTBEAT_MESSAGE,
+                    kind=(
+                        job_kind_to_proto(current.kind)
+                        if current is not None
+                        else control_pb2.JOB_KIND_UNSPECIFIED
+                    ),
+                    alias=(current.alias or "") if current is not None else "",
                 )
                 continue
             if item[0] == "startup_error":
@@ -535,7 +695,7 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
                 return
             event: JobEvent = item[1]
             job_id = item[2]
-            yield to_proto(event, job_id)
+            yield to_proto(event, job_id, item[3], item[4])
             if event.state in _TERMINAL_STATES:
                 return
 
@@ -700,8 +860,10 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
     async def GetJobEvents(self, request, context):
         """Replay the buffered events for one job, oldest first (FR-01.4).
 
-        Replay-and-return only: the admin job page polls every 2 s and each
-        call is a fresh snapshot of the bounded per-job history (NFR-01.5).
+        Default is replay-and-return. With `follow` (IMP-01.7) the stream
+        keeps going after the replay until the job's terminal event, so
+        the admin job page no longer needs to poll every 2 s. Followers
+        still receive the NFR-02.5 debug heartbeats during long waits.
         """
         events = self._job_events.get(request.job_id)
         if events is None:
@@ -709,8 +871,68 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
                 grpc.StatusCode.NOT_FOUND, f"unknown job '{request.job_id}'"
             )
             return
-        for event in events:
-            yield to_proto(event, request.job_id)
+        meta = self._job_meta.get(request.job_id)
+        kind = (
+            job_kind_to_proto(meta.kind)
+            if meta is not None
+            else control_pb2.JOB_KIND_UNSPECIFIED
+        )
+        alias = meta.alias if meta is not None else ""
+        # A follower owns its wakeup Event: `_record_job_event` sets every
+        # registered Event, the follower clears only its own. The per-job
+        # deque is the source of truth (re-checked after every wake), so a
+        # missed set only delays delivery to the next event.
+        wakeup = asyncio.Event()
+        self._job_wakeup.add(wakeup)
+        try:
+            yielded = 0
+            while True:
+                history = self._job_events.get(request.job_id)
+                if history is None:
+                    return  # evicted from the bounded history mid-follow
+                while yielded < len(history):
+                    event = history[yielded]
+                    yielded += 1
+                    yield to_proto(event, request.job_id, kind, alias)
+                    if event.state in _TERMINAL_STATES:
+                        return
+                if not request.follow:
+                    return
+                try:
+                    await asyncio.wait_for(
+                        wakeup.wait(), timeout=HEARTBEAT_SECONDS
+                    )
+                except TimeoutError:
+                    # NFR-02.5: heartbeat while the job is between events.
+                    yield control_pb2.JobEvent(
+                        job_id=request.job_id,
+                        ts_unix_ms=int(datetime.now(UTC).timestamp() * 1000),
+                        level="debug",
+                        message=HEARTBEAT_MESSAGE,
+                        kind=kind,
+                        alias=alias,
+                    )
+                    continue
+                wakeup.clear()
+        finally:
+            self._job_wakeup.discard(wakeup)
+
+    async def GetJob(self, request, context):
+        """One job's summary, served from the bounded history (IMP-01.2).
+
+        `NOT_FOUND` when the job's events were evicted (NFR-01.5) — except
+        for a still-running current job, which is reported even before its
+        first event arrives.
+        """
+        meta = self._job_meta.get(request.job_id)
+        if meta is not None:
+            return self._history_job_proto(request.job_id, meta)
+        job = self.runner.current_job()
+        if job is not None and job.id == request.job_id:
+            return self._inflight_job_proto(job)
+        await context.abort(
+            grpc.StatusCode.NOT_FOUND, f"unknown job '{request.job_id}'"
+        )
 
     # -- downloads (Phase 4, M4.1) -------------------------------------------
 
@@ -728,6 +950,10 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
             info.done = handle.done
             info.ok = handle.ok
             info.error = handle.error
+            info.current_file = handle.current_file
+            info.revision = handle.revision
+            info.started_at_unix_ms = handle.started_at_unix_ms
+            info.finished_at_unix_ms = handle.finished_at_unix_ms
         return response
 
     async def DownloadModel(self, request, context):
@@ -755,6 +981,7 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
                 current_file=progress.current_file,
                 terminal=progress.terminal,
                 error=progress.error,
+                ok=progress.ok,
             )
 
     async def CancelDownload(self, request, context):
@@ -781,7 +1008,16 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         return response
 
     async def RemoveCached(self, request, context):
-        """Remove one repo's cache dir; idempotent (FR-04.4)."""
+        """Remove one repo's cache dir; idempotent (FR-04.4).
+
+        Refused while a download for the same repo is in flight (IMP-02.4):
+        removing the blobs under a running download would break FR-04.2's
+        resumable partial files.
+        """
+        if self.downloads.is_inflight(request.repo_id):
+            return control_pb2.RemoveCachedResponse(
+                removed=False, error="download in flight"
+            )
         removed, error = await asyncio.to_thread(self.cache.remove, request.repo_id)
         return control_pb2.RemoveCachedResponse(removed=removed, error=error)
 
@@ -819,6 +1055,9 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         model.host_port = spec.host_port
         model.tags.extend(spec.tags)
         model.use_case = spec.use_case
+        model.container_name = spec.container_name
+        model.extra_args.extend(spec.extra_args)
+        model.yaml_preview = self.registry.render_entry(entry)
         model.state = control_pb2.AVAILABLE
         model.cached_locally = self.cache.is_cached(spec.hf_repo)
         return response
@@ -827,10 +1066,9 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         """Append a validated entry to models.yaml, then reload it (FR-04.5/
         FR-04.6) so the controller sees the new alias immediately.
 
-        Defaults are filled exactly like `ProposeRegistration` (the proto
-        spec carries no container_name/port fields), then the completed
-        entry is validated against the on-disk registry and appended
-        atomically.
+        Defaults are filled exactly like `ProposeRegistration` (both use
+        `registry.propose`), then the completed entry is validated against
+        the on-disk registry and appended atomically.
         """
         data = _registration_spec_to_dict(request.spec)
         entry, warnings, errors = await asyncio.to_thread(

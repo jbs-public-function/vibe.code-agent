@@ -18,13 +18,20 @@ import socket
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
+import grpc
 import pytest
 
-from vibe.client import ControllerClient, ControllerUnavailable
+from vibe.client import (
+    ControllerClient,
+    ControllerUnavailable,
+    NoModelLoaded,
+    UpstreamError,
+)
 from vibe.config import Settings
 from vibe.controller import RingBuffer, build_server
+from vibe.controller import servicer as servicer_mod
 from vibe.gen.vibe.v1 import control_pb2
 from vibe.gpu import GpuProcess, GpuStats
 from vibe.jobs import JobEvent, JobInProgress, JobRunner
@@ -229,6 +236,196 @@ async def test_unload_idempotent(controller: SimpleNamespace) -> None:
     assert events
     assert any(event.state == control_pb2.UNLOADING for event in events)
     assert any("nothing to unload" in event.message for event in events)
+    # IMP-02.7: the no-op ends with a terminal AVAILABLE event so clients
+    # can tell "done" from "disconnected".
+    assert events[-1].state == control_pb2.AVAILABLE
+    assert events[-1].terminal is True
+
+
+async def test_get_job_summary_after_load(controller: SimpleNamespace) -> None:
+    """IMP-01.2: GetJob returns kind/alias/terminal from the job history."""
+    events = await _drain(controller.client.load("qwen2.5-coder-7b"))
+    assert events
+    job_id = events[0].job_id
+    assert job_id
+
+    job = await controller.client.get_job(job_id)
+    assert job.id == job_id
+    assert job.kind == control_pb2.LOAD
+    assert job.alias == "qwen2.5-coder-7b"
+    assert job.terminal is True
+    assert job.done is True
+    assert job.ok is True
+    assert job.last_error == ""
+    assert job.started_at_unix_ms > 0
+    assert job.finished_at_unix_ms >= job.started_at_unix_ms
+
+
+async def test_get_job_inflight(slow_controller: SimpleNamespace) -> None:
+    """IMP-01.2: GetJob reports a still-running job as not terminal."""
+    first = asyncio.create_task(
+        _drain(slow_controller.client.load("qwen2.5-coder-7b"))
+    )
+    try:
+        current = None
+        for _ in range(200):
+            current = slow_controller.runner.current_job()
+            if current is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert current is not None
+
+        job = await slow_controller.client.get_job(current.id)
+        assert job.kind == control_pb2.LOAD
+        assert job.alias == "qwen2.5-coder-7b"
+        assert job.terminal is False
+        assert job.done is False
+        assert job.ok is False
+    finally:
+        slow_controller.gate.set()
+    await first
+
+
+async def test_list_models_cached_locally_local_path(
+    settings: Settings, fake_docker: Any, tmp_path: Any
+) -> None:
+    """IMP-02.3: local-path hf_repo entries use the same `is_cached` check."""
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+    registry = Registry.from_dict(
+        {
+            "models": [
+                {
+                    "alias": "local-1",
+                    "display_name": "Local 1",
+                    "hf_repo": str(model_dir),
+                    "max_model_len": 4096,
+                    "gpu_memory_utilization": 0.5,
+                    "container_name": "vibe-local-1",
+                    "host_port": 8001,
+                }
+            ]
+        }
+    )
+    ns = await _start(settings, registry, fake_docker, fake_gpu)
+    try:
+        models = await ns.client.list_models()
+        local = next(model for model in models if model.alias == "local-1")
+        assert local.cached_locally is True
+    finally:
+        await _stop(ns)
+
+
+async def test_chat_no_model_loaded_translation(controller: SimpleNamespace) -> None:
+    """IMP-02.25: Chat FAILED_PRECONDITION → NoModelLoaded (not JobInProgress)."""
+    with pytest.raises(NoModelLoaded) as excinfo:
+        await _drain(
+            controller.client.chat(
+                "qwen2.5-coder-7b",
+                [control_pb2.ChatMessage(role="user", content="hi")],
+            )
+        )
+    assert "no model loaded" in str(excinfo.value)
+
+
+async def test_chat_upstream_error_translation(
+    settings: Settings,
+    registry: Registry,
+    fake_docker: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IMP-02.25: UNAVAILABLE with "model server returned" → UpstreamError."""
+
+    class _Response:
+        status_code = 500
+
+        async def __aenter__(self) -> "_Response":
+            return self
+
+        async def __aexit__(self, *exc_info: Any) -> None:
+            pass
+
+        async def aread(self) -> bytes:
+            return b"oom"
+
+        async def aclose(self) -> None:
+            pass
+
+    class _Client:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Client":
+            return self
+
+        async def __aexit__(self, *exc_info: Any) -> None:
+            pass
+
+        def stream(self, method: str, url: str, json=None) -> _Response:
+            return _Response()
+
+    monkeypatch.setattr(servicer_mod.httpx, "AsyncClient", _Client)
+    container = SimpleNamespace(name="vibe-qwen2.5-coder-7b", id="c" * 12)
+    fake_docker.managed = [container]
+    fake_docker.info_by_name[container.name] = {
+        "name": container.name,
+        "id": "c" * 12,
+        "status": "running",
+        "started_at": None,
+        "host_port": 8030,
+        "image": "vllm/vllm-openai:v0.11.2",
+        "alias": "qwen2.5-coder-7b",
+    }
+    ns = await _start(settings, registry, fake_docker, fake_gpu)
+    try:
+        with pytest.raises(UpstreamError) as excinfo:
+            await _drain(
+                ns.client.chat(
+                    "qwen2.5-coder-7b",
+                    [control_pb2.ChatMessage(role="user", content="hi")],
+                )
+            )
+        assert "model server returned 500" in str(excinfo.value)
+    finally:
+        await _stop(ns)
+
+
+async def test_download_invalid_argument_translation(
+    controller: SimpleNamespace,
+) -> None:
+    """IMP-02.25: INVALID_ARGUMENT from DownloadModel → RuntimeError + details."""
+    with pytest.raises(RuntimeError) as excinfo:
+        await _drain(controller.client.download("   "))
+    assert "hf_repo is required" in str(excinfo.value)
+
+
+async def test_raise_translated_upstream_prefix() -> None:
+    """IMP-02.25 unit: the chat mapping routes "model server returned" to
+    UpstreamError before the ControllerUnavailable branch."""
+    client = ControllerClient(target="127.0.0.1:1")
+    try:
+        exc = grpc.aio.AioRpcError(
+            grpc.StatusCode.UNAVAILABLE,
+            cast(Any, ()),
+            cast(Any, ()),
+            "model server returned 500: boom",
+        )
+        with pytest.raises(UpstreamError):
+            client._raise_translated(
+                exc, unavailable_with="model server returned"
+            )
+        with pytest.raises(NoModelLoaded):
+            client._raise_translated(
+                grpc.aio.AioRpcError(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    cast(Any, ()),
+                    cast(Any, ()),
+                    "no model loaded — run vibe load x first",
+                ),
+                failed_precondition=NoModelLoaded,
+            )
+    finally:
+        await client.close()
 
 
 async def test_controller_unavailable() -> None:

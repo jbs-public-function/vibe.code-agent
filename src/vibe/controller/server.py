@@ -9,6 +9,7 @@ root used by `vibe serve` (FR-02.9).
 from __future__ import annotations
 
 import asyncio
+import signal
 from collections.abc import Callable
 
 import grpc
@@ -95,6 +96,10 @@ async def build_server(
         settings, registry, runner, docker, gpu_fn, buffer
     )
     server = grpc.aio.server()
+    # `run` reaches the servicer through this attribute to close the
+    # download executor on shutdown (IMP-02.14); like `bound_address` below
+    # it is an implementation detail of the composition root.
+    server.servicer = servicer  # pyright: ignore[reportAttributeAccessIssue]
     control_pb2_grpc.add_ModelControllerServicer_to_server(servicer, server)
     health_pb2_grpc.add_HealthServicer_to_server(
         DockerHealthServicer(docker), server
@@ -110,16 +115,49 @@ async def build_server(
     return server
 
 
-async def run(server: grpc.aio.Server) -> None:
-    """Start the server and block until termination (Ctrl+C)."""
+async def run(server: grpc.aio.Server, install_signals: bool = True) -> None:
+    """Start the server and block until termination (Ctrl+C/SIGTERM).
+
+    With `install_signals` (the default) SIGINT/SIGTERM are handled inside
+    the loop: they trigger `server.stop(grace)` so pump tasks and downloads
+    drain instead of being hard-cancelled by `asyncio.run`'s
+    KeyboardInterrupt (IMP-02.19). The all-in-one composition root passes
+    `install_signals=False` and owns the composite signal handler itself
+    (IMP-03.1).
+    """
     await server.start()
     address = getattr(server, "bound_address", None) or "(unknown address)"
     print(f"vibe controller listening on {address}")
+    loop = asyncio.get_running_loop()
+
+    stop_task: asyncio.Task | None = None
+
+    def _request_stop() -> None:
+        """`loop.add_signal_handler` callback: stop gracefully, not hard."""
+        nonlocal stop_task
+        if stop_task is None:
+            stop_task = asyncio.create_task(server.stop(grace=2))
+
+    if install_signals:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _request_stop)
+            except (NotImplementedError, RuntimeError):
+                # Non-Unix, or not the main thread: fall back to the
+                # KeyboardInterrupt path below.
+                pass
     try:
         await server.wait_for_termination()
     except KeyboardInterrupt:
+        # Only reachable when the signal handlers could not be installed:
+        # still stop gracefully rather than hard-cancelling pump tasks.
         await server.stop(grace=2)
-        print("controller stopped")
+    if stop_task is not None:
+        await stop_task
+    servicer = getattr(server, "servicer", None)
+    if servicer is not None:
+        servicer.downloads.close()  # IMP-02.14: executor shutdown
+    print("controller stopped")
 
 
 def main(settings: Settings, registry: Registry) -> int:

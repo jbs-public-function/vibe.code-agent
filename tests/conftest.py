@@ -104,6 +104,9 @@ class FakeDocker:
         self.started: list = []  # (spec, container) pairs from start()
         self.stopped: list = []  # containers passed to stop()
         self.wait_ready_calls: list = []  # (spec, timeout_s) pairs
+        # When set, `wait_ready` raises it (scriptable ContainerExited /
+        # ReadinessTimeout for JobRunner error-path tests).
+        self.wait_ready_error: Exception | None = None
         self.info_by_name: dict[str, dict] = {}
         self.log_lines: list[str] = []
 
@@ -123,6 +126,8 @@ class FakeDocker:
 
     async def wait_ready(self, spec, timeout_s: int) -> None:
         self.wait_ready_calls.append((spec, timeout_s))
+        if self.wait_ready_error is not None:
+            raise self.wait_ready_error
 
     def container_info(self, container) -> dict:
         default = {

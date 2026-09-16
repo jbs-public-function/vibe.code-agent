@@ -34,7 +34,7 @@ UNLOAD: JobKind
 DOWNLOAD: JobKind
 
 class ModelInfo(_message.Message):
-    __slots__ = ("alias", "display_name", "hf_repo", "quantization", "max_model_len", "gpu_memory_utilization", "host_port", "tags", "use_case", "state", "cached_locally")
+    __slots__ = ("alias", "display_name", "hf_repo", "quantization", "max_model_len", "gpu_memory_utilization", "host_port", "tags", "use_case", "state", "cached_locally", "container_name", "extra_args", "yaml_preview")
     ALIAS_FIELD_NUMBER: _ClassVar[int]
     DISPLAY_NAME_FIELD_NUMBER: _ClassVar[int]
     HF_REPO_FIELD_NUMBER: _ClassVar[int]
@@ -46,6 +46,9 @@ class ModelInfo(_message.Message):
     USE_CASE_FIELD_NUMBER: _ClassVar[int]
     STATE_FIELD_NUMBER: _ClassVar[int]
     CACHED_LOCALLY_FIELD_NUMBER: _ClassVar[int]
+    CONTAINER_NAME_FIELD_NUMBER: _ClassVar[int]
+    EXTRA_ARGS_FIELD_NUMBER: _ClassVar[int]
+    YAML_PREVIEW_FIELD_NUMBER: _ClassVar[int]
     alias: str
     display_name: str
     hf_repo: str
@@ -57,7 +60,10 @@ class ModelInfo(_message.Message):
     use_case: str
     state: ModelState
     cached_locally: bool
-    def __init__(self, alias: _Optional[str] = ..., display_name: _Optional[str] = ..., hf_repo: _Optional[str] = ..., quantization: _Optional[str] = ..., max_model_len: _Optional[int] = ..., gpu_memory_utilization: _Optional[float] = ..., host_port: _Optional[int] = ..., tags: _Optional[_Iterable[str]] = ..., use_case: _Optional[str] = ..., state: _Optional[_Union[ModelState, str]] = ..., cached_locally: _Optional[bool] = ...) -> None: ...
+    container_name: str
+    extra_args: _containers.RepeatedScalarFieldContainer[str]
+    yaml_preview: str
+    def __init__(self, alias: _Optional[str] = ..., display_name: _Optional[str] = ..., hf_repo: _Optional[str] = ..., quantization: _Optional[str] = ..., max_model_len: _Optional[int] = ..., gpu_memory_utilization: _Optional[float] = ..., host_port: _Optional[int] = ..., tags: _Optional[_Iterable[str]] = ..., use_case: _Optional[str] = ..., state: _Optional[_Union[ModelState, str]] = ..., cached_locally: _Optional[bool] = ..., container_name: _Optional[str] = ..., extra_args: _Optional[_Iterable[str]] = ..., yaml_preview: _Optional[str] = ...) -> None: ...
 
 class ListModelsRequest(_message.Message):
     __slots__ = ()
@@ -92,23 +98,37 @@ class Status(_message.Message):
     def __init__(self, active_alias: _Optional[str] = ..., state: _Optional[_Union[ModelState, str]] = ..., container_id: _Optional[str] = ..., host_port: _Optional[int] = ..., started_at_unix: _Optional[int] = ..., current_job: _Optional[_Union[Job, _Mapping]] = ..., last_error: _Optional[str] = ...) -> None: ...
 
 class Job(_message.Message):
-    __slots__ = ("id", "kind", "alias", "started_at_unix", "done", "ok")
+    __slots__ = ("id", "kind", "alias", "started_at_unix", "done", "ok", "terminal", "last_error", "started_at_unix_ms", "finished_at_unix_ms")
     ID_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     ALIAS_FIELD_NUMBER: _ClassVar[int]
     STARTED_AT_UNIX_FIELD_NUMBER: _ClassVar[int]
     DONE_FIELD_NUMBER: _ClassVar[int]
     OK_FIELD_NUMBER: _ClassVar[int]
+    TERMINAL_FIELD_NUMBER: _ClassVar[int]
+    LAST_ERROR_FIELD_NUMBER: _ClassVar[int]
+    STARTED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    FINISHED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
     id: str
     kind: JobKind
     alias: str
     started_at_unix: int
     done: bool
     ok: bool
-    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[JobKind, str]] = ..., alias: _Optional[str] = ..., started_at_unix: _Optional[int] = ..., done: _Optional[bool] = ..., ok: _Optional[bool] = ...) -> None: ...
+    terminal: bool
+    last_error: str
+    started_at_unix_ms: int
+    finished_at_unix_ms: int
+    def __init__(self, id: _Optional[str] = ..., kind: _Optional[_Union[JobKind, str]] = ..., alias: _Optional[str] = ..., started_at_unix: _Optional[int] = ..., done: _Optional[bool] = ..., ok: _Optional[bool] = ..., terminal: _Optional[bool] = ..., last_error: _Optional[str] = ..., started_at_unix_ms: _Optional[int] = ..., finished_at_unix_ms: _Optional[int] = ...) -> None: ...
+
+class GetJobRequest(_message.Message):
+    __slots__ = ("job_id",)
+    JOB_ID_FIELD_NUMBER: _ClassVar[int]
+    job_id: str
+    def __init__(self, job_id: _Optional[str] = ...) -> None: ...
 
 class JobEvent(_message.Message):
-    __slots__ = ("job_id", "ts_unix_ms", "level", "message", "state", "progress", "terminal")
+    __slots__ = ("job_id", "ts_unix_ms", "level", "message", "state", "progress", "terminal", "kind", "alias")
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
     TS_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
     LEVEL_FIELD_NUMBER: _ClassVar[int]
@@ -116,6 +136,8 @@ class JobEvent(_message.Message):
     STATE_FIELD_NUMBER: _ClassVar[int]
     PROGRESS_FIELD_NUMBER: _ClassVar[int]
     TERMINAL_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    ALIAS_FIELD_NUMBER: _ClassVar[int]
     job_id: str
     ts_unix_ms: int
     level: str
@@ -123,7 +145,9 @@ class JobEvent(_message.Message):
     state: ModelState
     progress: float
     terminal: bool
-    def __init__(self, job_id: _Optional[str] = ..., ts_unix_ms: _Optional[int] = ..., level: _Optional[str] = ..., message: _Optional[str] = ..., state: _Optional[_Union[ModelState, str]] = ..., progress: _Optional[float] = ..., terminal: _Optional[bool] = ...) -> None: ...
+    kind: JobKind
+    alias: str
+    def __init__(self, job_id: _Optional[str] = ..., ts_unix_ms: _Optional[int] = ..., level: _Optional[str] = ..., message: _Optional[str] = ..., state: _Optional[_Union[ModelState, str]] = ..., progress: _Optional[float] = ..., terminal: _Optional[bool] = ..., kind: _Optional[_Union[JobKind, str]] = ..., alias: _Optional[str] = ...) -> None: ...
 
 class LoadModelRequest(_message.Message):
     __slots__ = ("alias", "force", "keep_failed", "timeout_s")
@@ -142,10 +166,12 @@ class UnloadModelRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetJobEventsRequest(_message.Message):
-    __slots__ = ("job_id",)
+    __slots__ = ("job_id", "follow")
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
+    FOLLOW_FIELD_NUMBER: _ClassVar[int]
     job_id: str
-    def __init__(self, job_id: _Optional[str] = ...) -> None: ...
+    follow: bool
+    def __init__(self, job_id: _Optional[str] = ..., follow: _Optional[bool] = ...) -> None: ...
 
 class StreamLogsRequest(_message.Message):
     __slots__ = ("tail", "follow")
@@ -226,7 +252,7 @@ class ListDownloadsRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class DownloadInfo(_message.Message):
-    __slots__ = ("id", "hf_repo", "include", "progress", "bytes_done", "bytes_total", "done", "ok", "error")
+    __slots__ = ("id", "hf_repo", "include", "progress", "bytes_done", "bytes_total", "done", "ok", "error", "current_file", "revision", "started_at_unix_ms", "finished_at_unix_ms")
     ID_FIELD_NUMBER: _ClassVar[int]
     HF_REPO_FIELD_NUMBER: _ClassVar[int]
     INCLUDE_FIELD_NUMBER: _ClassVar[int]
@@ -236,6 +262,10 @@ class DownloadInfo(_message.Message):
     DONE_FIELD_NUMBER: _ClassVar[int]
     OK_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
+    CURRENT_FILE_FIELD_NUMBER: _ClassVar[int]
+    REVISION_FIELD_NUMBER: _ClassVar[int]
+    STARTED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    FINISHED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
     id: str
     hf_repo: str
     include: _containers.RepeatedScalarFieldContainer[str]
@@ -245,7 +275,11 @@ class DownloadInfo(_message.Message):
     done: bool
     ok: bool
     error: str
-    def __init__(self, id: _Optional[str] = ..., hf_repo: _Optional[str] = ..., include: _Optional[_Iterable[str]] = ..., progress: _Optional[float] = ..., bytes_done: _Optional[int] = ..., bytes_total: _Optional[int] = ..., done: _Optional[bool] = ..., ok: _Optional[bool] = ..., error: _Optional[str] = ...) -> None: ...
+    current_file: str
+    revision: str
+    started_at_unix_ms: int
+    finished_at_unix_ms: int
+    def __init__(self, id: _Optional[str] = ..., hf_repo: _Optional[str] = ..., include: _Optional[_Iterable[str]] = ..., progress: _Optional[float] = ..., bytes_done: _Optional[int] = ..., bytes_total: _Optional[int] = ..., done: _Optional[bool] = ..., ok: _Optional[bool] = ..., error: _Optional[str] = ..., current_file: _Optional[str] = ..., revision: _Optional[str] = ..., started_at_unix_ms: _Optional[int] = ..., finished_at_unix_ms: _Optional[int] = ...) -> None: ...
 
 class ListDownloadsResponse(_message.Message):
     __slots__ = ("downloads",)
@@ -264,7 +298,7 @@ class DownloadModelRequest(_message.Message):
     def __init__(self, hf_repo: _Optional[str] = ..., include: _Optional[_Iterable[str]] = ..., revision: _Optional[str] = ...) -> None: ...
 
 class DownloadProgress(_message.Message):
-    __slots__ = ("id", "progress", "bytes_done", "bytes_total", "current_file", "terminal", "error")
+    __slots__ = ("id", "progress", "bytes_done", "bytes_total", "current_file", "terminal", "error", "ok")
     ID_FIELD_NUMBER: _ClassVar[int]
     PROGRESS_FIELD_NUMBER: _ClassVar[int]
     BYTES_DONE_FIELD_NUMBER: _ClassVar[int]
@@ -272,6 +306,7 @@ class DownloadProgress(_message.Message):
     CURRENT_FILE_FIELD_NUMBER: _ClassVar[int]
     TERMINAL_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
+    OK_FIELD_NUMBER: _ClassVar[int]
     id: str
     progress: float
     bytes_done: int
@@ -279,7 +314,8 @@ class DownloadProgress(_message.Message):
     current_file: str
     terminal: bool
     error: str
-    def __init__(self, id: _Optional[str] = ..., progress: _Optional[float] = ..., bytes_done: _Optional[int] = ..., bytes_total: _Optional[int] = ..., current_file: _Optional[str] = ..., terminal: _Optional[bool] = ..., error: _Optional[str] = ...) -> None: ...
+    ok: bool
+    def __init__(self, id: _Optional[str] = ..., progress: _Optional[float] = ..., bytes_done: _Optional[int] = ..., bytes_total: _Optional[int] = ..., current_file: _Optional[str] = ..., terminal: _Optional[bool] = ..., error: _Optional[str] = ..., ok: _Optional[bool] = ...) -> None: ...
 
 class CancelDownloadRequest(_message.Message):
     __slots__ = ("id",)
@@ -304,7 +340,7 @@ class ReloadRegistryResponse(_message.Message):
     def __init__(self, errors: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class RegistrationSpec(_message.Message):
-    __slots__ = ("hf_repo", "alias", "quantization", "max_model_len", "gpu_memory_utilization", "host_port", "tool_parser", "use_case", "tags", "display_name")
+    __slots__ = ("hf_repo", "alias", "quantization", "max_model_len", "gpu_memory_utilization", "host_port", "tool_parser", "use_case", "tags", "display_name", "container_name", "extra_args")
     HF_REPO_FIELD_NUMBER: _ClassVar[int]
     ALIAS_FIELD_NUMBER: _ClassVar[int]
     QUANTIZATION_FIELD_NUMBER: _ClassVar[int]
@@ -315,6 +351,8 @@ class RegistrationSpec(_message.Message):
     USE_CASE_FIELD_NUMBER: _ClassVar[int]
     TAGS_FIELD_NUMBER: _ClassVar[int]
     DISPLAY_NAME_FIELD_NUMBER: _ClassVar[int]
+    CONTAINER_NAME_FIELD_NUMBER: _ClassVar[int]
+    EXTRA_ARGS_FIELD_NUMBER: _ClassVar[int]
     hf_repo: str
     alias: str
     quantization: str
@@ -325,7 +363,9 @@ class RegistrationSpec(_message.Message):
     use_case: str
     tags: _containers.RepeatedScalarFieldContainer[str]
     display_name: str
-    def __init__(self, hf_repo: _Optional[str] = ..., alias: _Optional[str] = ..., quantization: _Optional[str] = ..., max_model_len: _Optional[int] = ..., gpu_memory_utilization: _Optional[float] = ..., host_port: _Optional[int] = ..., tool_parser: _Optional[str] = ..., use_case: _Optional[str] = ..., tags: _Optional[_Iterable[str]] = ..., display_name: _Optional[str] = ...) -> None: ...
+    container_name: str
+    extra_args: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, hf_repo: _Optional[str] = ..., alias: _Optional[str] = ..., quantization: _Optional[str] = ..., max_model_len: _Optional[int] = ..., gpu_memory_utilization: _Optional[float] = ..., host_port: _Optional[int] = ..., tool_parser: _Optional[str] = ..., use_case: _Optional[str] = ..., tags: _Optional[_Iterable[str]] = ..., display_name: _Optional[str] = ..., container_name: _Optional[str] = ..., extra_args: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ProposeRegistrationRequest(_message.Message):
     __slots__ = ("spec",)

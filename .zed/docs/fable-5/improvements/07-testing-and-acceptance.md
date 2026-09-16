@@ -15,20 +15,24 @@ Docker + nvidia-ctk) the first time the system runs for real.
 
 ### Controller (`tests/test_servicer.py`, `test_docker_ctl.py`, `test_registry.py`, `test_downloads.py`, `test_client.py`)
 
-- [ ] Heartbeat: patch `HEARTBEAT_SECONDS` small, assert `level="debug"` heartbeat events (NFR-02.5).
-- [ ] `wait_ready`: `ContainerExited`, `ReadinessTimeout`, gated-repo hint, `last_logs` truncation, `/health`→`/v1/models` alias check (currently `FakeDocker.wait_ready` is a stub).
-- [ ] Cancel `LoadModel` stream mid-job → job still reaches terminal; `GetStatus` shows `LOADING` meanwhile (IMP-02.1/02.2).
-- [ ] Idempotent unload emits terminal `AVAILABLE` (IMP-02.7).
-- [ ] Concurrent `write_entry` ×2 on one file → one succeeds, one gets `duplicate …`, file re-`load`s (IMP-02.20).
-- [ ] `Registry.load` with duplicate alias/port **across** documents; `write_entry` output re-loads with special-char `use_case`/`display_name`.
-- [ ] Realistic GGUF repo (README + config.json + `.gguf`) is rejected (IMP-02.21).
-- [ ] `RemoveCached` while a download for the same repo is in flight → refused (IMP-02.4).
-- [ ] `DownloadManager.start` with a different `include` for an in-flight repo (IMP-02.13).
-- [ ] Stress: every terminal `DownloadProgress` with `ok=False` has non-empty `error` (IMP-02.12).
-- [ ] `Chat` RPC: SSE parsing, `FAILED_PRECONDITION` when no container, upstream 500, cancel → `aclose()`.
-- [ ] Client translation: `FAILED_PRECONDITION` from `Chat` → `NoModelLoaded`; `INVALID_ARGUMENT` from `DownloadModel` (IMP-02.25).
-- [ ] `ListModels.cached_locally` for a local-path `hf_repo` (IMP-02.3).
-- [ ] Daemon-gone simulation: `containers.list` raising `requests.ConnectionError` → `DockerError` (IMP-02.10).
+> Implemented in `tests/test_controller.py`, `test_docker_ctl.py`, `test_registry.py`, `test_downloads.py`,
+> `test_cache.py`, `test_client.py`, `test_jobs.py`, `test_job_events.py` (there is no `test_servicer.py`).
+
+- [x] Heartbeat: patch `HEARTBEAT_SECONDS` small, assert `level="debug"` heartbeat events (NFR-02.5).
+- [x] `wait_ready`: `ContainerExited`, `ReadinessTimeout`, gated-repo hint, `last_logs` truncation, `/health`→`/v1/models` alias check (currently `FakeDocker.wait_ready` is a stub).
+- [x] Cancel `LoadModel` stream mid-job → job still reaches terminal; `GetStatus` shows `LOADING` meanwhile (IMP-02.1/02.2).
+- [x] Idempotent unload emits terminal `AVAILABLE` (IMP-02.7).
+- [x] Concurrent `write_entry` ×2 on one file → one succeeds, one gets `duplicate …`, file re-`load`s (IMP-02.20).
+- [x] `Registry.load` with duplicate alias/port **across** documents; `write_entry` output re-loads with special-char `use_case`/`display_name`.
+- [x] Realistic GGUF repo (README + config.json + `.gguf`) is rejected (IMP-02.21).
+- [x] `RemoveCached` while a download for the same repo is in flight → refused (IMP-02.4).
+- [x] `DownloadManager.start` with a different `include` for an in-flight repo (IMP-02.13).
+- [x] Stress: every terminal `DownloadProgress` with `ok=False` has non-empty `error` (IMP-02.12).
+- [x] `Chat` RPC: SSE parsing, `FAILED_PRECONDITION` when no container, upstream 500, cancel → `aclose()`.
+- [x] Client translation: `FAILED_PRECONDITION` from `Chat` → `NoModelLoaded`; `INVALID_ARGUMENT` from `DownloadModel` (IMP-02.25).
+- [x] `ListModels.cached_locally` for a local-path `hf_repo` (IMP-02.3).
+- [x] Daemon-gone simulation: `containers.list` raising `requests.ConnectionError` → `DockerError` (IMP-02.10).
+- [x] (doc 01) Replayed events carry kind/alias; `GetJob` NOT_FOUND after eviction; `DownloadProgress.ok` true exactly once on success; `GetJobEvents(follow=true)` tails to the terminal event.
 
 ### Gateway / serve / CLI (`tests/test_gateway.py`, new `test_serve.py`, `test_cli.py`)
 

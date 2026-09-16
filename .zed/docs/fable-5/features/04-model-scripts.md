@@ -131,6 +131,20 @@ rpc ProposeRegistration(ProposeRegistrationRequest) returns (ProposeRegistration
 rpc WriteRegistration(WriteRegistrationRequest) returns (WriteRegistrationResponse);
 ```
 
+Doc 01 additions (IMP-01.4/01.5) that extend these messages:
+
+```proto
+message DownloadInfo {
+  // ... existing fields ...
+  string current_file = 10; string revision = 11;
+  int64 started_at_unix_ms = 12; int64 finished_at_unix_ms = 13;
+}
+message DownloadProgress { /* ... */ bool ok = 8; }   // success is explicit, not error==""
+message RegistrationSpec { /* ... */ string container_name = 11; repeated string extra_args = 12; }
+message ModelInfo { /* ... */ string container_name = 12; repeated string extra_args = 13;
+                    string yaml_preview = 14; }        // exact YAML write_entry would append (XR-3)
+```
+
 ### File layout
 
 ```

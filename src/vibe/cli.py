@@ -299,6 +299,38 @@ def status(
     _run(_status(json_=json_))
 
 
+@app.command("jobs")
+def jobs_cmd(
+    job_id: str = typer.Argument(..., help="Job id from a load/unload stream."),
+) -> None:
+    """Show one job's kind, alias, and terminal state (IMP-01.2)."""
+    _run(_jobs(job_id))
+
+
+async def _jobs(job_id: str) -> None:
+    settings = _load_settings()
+    client = ControllerClient(settings)
+    try:
+        job = await client.get_job(job_id)
+    except KeyError:
+        print(
+            f"unknown job '{job_id}' — the controller keeps only recent jobs",
+            file=sys.stderr,
+        )
+        raise typer.Exit(EXIT_RUNTIME) from None
+    except ControllerUnavailable as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(EXIT_RUNTIME) from exc
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise typer.Exit(EXIT_RUNTIME) from exc
+    kind = control_pb2.JobKind.Name(job.kind)
+    print(
+        f"job {job.id}: kind={kind} alias={job.alias or '-'} "
+        f"terminal={job.terminal} last_error={job.last_error or '-'}"
+    )
+
+
 async def _status(json_: bool) -> None:
     settings = _load_settings()
     client = ControllerClient(settings)
@@ -415,6 +447,14 @@ async def _download(
     is_tty = sys.stderr.isatty()
     terminal_seen = False
     try:
+        # IMP-01.4: when the RPC attaches to an in-flight download, show its
+        # current file from `DownloadInfo` so the user sees where it stands.
+        for info in await client.list_downloads():
+            if info.done or info.hf_repo.lower() != hf_repo.strip().lower():
+                continue
+            current = f" ({info.current_file})" if info.current_file else ""
+            print(f"attaching to in-flight download{current}")
+            break
         async for event in client.download(
             hf_repo, include=include, revision=revision
         ):

@@ -279,6 +279,96 @@ async def test_empty_repo_raises_value_error():
         manager.start("  ")
 
 
+async def test_attach_with_different_include_raises(monkeypatch: pytest.MonkeyPatch):
+    """IMP-02.13: a different include/revision for an in-flight repo must not
+    silently attach — the RPC maps this ValueError to INVALID_ARGUMENT."""
+    monkeypatch.setattr(downloads_mod, "HfApi", FakeHfApi)
+    monkeypatch.setattr(
+        downloads_mod,
+        "snapshot_download",
+        FakeSnapshotDownload(FAKE_FILES, chunk=10, delay=0.02),
+    )
+    manager = DownloadManager(_settings("/tmp/vibe-dl-unit"))
+    first = manager.start("org/repo", include=["*.safetensors"])
+    with pytest.raises(ValueError, match="already in flight"):
+        manager.start("org/repo", include=["config.json"])
+    with pytest.raises(ValueError, match="already in flight"):
+        manager.start("org/repo", revision="main")
+    # The same (repo, revision, sorted include) still attaches.
+    assert manager.start("org/repo", include=["*.safetensors"]) is first
+    assert manager.cancel(first.id) is True
+
+
+async def test_terminal_progress_ok_semantics(monkeypatch: pytest.MonkeyPatch):
+    """IMP-01.4/02.12: the terminal event carries an explicit `ok` flag —
+    True exactly once on success, False with a non-empty error otherwise."""
+    monkeypatch.setattr(downloads_mod, "HfApi", FakeHfApi)
+    monkeypatch.setattr(
+        downloads_mod,
+        "snapshot_download",
+        FakeSnapshotDownload(FAKE_FILES, chunk=100, delay=0.0),
+    )
+    manager = DownloadManager(_settings("/tmp/vibe-dl-unit"))
+    events = [event async for event in manager.events(manager.start("org/ok"))]
+    ok_events = [event for event in events if event.ok]
+    assert len(ok_events) == 1
+    assert ok_events[0].terminal is True
+    assert ok_events[0].error == ""
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "cancel",
+        "gated",
+        "http_403",
+        "generic",
+    ],
+)
+async def test_terminal_progress_failures_have_error(
+    monkeypatch: pytest.MonkeyPatch, scenario: str
+):
+    """IMP-02.12 stress: every terminal event with ok=False has a non-empty
+    error, so a failure can never look like a success."""
+    monkeypatch.setattr(downloads_mod, "HfApi", FakeHfApi)
+    if scenario == "gated":
+        api = FakeHfApi()
+        api.error = _gated_error()
+        monkeypatch.setattr(downloads_mod, "HfApi", lambda token=None: api)
+        monkeypatch.setattr(
+            downloads_mod,
+            "snapshot_download",
+            FakeSnapshotDownload(FAKE_FILES, chunk=100, delay=0.0),
+        )
+    elif scenario == "http_403":
+        def denied(repo_id: str, **kwargs: Any) -> str:
+            raise _http_error(403)
+
+        monkeypatch.setattr(downloads_mod, "snapshot_download", denied)
+    elif scenario == "generic":
+        def boom(repo_id: str, **kwargs: Any) -> str:
+            raise OSError("disk exploded")
+
+        monkeypatch.setattr(downloads_mod, "snapshot_download", boom)
+    else:  # cancel
+        monkeypatch.setattr(
+            downloads_mod,
+            "snapshot_download",
+            FakeSnapshotDownload(FAKE_FILES, chunk=10, delay=0.01),
+        )
+
+    manager = DownloadManager(_settings("/tmp/vibe-dl-unit"))
+    handle = manager.start(f"org/{scenario}")
+    if scenario == "cancel":
+        await asyncio.sleep(0.05)  # let it make progress first
+        assert manager.cancel(handle.id) is True
+    events = [event async for event in manager.events(handle)]
+    terminal = events[-1]
+    assert terminal.terminal is True
+    assert terminal.ok is False
+    assert terminal.error
+
+
 # -- in-process RPC tests ----------------------------------------------------
 
 
@@ -452,5 +542,37 @@ async def test_remove_cached_rpc(
         assert list(response.entries) == []
         removed, error = await ns.client.remove_cached("org/repo")
         assert removed is True  # idempotent
+    finally:
+        await _stop(ns)
+
+
+async def test_remove_cached_refused_while_download_inflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registry: Registry,
+    fake_docker: Any,
+):
+    """IMP-02.4: RemoveCached refuses while the repo's download runs."""
+    monkeypatch.setattr(downloads_mod, "HfApi", FakeHfApi)
+    monkeypatch.setattr(
+        downloads_mod,
+        "snapshot_download",
+        FakeSnapshotDownload(FAKE_FILES, chunk=10, delay=0.05),
+    )
+    ns = await _start(_settings(str(tmp_path)), registry, fake_docker, fake_gpu)
+    try:
+        task = asyncio.create_task(_drain(ns.client.download("org/repo")))
+        infos: list[control_pb2.DownloadInfo] = []
+        for _ in range(200):
+            infos = await ns.client.list_downloads()
+            if infos:
+                break
+            await asyncio.sleep(0.01)
+        assert infos
+        removed, error = await ns.client.remove_cached("org/repo")
+        assert removed is False
+        assert error == "download in flight"
+        await ns.client.cancel_download(infos[0].id)
+        await task
     finally:
         await _stop(ns)
