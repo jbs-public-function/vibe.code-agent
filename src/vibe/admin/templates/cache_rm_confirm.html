@@ -5,9 +5,9 @@
 <section class="card">
   <p>Remove <code>{{ repo }}</code> from the HF cache? Its files under
      <code>HF_HOME/hub</code> are deleted; a later download starts fresh.</p>
-  <form method="post" action="{{ url_for('developer_cache_remove', repo=repo) }}" class="inline">
+  <form method="post" action="{{ path_for('developer_cache_remove', repo=repo) }}" class="inline">
     <button type="submit">Remove {{ repo }}</button>
-    <a href="{{ url_for('developer') }}">Cancel</a>
+    <a href="{{ path_for('developer') }}">Cancel</a>
   </form>
 </section>
 {% endblock content %}

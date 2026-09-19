@@ -8,6 +8,7 @@ the JSON liveness probe with a 3 s deadline on the controller.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import cast
 
@@ -16,21 +17,42 @@ from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from vibe.admin.routes import GRPC_TIMEOUT, client_of, grpc, render
+from vibe.admin.routes import GRPC_TIMEOUT, client_of, grpc, render, safe_grpc
 from vibe.client import ControllerUnavailable
 from vibe.gen.vibe.v1 import control_pb2
 from vibe.gateway.models import state_name
 
 router = APIRouter()
 
+logger = logging.getLogger("vibe.admin")
+
+# IMP-04.24: the probe must be cheap — the dashboard refreshes every 5 s.
+PROBE_TIMEOUT_S = 0.5
+
 
 async def _gateway_ok(request: Request) -> bool:
-    """Probe the Phase-2 gateway's /health over plain HTTP."""
-    http = cast(httpx.AsyncClient, request.app.state.http)
+    """Probe the Phase-2 gateway's /health over plain HTTP (IMP-04.24).
+
+    The URL comes from `app.state.gateway_health_url` (wildcard binds already
+    mapped to loopback, IPv6 bracketed); tests inject `app.state.gateway_transport`
+    so the probe never dials the real gateway. Any exception counts as down —
+    `httpx.InvalidURL` is a `ValueError`, not an `HTTPError`.
+    """
     url = cast(str, request.app.state.gateway_health_url)
+    transport = getattr(request.app.state, "gateway_transport", None)
     try:
-        response = await http.get(url)
-    except httpx.HTTPError:
+        if transport is None:
+            client = cast(httpx.AsyncClient, request.app.state.http)
+            response = await client.get(url)
+        else:
+            async with httpx.AsyncClient(
+                transport=transport, timeout=PROBE_TIMEOUT_S
+            ) as probe:
+                response = await probe.get(url)
+    except Exception as exc:
+        logger.warning(
+            "gateway probe failed", extra={"url": url, "error": str(exc)}
+        )
         return False
     return response.status_code == 200
 
@@ -39,8 +61,10 @@ async def _gateway_ok(request: Request) -> bool:
 async def dashboard(request: Request) -> Response:
     """Dashboard: status, GPU, health and the current job (FR-01.1)."""
     client = client_of(request)
-    status_result, gpu_result, gateway_ok = await asyncio.gather(
-        grpc(client.status()), grpc(client.gpu()), _gateway_ok(request)
+    (status_result, status_error), (gpu_result, gpu_error), gateway_ok = (
+        await asyncio.gather(
+            safe_grpc(client.status()), safe_grpc(client.gpu()), _gateway_ok(request)
+        )
     )
     controller_down = status_result is None or gpu_result is None
     status = status_result if status_result is not None else control_pb2.Status()
@@ -70,16 +94,24 @@ async def dashboard(request: Request) -> Response:
         "bar_class": f"bar-{min(100, mem_pct - mem_pct % 5)}",
         "gateway_ok": gateway_ok,
     }
-    return render(request, "dashboard.html", context)
+    return render(request, "dashboard.html", context, error=status_error or gpu_error)
 
 
 @router.get("/health", name="health")
 async def health(request: Request) -> JSONResponse:
     """Liveness probe; controller status under the 3 s deadline (FR-01.9)."""
     client = client_of(request)
+    error: str | None = None
     try:
         await asyncio.wait_for(client.status(), timeout=GRPC_TIMEOUT)
         controller = "ok"
-    except (asyncio.TimeoutError, ControllerUnavailable, RuntimeError):
+    except (asyncio.TimeoutError, ControllerUnavailable):
         controller = "down"
-    return JSONResponse({"admin": "ok", "controller": controller})
+    except RuntimeError as exc:
+        # IMP-04.15: a real error is reported, not swallowed as "down".
+        controller = "down"
+        error = str(exc)
+    payload: dict[str, str] = {"admin": "ok", "controller": controller}
+    if error is not None:
+        payload["error"] = error
+    return JSONResponse(payload)

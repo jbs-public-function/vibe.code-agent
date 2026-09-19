@@ -21,6 +21,7 @@ from vibe.admin.routes import (
     redirect,
     redirect_with_flash,
     render,
+    safe_grpc,
     start_background_job,
 )
 from vibe.client import ControllerUnavailable
@@ -34,8 +35,11 @@ router = APIRouter()
 async def models_page(request: Request) -> Response:
     """Registry table plus the load/unload forms (FR-01.2)."""
     client = client_of(request)
-    infos = await grpc(client.list_models())
-    status = await grpc(client.status())
+    # IMP-04.16: the two independent calls run concurrently under the shared
+    # 3 s budget instead of back-to-back.
+    (infos, infos_error), (status, status_error) = await asyncio.gather(
+        safe_grpc(client.list_models()), safe_grpc(client.status())
+    )
     controller_down = infos is None or status is None
     # FR-04.9: uncached, non-loading models get a Download button that POSTs
     # into the /developer download flow.
@@ -56,6 +60,7 @@ async def models_page(request: Request) -> Response:
             "active_alias": status.active_alias if status is not None else "",
             "downloadable": downloadable,
         },
+        error=infos_error or status_error,
     )
 
 
@@ -79,6 +84,10 @@ async def _start_job(
         )
     except KeyError:
         return redirect_with_flash("/models", f"unknown alias: {alias}")
+    except StopAsyncIteration:
+        # IMP-04.15: an empty job stream (controller answered, no events) must
+        # not become a 500.
+        return redirect_with_flash("/models", "controller reported no job events")
     except (asyncio.TimeoutError, ControllerUnavailable):
         return redirect_with_flash(
             "/models", "controller unreachable — try again in a moment"

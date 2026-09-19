@@ -7,30 +7,30 @@
   {% if ready %}
 <section class="card">
   <h2>Send</h2>
-  <form method="post" action="{{ url_for('chat_send') }}">
+  <form method="post" action="{{ path_for('chat_send') }}">
     <label for="message">Message</label>
     <textarea id="message" name="message" rows="4" required autofocus></textarea>
     <div class="inline">
       <label for="temperature">temperature</label>
-      <input id="temperature" name="temperature" type="text" value="{{ temperature }}" size="4">
+      <input id="temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="{{ temperature }}">
       <label for="max_tokens">max_tokens</label>
-      <input id="max_tokens" name="max_tokens" type="text" value="{{ max_tokens }}" size="6">
+      <input id="max_tokens" name="max_tokens" type="number" min="1" step="1" {% if max_model_len %}max="{{ max_model_len }}"{% endif %} value="{{ max_tokens }}">
       <button type="submit">Send</button>
     </div>
   </form>
-  <form method="post" action="{{ url_for('chat_reset') }}" class="inline">
+  <form method="post" action="{{ path_for('chat_reset') }}" class="inline">
     <button type="submit">Reset conversation</button>
   </form>
 </section>
   {% else %}
 <section class="card">
-  <p>No model loaded. <a href="{{ url_for('models') }}">Load a model first</a>.</p>
+  <p>No model loaded. <a href="{{ path_for('models') }}">Load a model first</a>.</p>
 </section>
   {% endif %}
 {% endif %}
 
 {% if warn %}
-<div class="flash">History is large (~{{ total_tokens }} tokens vs {{ max_model_len }} context) — consider resetting the conversation.</div>
+<div class="flash" role="status">History is large (~{{ total_tokens }} tokens vs {{ max_model_len }} context) — consider resetting the conversation.</div>
 {% endif %}
 
 <section class="card">

@@ -5,7 +5,7 @@
 
 <section class="card">
   <h2>Downloads</h2>
-  <form method="post" action="{{ url_for('developer_downloads_post') }}">
+  <form method="post" action="{{ path_for('developer_downloads_post') }}">
     <div class="inline">
       <label for="repo">HF repo</label>
       <input name="repo" id="repo" placeholder="org/repo" required>
@@ -22,7 +22,7 @@
     <tbody>
     {% for info in downloads %}
       <tr>
-        <td><a href="{{ url_for('developer_download', download_id=info.id) }}"><code>{{ info.id }}</code></a></td>
+        <td><a href="{{ path_for('developer_download', download_id=info.id) }}"><code>{{ info.id }}</code></a></td>
         <td>{{ info.hf_repo }}</td>
         <td>{{ "%.0f%%"|format(info.progress * 100) }}</td>
         <td>
@@ -52,11 +52,11 @@
         <td>{{ entry.size }}</td>
         <td>{{ entry.last_modified }}</td>
         <td>
-          {% for alias in entry.aliases %}<a href="{{ url_for('models') }}">{{ alias }}</a>{% if not loop.last %}, {% endif %}{% else %}—{% endfor %}
+          {% for alias in entry.aliases %}<a href="{{ path_for('models') }}">{{ alias }}</a>{% if not loop.last %}, {% endif %}{% else %}—{% endfor %}
         </td>
         <td>
-          <a href="/developer/register?repo={{ entry.repo_id }}">Register</a> ·
-          <a href="{{ url_for('developer_cache_confirm', repo=entry.repo_id) }}">Remove</a>
+          <a href="{{ path_for('developer_register_form') }}?repo={{ entry.repo_id|urlencode }}">Register</a> ·
+          <a href="{{ path_for('developer_cache_confirm', repo=entry.repo_id) }}">Remove</a>
         </td>
       </tr>
     {% endfor %}
@@ -70,7 +70,14 @@
 <section class="card">
   <h2>Register a model</h2>
   <p>Add a downloaded repo to <code>models.yaml</code> with validation and sensible
-     defaults: <a href="{{ url_for('developer_register_form') }}">guided registration →</a></p>
+     defaults: <a href="{{ path_for('developer_register_form') }}">guided registration →</a></p>
+</section>
+
+<section class="card">
+  <h2>Registry</h2>
+  <form method="post" action="{{ path_for('developer_reload') }}" class="inline">
+    <button type="submit">Reload registry</button>
+  </form>
 </section>
 
 <section class="card">

@@ -4,12 +4,19 @@ Every controller call goes through one of the small wrappers here so the 3 s
 deadline and the "controller unreachable" degradation (NFR-01.5) are applied
 consistently. POST bodies are parsed with `parse_qsl` — the admin must not
 depend on `python-multipart`, so `request.form()` is never used.
+
+IMP-04.15: the wrappers treat only `ControllerUnavailable` and deadline
+expiry as "unreachable"; any other `RuntimeError` (e.g. a vLLM 400 surfaced
+through `UpstreamError`) is a real error that routes surface with its
+message. `safe_grpc`/`safe_collect` pair every value with that message so
+page routes can render a distinct error banner instead of a 500.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
+from contextlib import suppress
 from datetime import datetime
 from typing import TypeVar, cast
 from urllib.parse import parse_qsl
@@ -32,18 +39,28 @@ _T = TypeVar("_T")
 _TERMINAL_STATES = (control_pb2.READY, control_pb2.AVAILABLE, control_pb2.ERROR)
 
 
+async def aclose(agen: AsyncIterator[object]) -> None:
+    """Best-effort close of an async generator typed as `AsyncIterator`.
+
+    The client methods are annotated `AsyncIterator[...]` but return async
+    generators; `aclose()` releases the underlying stream (IMP-04.15).
+    """
+    await cast(AsyncGenerator[object, None], agen).aclose()
+
+
 async def grpc(awaitable: Awaitable[_T]) -> _T | None:
     """Await a unary controller call under the 3 s deadline; `None` = down.
 
     `KeyError` (unknown alias) and `JobInProgress` propagate so routes can
-    handle them specifically; every other controller failure degrades to
-    `None` rather than a 500 (NFR-01.5).
+    handle them specifically; `ControllerUnavailable` and deadline expiry
+    degrade to `None` (NFR-01.5). Any other `RuntimeError` propagates — it is
+    a real error whose message must reach the user (IMP-04.15).
     """
     try:
         return await asyncio.wait_for(awaitable, timeout=GRPC_TIMEOUT)
     except (JobInProgress, KeyError):
         raise
-    except (asyncio.TimeoutError, ControllerUnavailable, RuntimeError):
+    except (asyncio.TimeoutError, ControllerUnavailable):
         return None
 
 
@@ -51,7 +68,10 @@ async def collect(agen: AsyncIterator[_T]) -> list[_T] | None:
     """Collect a bounded stream under the 3 s deadline; `None` = down.
 
     The deadline applies to the whole collect, not per item (NFR-01.5).
-    `KeyError` and `JobInProgress` propagate for route-specific handling.
+    `KeyError` and `JobInProgress` propagate for route-specific handling;
+    other `RuntimeError`s propagate (IMP-04.15). On deadline expiry the
+    generator is `aclose()`d so the underlying stream is released
+    (IMP-04.15).
     """
 
     async def _collect() -> list[_T]:
@@ -61,8 +81,40 @@ async def collect(agen: AsyncIterator[_T]) -> list[_T] | None:
         return await asyncio.wait_for(_collect(), timeout=GRPC_TIMEOUT)
     except (JobInProgress, KeyError):
         raise
-    except (asyncio.TimeoutError, ControllerUnavailable, RuntimeError):
+    except asyncio.TimeoutError:
+        with suppress(Exception):
+            await aclose(agen)
         return None
+    except ControllerUnavailable:
+        return None
+
+
+async def safe_grpc(awaitable: Awaitable[_T]) -> tuple[_T | None, str | None]:
+    """`grpc()` plus a `RuntimeError` message for the error banner (IMP-04.15)."""
+    try:
+        return await grpc(awaitable), None
+    except RuntimeError as exc:
+        return None, str(exc)
+
+
+async def safe_collect(agen: AsyncIterator[_T]) -> tuple[list[_T] | None, str | None]:
+    """`collect()` plus a `RuntimeError` message for the error banner (IMP-04.15)."""
+    try:
+        return await collect(agen), None
+    except RuntimeError as exc:
+        return None, str(exc)
+
+
+async def grpc_flash(awaitable: Awaitable[_T]) -> tuple[_T | None, str | None]:
+    """`grpc()` plus a `RuntimeError` message for a flash on POST routes (IMP-04.15).
+
+    `None` with `message=None` means "unreachable" (degradation flash); `None`
+    with a message is a real controller error to flash verbatim.
+    """
+    try:
+        return await grpc(awaitable), None
+    except RuntimeError as exc:
+        return None, str(exc)
 
 
 async def parse_form(request: Request) -> dict[str, str]:
@@ -79,12 +131,18 @@ def client_of(request: Request) -> ControllerClient:
     return cast(ControllerClient, request.app.state.client)
 
 
-def render(request: Request, name: str, context: dict[str, object]) -> HTMLResponse:
-    """Render a page template, consuming any pending flash (FR-01.11)."""
+def render(
+    request: Request, name: str, context: dict[str, object], error: str | None = None
+) -> HTMLResponse:
+    """Render a page template, consuming any pending flash (FR-01.11).
+
+    `error` is a distinct controller-error banner (IMP-04.15), separate from
+    the "controller unreachable" degradation.
+    """
     templates = cast(Jinja2Templates, request.app.state.templates)
     flash_text = get_flash(request)
     response = templates.TemplateResponse(
-        request, name, {**context, "flash": flash_text}
+        request, name, {**context, "flash": flash_text, "error": error}
     )
     if flash_text is not None:
         clear_flash(response)
@@ -115,9 +173,15 @@ async def start_background_job(
     by a task held in `app.state.background_tasks` (discarded via a
     done-callback) so the job outlives the HTTP request. `KeyError`,
     `JobInProgress` and controller failures from the first event propagate to
-    the caller for route-specific flash handling.
+    the caller for route-specific flash handling; on a first-event deadline
+    the generator is `aclose()`d (IMP-04.15).
     """
-    first = await asyncio.wait_for(anext(agen), timeout=GRPC_TIMEOUT)
+    try:
+        first = await asyncio.wait_for(anext(agen), timeout=GRPC_TIMEOUT)
+    except asyncio.TimeoutError:
+        with suppress(Exception):
+            await aclose(agen)
+        raise
     job_id = first.job_id
 
     async def drain() -> None:
@@ -132,11 +196,6 @@ async def start_background_job(
     tasks.add(task)
     task.add_done_callback(tasks.discard)
 
-    if job_id:
-        known = cast(dict[str, tuple[str, str]], request.app.state.known_jobs)
-        if len(known) >= 100:
-            known.clear()
-        known[job_id] = (kind, alias)
     return job_id
 
 
@@ -169,8 +228,8 @@ def fmt_uptime(seconds: float | None) -> str:
     return f"{secs}s"
 
 
-def fmt_mib(value: int) -> str:
-    """MiB with thousands separators."""
+def fmt_thousands(value: int) -> str:
+    """Thousands separators only — use `_fmt_size` for byte counts (IMP-04.30)."""
     return f"{value:,}"
 
 

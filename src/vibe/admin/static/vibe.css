@@ -55,6 +55,7 @@ th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid var
 th { color: var(--muted); font-weight: 600; }
 
 .badge { display: inline-block; padding: 0.05em 0.5em; border-radius: 999px; font-size: 0.82rem; background: var(--line); }
+.badge-unknown { background: var(--line); color: var(--muted); }
 .badge-ready, .badge-available { background: var(--ok-bg); color: var(--ok); }
 .badge-loading, .badge-unloading { background: var(--warn-bg); color: var(--warn); }
 .badge-error { background: var(--err-bg); color: var(--err); }
@@ -91,6 +92,7 @@ button:hover { filter: brightness(1.08); }
 .inline { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.6rem 0; }
 
 .dim { color: var(--muted); }
+.warn { color: var(--warn); }
 .error { color: var(--err); }
 
 footer { max-width: 72rem; margin: 1.5rem auto 0; padding-top: 0.6rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.85rem; }

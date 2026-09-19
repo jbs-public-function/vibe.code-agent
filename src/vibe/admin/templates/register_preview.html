@@ -4,28 +4,31 @@
 <h1>Register model</h1>
 
 {% if errors %}
-<div class="flash">
+<div class="flash" role="alert">
   {% for error in errors %}<p>{{ error }}</p>{% endfor %}
 </div>
+<form method="post" action="{{ path_for('developer_reload') }}" class="inline">
+  <button type="submit">Reload registry</button>
+</form>
 {% endif %}
-{% for warning in warnings %}<p class="dim">warning: {{ warning }}</p>{% endfor %}
+{% for warning in warnings %}<p class="warn">warning: {{ warning }}</p>{% endfor %}
 
 {% if preview %}
 <section class="card">
   <h2>Proposed models.yaml entry</h2>
   <pre class="logs">{{ preview }}</pre>
-  <form method="post" action="{{ url_for('developer_register_confirm') }}" class="inline">
-    {% for name, value in form.items() %}
+  <form method="post" action="{{ path_for('developer_register_confirm') }}" class="inline">
+    {% for name, value in confirm.items() %}
     <input type="hidden" name="{{ name }}" value="{{ value }}">
     {% endfor %}
     <button type="submit">Confirm and reload registry</button>
   </form>
-  <p class="dim">The controller validates and writes the final entry; this snippet is illustrative.</p>
+  <p class="dim">This is the exact entry the controller will write.</p>
 </section>
 {% else %}
 <section class="card">
   <h2>New models.yaml entry</h2>
-  <form method="post" action="{{ url_for('developer_register') }}">
+  <form method="post" action="{{ path_for('developer_register') }}">
     <div class="inline">
       <label for="repo">HF repo</label>
       <input name="repo" id="repo" value="{{ form.get('repo', '') }}" required>
@@ -35,13 +38,13 @@
     <div class="inline">
       <label for="quantization">Quantization</label>
       <select name="quantization" id="quantization">
-        {% for option in ["auto", "awq", "gptq", "none"] %}
+        {% for option in quantization_options %}
         <option value="{{ option }}" {% if form.get('quantization') == option %}selected{% endif %}>{{ option }}</option>
         {% endfor %}
       </select>
       <label for="tool_parser">Tool parser</label>
       <select name="tool_parser" id="tool_parser">
-        {% for option in ["auto", "hermes", "llama3_json"] %}
+        {% for option in tool_parser_options %}
         <option value="{{ option }}" {% if form.get('tool_parser') == option %}selected{% endif %}>{{ option }}</option>
         {% endfor %}
       </select>

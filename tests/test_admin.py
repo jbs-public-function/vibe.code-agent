@@ -10,20 +10,37 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import AsyncIterator, Sequence
+from http.cookies import SimpleCookie
 from typing import Any, cast, override
+from urllib.parse import unquote
 
 import httpx
 import pytest
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
 
 from vibe.admin.app import build_app
+from vibe.admin.flash import FLASH_MAX_CHARS, get_flash, set_flash
+from vibe.admin.routes.chat import truncate_history
+from vibe.admin.sessions import (
+    MAX_SESSIONS,
+    MAX_TURNS,
+    SESSION_TTL_SECONDS,
+    ChatSession,
+    SessionStore,
+)
 from vibe.client import ControllerClient, ControllerUnavailable
 from vibe.config import Settings
 from vibe.gen.vibe.v1 import control_pb2
 from vibe.jobs import JobInProgress
 
-CSP = "default-src 'self'; script-src 'none'; style-src 'self'"
+CSP = (
+    "default-src 'self'; script-src 'none'; style-src 'self'; "
+    "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+)
 
 
 # -- shared helpers ----------------------------------------------------------
@@ -118,7 +135,8 @@ class FakeControllerClient(ControllerClient):
     Subclasses the real client so tests can pass it where `ControllerClient`
     is annotated, but never issues a real RPC. `*_error` attributes raise from
     the matching method (from inside async generators, like the real client);
-    `load_script`/`unload_script` mix `JobEvent`s with floats (sleep seconds).
+    `load_script`/`unload_script`/`chat_script`/`log_script` mix events with
+    floats (sleep seconds).
     """
 
     def __init__(self) -> None:
@@ -130,10 +148,13 @@ class FakeControllerClient(ControllerClient):
         self.gpu_value: control_pb2.GpuStats = control_pb2.GpuStats()
         self.gpu_error: Exception | None = None
         self.log_lines: list[control_pb2.LogLine] = []
+        self.log_script: list[control_pb2.LogLine | float] = []
         self.logs_calls: list[tuple[int | None, bool]] = []
         self.logs_error: Exception | None = None
         self.job_events_map: dict[str, list[control_pb2.JobEvent]] = {}
         self.job_events_error: Exception | None = None
+        self.jobs_map: dict[str, control_pb2.Job] = {}
+        self.get_job_error: Exception | None = None
         self.load_script: list[control_pb2.JobEvent | float] = []
         self.load_error: Exception | None = None
         self.load_calls: list[tuple[str, bool]] = []
@@ -142,6 +163,7 @@ class FakeControllerClient(ControllerClient):
         self.unload_error: Exception | None = None
         self.unload_consumed: list[control_pb2.JobEvent] = []
         self.chat_chunks: list[control_pb2.ChatChunk] = []
+        self.chat_script: list[control_pb2.ChatChunk | float] = []
         self.chat_error: Exception | None = None
         self.chat_calls: list[dict[str, Any]] = []
         self.download_infos: list[control_pb2.DownloadInfo] = []
@@ -221,8 +243,10 @@ class FakeControllerClient(ControllerClient):
             self.unload_consumed.append(event)
             yield event
 
-    # Added by the Phase 3 controller work with exactly this signature.
-    async def job_events(self, job_id: str) -> AsyncIterator[control_pb2.JobEvent]:
+    @override
+    async def job_events(
+        self, job_id: str, *, follow: bool = False
+    ) -> AsyncIterator[control_pb2.JobEvent]:
         if self.job_events_error is not None:
             raise self.job_events_error
         if job_id not in self.job_events_map:
@@ -231,12 +255,27 @@ class FakeControllerClient(ControllerClient):
             yield event
 
     @override
+    async def get_job(self, job_id: str) -> control_pb2.Job:
+        if self.get_job_error is not None:
+            raise self.get_job_error
+        if job_id not in self.jobs_map:
+            raise KeyError(job_id)
+        return self.jobs_map[job_id]
+
+    @override
     async def logs(
         self, tail: int | None = None, follow: bool = False
     ) -> AsyncIterator[control_pb2.LogLine]:
         self.logs_calls.append((tail, follow))
         if self.logs_error is not None:
             raise self.logs_error
+        if self.log_script:
+            for item in self.log_script:
+                if isinstance(item, float):
+                    await asyncio.sleep(item)
+                    continue
+                yield cast(control_pb2.LogLine, item)
+            return
         for line in self.log_lines:
             yield line
 
@@ -256,14 +295,16 @@ class FakeControllerClient(ControllerClient):
                 "max_tokens": max_tokens,
             }
         )
+        script = self.chat_script if self.chat_script else self.chat_chunks
+        for item in script:
+            if isinstance(item, float):
+                await asyncio.sleep(item)
+                continue
+            yield cast(control_pb2.ChatChunk, item)
         if self.chat_error is not None:
             # Simulates the controller dying mid-stream: chunks already
             # yielded reach the page, then the stream errors out.
-            for chunk in self.chat_chunks:
-                yield chunk
             raise self.chat_error
-        for chunk in self.chat_chunks:
-            yield chunk
 
     @override
     async def close(self) -> None:
@@ -364,15 +405,41 @@ def populated_fake() -> FakeControllerClient:
         control_pb2.LogLine(ts_unix_ms=now_ms, line="INFO: server started"),
         control_pb2.LogLine(ts_unix_ms=now_ms, line="ERROR: CUDA out of memory"),
     ]
+    fake.download_infos = [make_download_info("dl-1", "org/repo-a")]
+    fake.cache_value = control_pb2.ListCacheResponse(
+        entries=[
+            control_pb2.CacheEntry(
+                repo_id="org/repo-a",
+                size_bytes=2 * 1024**3,
+                last_modified="2026-09-15",
+            )
+        ],
+        disk_total_bytes=100 * 1024**3,
+        disk_free_bytes=40 * 1024**3,
+    )
     return fake
 
 
-def make_app(fake: FakeControllerClient) -> Any:
-    return build_app(Settings(vllm_image_tag="v0.11.2"), fake)
+def make_app(fake: FakeControllerClient, *, gateway_status: int = 200) -> Any:
+    """Compose the app with a mocked gateway probe (IMP-04.24).
+
+    `vibe_bind="test"` puts the `Host: test` used by the httpx clients into
+    the middleware's allow-list; the `MockTransport` stops the dashboard probe
+    from dialing the real gateway.
+    """
+    app = build_app(Settings(vllm_image_tag="v0.11.2", vibe_bind="test"), fake)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(gateway_status, text="ok")
+
+    app.state.gateway_transport = httpx.MockTransport(handler)
+    return app
 
 
-def make_transport(fake: FakeControllerClient) -> httpx.ASGITransport:
-    return httpx.ASGITransport(app=make_app(fake))
+def make_transport(
+    fake: FakeControllerClient, *, gateway_status: int = 200
+) -> httpx.ASGITransport:
+    return httpx.ASGITransport(app=make_app(fake, gateway_status=gateway_status))
 
 
 async def drive(
@@ -395,6 +462,9 @@ async def drive(
         if not sent:
             sent = True
             return {"type": "http.request", "body": body, "more_body": False}
+        # A real client keeps the connection open while reading the streamed
+        # response; StreamingResponse cancels this wait when the stream ends.
+        await asyncio.sleep(3600)
         return {"type": "http.disconnect"}
 
     async def send(message: dict[str, Any]) -> None:
@@ -420,6 +490,13 @@ async def drive(
     return start["status"], start["headers"], chunks
 
 
+def extract_hidden(text: str) -> dict[str, str]:
+    """The hidden form fields of a rendered register preview."""
+    return dict(
+        re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', text)
+    )
+
+
 # -- pages: script-free + security headers (NFR-01.1) ------------------------
 
 
@@ -432,6 +509,9 @@ ADMIN_PAGES = [
     "/chat",
     "/logs",
     "/developer",
+    "/developer/register",
+    "/developer/downloads/dl-1",
+    "/developer/cache/org/repo-a/confirm",
 ]
 
 
@@ -442,6 +522,9 @@ async def test_pages_are_script_free_and_carry_security_headers(path: str) -> No
         response = await client.get(path)
     assert response.status_code == 200
     assert "<script" not in response.text
+    assert "style=" not in response.text
+    # IMP-04.26: every link is root-relative (the gateway URL lives in <code>).
+    assert 'href="http' not in response.text
     assert response.headers["content-security-policy"] == CSP
     assert response.headers["x-content-type-options"] == "nosniff"
 
@@ -473,8 +556,101 @@ async def test_dashboard_shows_status_gpu_and_job() -> None:
     assert "python" in text
     assert "bar-45" in text  # 12000/24576 = 48.8% → 45% step class
     assert '<meta http-equiv="refresh" content="5">' in text
-    assert 'href="http://test/jobs/j-ok"' in text
+    assert 'href="/jobs/j-ok"' in text
     assert "http://localhost:8080/v1" in text
+    assert 'aria-label="memory"' in text
+
+
+async def test_gateway_probe_uses_injected_transport() -> None:
+    up = make_transport(populated_fake(), gateway_status=200)
+    async with httpx.AsyncClient(transport=up, base_url="http://test") as client:
+        ok = await client.get("/")
+    assert "Gateway</dt><dd>ok" in ok.text
+
+    down = make_transport(populated_fake(), gateway_status=503)
+    async with httpx.AsyncClient(transport=down, base_url="http://test") as client:
+        not_ok = await client.get("/")
+    assert "Gateway</dt><dd>down" in not_ok.text
+
+
+async def test_gateway_probe_transport_error_counts_as_down() -> None:
+    app = make_app(populated_fake())
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    app.state.gateway_transport = httpx.MockTransport(boom)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/")
+    assert response.status_code == 200
+    assert "Gateway</dt><dd>down" in response.text
+
+
+# -- security middleware (IMP-04.1, IMP-04.28) --------------------------------
+
+
+async def test_cross_origin_post_rejected_same_origin_passes() -> None:
+    fake = FakeControllerClient()
+    fake.unload_script = [make_event("j-u", state=control_pb2.AVAILABLE, terminal=True)]
+    app = make_app(fake)
+    # A page served from elsewhere POSTing at the admin: rejected.
+    status, _, _ = await drive(
+        app, "POST", "/models/unload",
+        headers={"origin": "http://evil.example", "host": "test"},
+    )
+    assert status == 403
+    # The same POST from the admin's own origin passes.
+    status, _, _ = await drive(
+        app, "POST", "/models/unload",
+        headers={"origin": "http://test", "host": "test"},
+    )
+    assert status == 303
+    # Sec-Fetch-Site: cross-site rejected; none and same-origin allowed.
+    status, _, _ = await drive(
+        app, "POST", "/models/unload",
+        headers={"sec-fetch-site": "cross-site", "host": "test"},
+    )
+    assert status == 403
+    status, _, _ = await drive(
+        app, "POST", "/models/unload",
+        headers={"sec-fetch-site": "none", "host": "test"},
+    )
+    assert status == 303
+    # No Origin and no Sec-Fetch-Site (curl): allowed by design.
+    status, _, _ = await drive(
+        app, "POST", "/models/unload", headers={"host": "test"}
+    )
+    assert status == 303
+    # Referer fallback: foreign host rejected, same host passes.
+    status, _, _ = await drive(
+        app, "POST", "/models/unload",
+        headers={"referer": "http://evil.example/x", "host": "test"},
+    )
+    assert status == 403
+    status, _, _ = await drive(
+        app, "POST", "/models/unload",
+        headers={"referer": "http://test/x", "host": "test"},
+    )
+    assert status == 303
+
+
+async def test_host_outside_allow_list_rejected() -> None:
+    app = make_app(populated_fake())
+    status, _, _ = await drive(app, "GET", "/", headers={"host": "evil.example"})
+    assert status == 403
+    status, _, _ = await drive(app, "GET", "/", headers={"host": "127.0.0.1:8081"})
+    assert status == 200
+    status, _, _ = await drive(app, "GET", "/", headers={"host": "[::1]:8081"})
+    assert status == 200
+
+
+async def test_head_request_supported() -> None:
+    transport = make_transport(populated_fake())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.head("/")
+    assert response.status_code == 200
+    assert response.content == b""
 
 
 # -- models load/unload (FR-01.3) ---------------------------------------------
@@ -619,6 +795,58 @@ async def test_job_page_unknown_job_is_not_found() -> None:
     assert 'http-equiv="refresh"' not in response.text
 
 
+async def test_job_page_shows_kind_alias_from_events_or_get_job() -> None:
+    """A CLI-started job carries kind/alias on its events (IMP-04.13)."""
+    fake = FakeControllerClient()
+    now_ms = int(time.time() * 1000)
+    fake.job_events_map["cli-1"] = [
+        control_pb2.JobEvent(
+            job_id="cli-1",
+            ts_unix_ms=now_ms,
+            level="INFO",
+            message="downloading",
+            kind=control_pb2.DOWNLOAD,
+            alias="org/repo",
+        ),
+    ]
+    # Fallback: events without kind/alias → GetJob fills them in (IMP-01.2).
+    fake.job_events_map["cli-2"] = [make_event("cli-2", message="loading")]
+    fake.jobs_map["cli-2"] = control_pb2.Job(
+        id="cli-2",
+        kind=control_pb2.LOAD,
+        alias="llama-3.1-8b",
+        started_at_unix=int(time.time()) - 10,
+    )
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        from_events = await client.get("/jobs/cli-1")
+        assert "DOWNLOAD" in from_events.text
+        assert "org/repo" in from_events.text
+        from_job = await client.get("/jobs/cli-2")
+        assert "LOAD" in from_job.text
+        assert "llama-3.1-8b" in from_job.text
+
+
+async def test_job_page_refreshes_while_controller_down_and_notes_unknown() -> None:
+    fake = FakeControllerClient()
+    fake.status_error = ControllerUnavailable("down")
+    fake.job_events_map["j-1"] = [make_event("j-1", message="pulling")]
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        down = await client.get("/jobs/j-1")
+        # IMP-04.14: the controller may come back — keep refreshing.
+        assert '<meta http-equiv="refresh" content="2">' in down.text
+
+    # Non-terminal job that is no longer current, controller up: unknown.
+    fake.status_error = None
+    fake.status_value = control_pb2.Status(state=control_pb2.AVAILABLE)
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        orphaned = await client.get("/jobs/j-1")
+    assert "outcome is unknown" in orphaned.text
+    assert '<meta http-equiv="refresh" content="2">' not in orphaned.text
+
+
 # -- chat (FR-01.5/01.6, NFR-01.6) --------------------------------------------
 
 
@@ -645,6 +873,7 @@ async def test_chat_stream_escapes_and_flushes_header_first() -> None:
     assert header_dict[b"content-type"].startswith(b"text/html")
     assert header_dict[b"cache-control"] == b"no-store"
     assert header_dict[b"content-security-policy"] == CSP.encode()
+    assert "samesite=lax" in header_dict[b"set-cookie"].decode().lower()
     body = b"".join(chunks)
     # Escaped form present, raw payload never appears.
     assert b"&lt;script&gt;alert(1)&lt;/script&gt;" in body
@@ -688,6 +917,39 @@ async def test_chat_stream_appends_error_block_when_controller_dies_midstream() 
     assert b"</pre>" in body
 
 
+async def test_chat_runtime_error_midstream_renders_message() -> None:
+    """IMP-04.5: a real upstream error surfaces with its message."""
+    fake = FakeControllerClient()
+    fake.status_value = control_pb2.Status(
+        active_alias="llama-3.1-8b", state=control_pb2.READY
+    )
+    fake.chat_chunks = [control_pb2.ChatChunk(delta="partial")]
+    fake.chat_error = RuntimeError("vLLM 400: context too long")
+    app = make_app(fake)
+    status, _, chunks = await drive(app, "POST", "/chat", body=b"message=hi")
+    assert status == 200
+    body = b"".join(chunks)
+    assert b"partial" in body
+    assert b"vLLM 400: context too long" in body
+    assert b"controller unreachable" not in body
+
+
+async def test_chat_first_token_after_slow_prefill_still_streams() -> None:
+    """IMP-04.4: a >3 s prefill streams with keep-alive padding, not an error."""
+    fake = FakeControllerClient()
+    fake.status_value = control_pb2.Status(
+        active_alias="llama-3.1-8b", state=control_pb2.READY
+    )
+    fake.chat_script = [5.2, control_pb2.ChatChunk(delta="late reply")]
+    app = make_app(fake)
+    status, _, chunks = await drive(app, "POST", "/chat", body=b"message=hi")
+    assert status == 200
+    body = b"".join(chunks)
+    assert b"late reply" in body
+    assert b"controller unreachable" not in body
+    assert b"<!-- keep-alive -->" in body
+
+
 async def test_chat_page_shows_no_model_loaded_when_not_ready() -> None:
     fake = FakeControllerClient()
     fake.status_value = control_pb2.Status(active_alias="", state=control_pb2.AVAILABLE)
@@ -696,7 +958,22 @@ async def test_chat_page_shows_no_model_loaded_when_not_ready() -> None:
         response = await client.get("/chat")
     assert response.status_code == 200
     assert "no model loaded" in response.text.lower()
-    assert 'href="http://test/models"' in response.text
+    assert 'href="/models"' in response.text
+
+
+async def test_chat_not_ready_does_not_persist_user_turn() -> None:
+    """IMP-04.6: a failed send must not leave a dangling user turn."""
+    fake = FakeControllerClient()
+    fake.status_value = control_pb2.Status(active_alias="", state=control_pb2.AVAILABLE)
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/chat", data={"message": "hi"}, follow_redirects=False
+        )
+        assert response.status_code == 303
+        reloaded = await client.get("/chat")
+    assert "No messages yet" in reloaded.text
+    assert '<div class="role">user' not in reloaded.text
 
 
 async def test_chat_reset_clears_the_conversation() -> None:
@@ -713,6 +990,52 @@ async def test_chat_reset_clears_the_conversation() -> None:
         assert response.headers["location"] == "/chat"
         reloaded = await client.get("/chat")
     assert "No messages yet" in reloaded.text
+
+
+async def test_chat_clamps_temperature_and_max_tokens() -> None:
+    """IMP-04.10: out-of-range values are clamped server-side."""
+    fake = FakeControllerClient()
+    fake.status_value = control_pb2.Status(
+        active_alias="llama-3.1-8b", state=control_pb2.READY
+    )
+    fake.infos = [make_info("llama-3.1-8b", max_len=2048)]
+    fake.chat_chunks = [control_pb2.ChatChunk(delta="ok")]
+    app = make_app(fake)
+    status, _, _ = await drive(
+        app, "POST", "/chat", body=b"message=hi&temperature=9&max_tokens=999999"
+    )
+    assert status == 200
+    call = fake.chat_calls[0]
+    assert call["temperature"] == 2.0
+    assert call["max_tokens"] == 2048
+
+
+async def test_chat_truncation_drops_oldest_turns_and_notes_in_footer() -> None:
+    """IMP-04.7: history is truncated at 75 % and the footer says so."""
+    fake = FakeControllerClient()
+    fake.status_value = control_pb2.Status(
+        active_alias="llama-3.1-8b", state=control_pb2.READY
+    )
+    fake.infos = [make_info("llama-3.1-8b", max_len=400)]  # budget = 300 tokens
+    fake.chat_chunks = [control_pb2.ChatChunk(delta="ok")]
+    app = make_app(fake)
+    store = cast(SessionStore, app.state.sessions)
+    session = store.get_or_create(None)
+    for i in range(5):  # ~101 tokens each → 505 total, 3 must go
+        session.append(
+            {"role": "user" if i % 2 else "assistant", "content": f"turn {i} " + "z" * 400}
+        )
+    status, _, chunks = await drive(
+        app,
+        "POST",
+        "/chat",
+        body=b"message=hi",
+        headers={"cookie": f"vibe_session={session.session_id}"},
+    )
+    assert status == 200
+    body = b"".join(chunks)
+    assert b"older turns omitted" in body
+    assert b"turn 0" not in body  # oldest non-system turns were dropped
 
 
 # -- logs (FR-01.7) -----------------------------------------------------------
@@ -736,6 +1059,18 @@ async def test_logs_page_shows_lines_escaped_with_tail_selector() -> None:
     assert fake.logs_calls == [(100, False)]
 
 
+async def test_logs_page_invalid_tail_renders_html_error() -> None:
+    """IMP-04.12: ?tail=abc is an HTML error, not a FastAPI 422 JSON."""
+    transport = make_transport(populated_fake())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        page = await client.get("/logs", params={"tail": "abc"})
+        assert page.status_code == 400
+        assert "tail must be a number" in page.text
+        stream = await client.get("/logs/stream", params={"tail": "abc"})
+        assert stream.status_code == 400
+        assert "tail must be a number" in stream.text
+
+
 async def test_logs_stream_is_chunked_text_plain() -> None:
     fake = FakeControllerClient()
     fake.log_lines = [
@@ -743,10 +1078,45 @@ async def test_logs_stream_is_chunked_text_plain() -> None:
     ]
     transport = make_transport(fake)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/logs/stream")
+        response = await client.get(
+            "/logs/stream", params={"tail": "0", "follow": "1"}
+        )
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/plain")
     assert "streamed line" in response.text
+    assert fake.logs_calls == [(0, True)]
+
+
+async def test_logs_stream_defaults_to_replay_tail() -> None:
+    """IMP-04.11: the default first chunk is a 50-line replay."""
+    fake = FakeControllerClient()
+    fake.log_lines = [
+        control_pb2.LogLine(ts_unix_ms=int(time.time() * 1000), line="replayed line"),
+    ]
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/logs/stream")
+    assert response.status_code == 200
+    assert "replayed line" in response.text
+    assert fake.logs_calls == [(50, True)]
+
+
+async def test_logs_stream_quiet_container_stays_open() -> None:
+    """IMP-04.11: a >3 s quiet stream is not killed by a first-line deadline."""
+    fake = FakeControllerClient()
+    now_ms = int(time.time() * 1000)
+    fake.log_script = [
+        4.0,
+        control_pb2.LogLine(ts_unix_ms=now_ms, line="late line"),
+    ]
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/logs/stream", params={"tail": "0", "follow": "1"}
+        )
+    assert response.status_code == 200
+    assert "late line" in response.text
+    assert "controller unreachable" not in response.text
     assert fake.logs_calls == [(0, True)]
 
 
@@ -770,6 +1140,30 @@ async def test_flash_rendered_once_then_cleared() -> None:
         assert "unknown alias: nope" not in second.text
 
 
+def test_flash_roundtrip_special_chars_and_truncation() -> None:
+    message = 'quote"s;semicolons ✓ unicode'
+    response = StarletteResponse()
+    set_flash(response, message)
+    assert "samesite=lax" in response.headers["set-cookie"].lower()
+    jar = SimpleCookie()
+    jar.load(response.headers["set-cookie"])
+    raw = jar["vibe_flash"].value
+    request = StarletteRequest(
+        {"type": "http", "headers": [(b"cookie", f"vibe_flash={raw}".encode())]}
+    )
+    assert get_flash(request) == message
+
+    # A >4 KiB message is truncated so the cookie always fits (IMP-04.3).
+    big = "✓" * 5000
+    response2 = StarletteResponse()
+    set_flash(response2, big)
+    jar2 = SimpleCookie()
+    jar2.load(response2.headers["set-cookie"])
+    raw2 = jar2["vibe_flash"].value
+    assert len(raw2) <= 3500
+    assert len(unquote(raw2)) <= FLASH_MAX_CHARS
+
+
 # -- controller down (NFR-01.5) ------------------------------------------------
 
 
@@ -786,6 +1180,52 @@ async def test_controller_down_renders_banner_not_500() -> None:
             response = await client.get(path)
             assert response.status_code == 200
             assert "controller unreachable" in response.text.lower()
+
+
+async def test_controller_runtime_error_shows_message_banner() -> None:
+    """IMP-04.15: a real controller error gets its message, not a 500."""
+    fake = FakeControllerClient()
+    fake.status_error = RuntimeError("registry failed to load models.yaml")
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/")
+    assert response.status_code == 200
+    assert "registry failed to load models.yaml" in response.text
+    assert "Controller error" in response.text
+
+
+CONTROLLER_DOWN_POSTS = [
+    ("/models/load", {"alias": "llama-3.1-8b"}),
+    ("/models/unload", {}),
+    ("/chat", {"message": "hi"}),
+    ("/developer/downloads", {"repo": "org/repo"}),
+    ("/developer/register", {"repo": "org/repo", "alias": "x"}),
+    ("/developer/register/confirm", {"repo": "org/repo", "alias": "x"}),
+    ("/developer/downloads/dl-1/cancel", {}),
+    ("/developer/cache/org/repo/remove", {}),
+]
+
+
+@pytest.mark.parametrize("path,data", CONTROLLER_DOWN_POSTS)
+async def test_controller_down_on_every_post_route_flashes(
+    path: str, data: dict[str, str]
+) -> None:
+    fake = FakeControllerClient()
+    fake.status_error = ControllerUnavailable("down")
+    fake.load_error = ControllerUnavailable("down")
+    fake.unload_error = ControllerUnavailable("down")
+    fake.download_error = ControllerUnavailable("down")
+    fake.cancel_error = ControllerUnavailable("down")
+    fake.remove_error = ControllerUnavailable("down")
+    fake.propose_error = ControllerUnavailable("down")
+    fake.write_error = ControllerUnavailable("down")
+    fake.reload_error = ControllerUnavailable("down")
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(path, data=data, follow_redirects=False)
+        assert response.status_code == 303
+        followed = await client.get(response.headers["location"])
+    assert "controller unreachable" in followed.text.lower()
 
 
 # -- health (FR-01.9) ----------------------------------------------------------
@@ -840,6 +1280,7 @@ async def test_developer_page_shows_downloads_cache_disk_and_zed(monkeypatch) ->
     assert "512.0 GiB total / 100.0 GiB free" in text
     assert "qwen2.5-coder-7b" in text
     assert "vibe-local" in text
+    assert "Reload registry" in text
     assert "<script" not in text
 
 
@@ -889,7 +1330,7 @@ async def test_download_page_refreshes_until_done_then_cancel() -> None:
         running = await client.get("/developer/downloads/dl-1")
         assert '<meta http-equiv="refresh" content="2">' in running.text
         assert "bar-45" in running.text
-        assert "450 / 1,000" in running.text
+        assert "450 B / 1000 B" in running.text
         # Once done the refresh stops and the success block shows.
         fake.download_infos = [
             make_download_info(
@@ -928,6 +1369,20 @@ async def test_download_page_unknown_id_is_not_found() -> None:
     assert 'http-equiv="refresh"' not in response.text
 
 
+async def test_download_cancel_unknown_id_flashes() -> None:
+    """IMP-04.21: cancelling an unknown download flashes instead of 500ing."""
+    fake = FakeControllerClient()
+    fake.cancel_error = KeyError("nope")
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/developer/downloads/dl-9/cancel", follow_redirects=False
+        )
+        assert response.status_code == 303
+        followed = await client.get(response.headers["location"])
+    assert "unknown download" in followed.text
+
+
 async def test_cache_confirm_and_remove() -> None:
     fake = FakeControllerClient()
     fake.cache_value = control_pb2.ListCacheResponse(
@@ -953,6 +1408,23 @@ async def test_cache_confirm_and_remove() -> None:
     assert "removed org/repo-a from the HF cache" in followed.text
 
 
+async def test_cache_remove_unknown_repo_flashes() -> None:
+    """IMP-04.21: removing an unknown repo flashes instead of 500ing."""
+    fake = FakeControllerClient()
+    fake.remove_error = KeyError("nope")
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/developer/cache/org/nope/remove", follow_redirects=False
+        )
+        assert response.status_code == 303
+        followed = await client.get("/developer")
+    assert "unknown repo" in followed.text
+
+
+# -- registration (FR-04.7d) --------------------------------------------------
+
+
 async def test_register_flow_preview_then_confirm() -> None:
     fake = FakeControllerClient()
     fake.propose_response = control_pb2.ProposeRegistrationResponse(
@@ -968,6 +1440,16 @@ async def test_register_flow_preview_then_confirm() -> None:
             tags=["code", "tools"],
             state=control_pb2.AVAILABLE,
             cached_locally=True,
+            yaml_preview=(
+                "models:\n"
+                "- alias: qwen2.5-coder-1.5b\n"
+                "  display_name: Qwen2.5 Coder 1.5B\n"
+                "  hf_repo: Qwen/Qwen2.5-Coder-1.5B-Instruct\n"
+                "  container_name: vibe-qwen2.5-coder-1.5b\n"
+                "  extra_args:\n"
+                "  - --enable-auto-tool-choice\n"
+                "  - --tool-call-parser hermes\n"
+            ),
         ),
         warnings=["vram estimate: 9.4 GiB"],
     )
@@ -991,14 +1473,21 @@ async def test_register_flow_preview_then_confirm() -> None:
         assert "--tool-call-parser" in preview.text
         assert "warning: vram estimate: 9.4 GiB" in preview.text
         assert "Confirm and reload registry" in preview.text
+        # The confirm round-trips the controller-filled hidden values, as the
+        # browser does (IMP-04.22).
+        hidden = extract_hidden(preview.text)
+        assert hidden["port"] == "8011"
         confirm = await client.post(
-            "/developer/register/confirm", data=form_data, follow_redirects=False
+            "/developer/register/confirm", data=hidden, follow_redirects=False
         )
         assert confirm.status_code == 303
         assert confirm.headers["location"] == "/models"
         followed = await client.get("/models")
     assert "alias qwen2.5-coder-1.5b added" in followed.text
-    assert [spec.alias for spec in fake.propose_calls] == ["qwen2.5-coder-1.5b"]
+    assert [spec.alias for spec in fake.propose_calls] == [
+        "qwen2.5-coder-1.5b",
+        "qwen2.5-coder-1.5b",
+    ]
     assert [spec.alias for spec in fake.write_calls] == ["qwen2.5-coder-1.5b"]
     assert fake.write_calls[0].tool_parser == "hermes"
     assert list(fake.write_calls[0].tags) == ["code", "tools"]
@@ -1021,6 +1510,136 @@ async def test_register_propose_errors_rerender_form() -> None:
     assert "Confirm and reload registry" not in response.text
     assert fake.write_calls == []
     assert fake.reload_calls == 0
+
+
+async def test_register_form_parse_errors_rerender_form() -> None:
+    """IMP-04.18: "80a0"/"0.7x" re-render with messages instead of coercing."""
+    fake = FakeControllerClient()
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/developer/register",
+            data={
+                "repo": "org/repo",
+                "alias": "x",
+                "max_model_len": "80a0",
+                "gpu_mem": "0.7x",
+            },
+        )
+    assert response.status_code == 200
+    assert "max model len must be a whole number" in response.text
+    assert "GPU mem fraction must be a number" in response.text
+    assert 'name="alias"' in response.text  # the form re-renders
+    assert "Confirm and reload registry" not in response.text
+    assert fake.propose_calls == []
+    assert fake.write_calls == []
+
+
+async def test_register_form_prefills_repo_and_suggests_alias() -> None:
+    transport = make_transport(populated_fake())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/developer/register", params={"repo": "org/my-model"}
+        )
+    assert response.status_code == 200
+    assert 'value="org/my-model"' in response.text
+    assert 'value="my-model"' in response.text
+
+
+async def test_register_confirm_detects_drift_from_preview() -> None:
+    """IMP-04.22: alias/port cannot drift between preview and write."""
+    fake = FakeControllerClient()
+    fake.propose_response = control_pb2.ProposeRegistrationResponse(
+        model=control_pb2.ModelInfo(
+            alias="qwen",
+            hf_repo="org/repo",
+            quantization="none",
+            max_model_len=32768,
+            gpu_memory_utilization=0.6,
+            host_port=8011,
+        ),
+    )
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        preview = await client.post(
+            "/developer/register",
+            data={"repo": "org/repo", "alias": "qwen", "quantization": "none"},
+        )
+        hidden = extract_hidden(preview.text)
+        # The controller now proposes a different port — confirm must refuse.
+        fake.propose_response = control_pb2.ProposeRegistrationResponse(
+            model=control_pb2.ModelInfo(
+                alias="qwen",
+                hf_repo="org/repo",
+                quantization="none",
+                max_model_len=32768,
+                gpu_memory_utilization=0.6,
+                host_port=8022,
+            ),
+        )
+        confirm = await client.post("/developer/register/confirm", data=hidden)
+    assert confirm.status_code == 200
+    assert "changed since the preview" in confirm.text
+    assert "8022" in confirm.text
+    assert fake.write_calls == []
+
+
+async def test_register_confirm_write_failure_rerenders_with_reload() -> None:
+    fake = FakeControllerClient()
+    fake.propose_response = control_pb2.ProposeRegistrationResponse(
+        model=control_pb2.ModelInfo(alias="x", hf_repo="org/repo", quantization="none"),
+    )
+    fake.write_response = control_pb2.WriteRegistrationResponse(
+        ok=False, errors=["host_port 8020 already in use"]
+    )
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/developer/register/confirm",
+            data={"repo": "org/repo", "alias": "x", "quantization": "none"},
+        )
+    assert response.status_code == 200
+    assert "host_port 8020 already in use" in response.text
+    assert "Reload registry" in response.text
+    assert fake.reload_calls == 0
+
+
+async def test_register_confirm_reload_failure_shows_reload_button() -> None:
+    """IMP-04.17: write-succeeds-then-reload-fails offers the recovery button."""
+    fake = FakeControllerClient()
+    fake.propose_response = control_pb2.ProposeRegistrationResponse(
+        model=control_pb2.ModelInfo(alias="x", hf_repo="org/repo", quantization="none"),
+    )
+    fake.reload_errors = ["invalid yaml: duplicate alias"]
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/developer/register/confirm",
+            data={"repo": "org/repo", "alias": "x", "quantization": "none"},
+        )
+        assert response.status_code == 200
+        assert "invalid yaml: duplicate alias" in response.text
+        assert "Reload registry" in response.text
+        assert fake.reload_calls == 1
+        # The standalone button recovers on retry.
+        fake.reload_errors = []
+        retry = await client.post("/developer/reload", follow_redirects=False)
+        assert retry.status_code == 303
+        followed = await client.get("/developer")
+    assert "registry reloaded" in followed.text
+    assert fake.reload_calls == 2
+
+
+async def test_reload_registry_button_flashes_outcome() -> None:
+    fake = FakeControllerClient()
+    transport = make_transport(fake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/developer/reload", follow_redirects=False)
+        assert response.status_code == 303
+        assert response.headers["location"] == "/developer"
+        followed = await client.get("/developer")
+    assert "registry reloaded" in followed.text
+    assert fake.reload_calls == 1
 
 
 async def test_models_page_download_button_only_for_uncached() -> None:
@@ -1057,6 +1676,7 @@ async def test_models_page_download_button_only_for_uncached() -> None:
     assert 'name="repo" value="org/uncached"' in text
     assert 'name="repo" value="org/loading"' not in text
     assert 'name="repo" value="org/cached-one"' not in text
+    assert 'aria-label="Download uncached"' in text
 
 
 async def test_developer_controller_down_banner_not_500() -> None:
@@ -1071,3 +1691,70 @@ async def test_developer_controller_down_banner_not_500() -> None:
     assert response.status_code == 200
     assert "controller unreachable" in response.text.lower()
     assert "<script" not in response.text
+
+
+# -- session store (IMP-04.9) --------------------------------------------------
+
+
+def test_truncate_history_drops_oldest_turns_at_budget() -> None:
+    messages = [
+        {"role": "system", "content": "you are helpful"},
+        {"role": "user", "content": "a" * 400},  # ~100 tokens
+        {"role": "assistant", "content": "b" * 800},  # ~200 tokens
+        {"role": "user", "content": "c" * 400},  # ~100 tokens
+    ]
+    kept, dropped = truncate_history(messages, 300)
+    assert dropped == 2
+    assert [turn["role"] for turn in kept] == ["system", "user"]
+    assert kept[-1]["content"] == "c" * 400
+    # System turns are never dropped.
+    only_system = [{"role": "system", "content": "x" * 4000}]
+    kept, dropped = truncate_history(only_system, 100)
+    assert dropped == 0
+    assert kept == only_system
+
+
+def test_session_store_sweeps_by_last_seen_not_created_at() -> None:
+    store = SessionStore()
+    session = store.get_or_create(None)
+    # Created long ago but used recently: survives the sweep.
+    session.created_at = time.time() - 2 * SESSION_TTL_SECONDS
+    session.last_seen = time.time()
+    again = store.get_or_create(session.session_id)
+    assert again.session_id == session.session_id
+    # Idle past the TTL: swept on the next access.
+    session.last_seen = time.time() - SESSION_TTL_SECONDS - 1
+    fresh = store.get_or_create(session.session_id)
+    assert fresh.session_id != session.session_id
+
+
+def test_session_store_lru_cap_evicts_least_recently_used() -> None:
+    store = SessionStore()
+    ids = [store.get_or_create(None).session_id for _ in range(MAX_SESSIONS)]
+    # Touch the first session so it becomes most-recently-used.
+    assert store.get_or_create(ids[0]).session_id == ids[0]
+    store.get_or_create(None)  # one over the cap → evicts the LRU (ids[1])
+    assert len(store._sessions) == MAX_SESSIONS
+    assert ids[0] in store._sessions
+    assert ids[1] not in store._sessions
+
+
+def test_chat_session_turn_cap_drops_oldest_non_system() -> None:
+    now = time.time()
+    session = ChatSession("s", now, now)
+    for i in range(MAX_TURNS + 10):
+        session.append({"role": "user" if i % 2 else "assistant", "content": str(i)})
+    assert len(session.messages) == MAX_TURNS
+    assert session.messages[0]["content"] == "10"
+
+
+# -- lifespan ---------------------------------------------------------------
+
+
+async def test_lifespan_closes_http_client_and_controller() -> None:
+    fake = FakeControllerClient()
+    app = make_app(fake)
+    async with app.router.lifespan_context(app):
+        pass
+    assert app.state.http.is_closed
+    assert fake.closed

@@ -5,20 +5,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Chat · vibe</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='vibe.css') }}">
+  <link rel="stylesheet" href="{{ path_for('static', path='vibe.css') }}">
 </head>
 <body>
   <nav class="nav" aria-label="site">
     <span class="brand">vibe</span>
-    <a href="{{ url_for('dashboard') }}">Dashboard</a>
+    <a href="{{ path_for('dashboard') }}">Dashboard</a>
     <span aria-hidden="true">·</span>
-    <a href="{{ url_for('models') }}">Models</a>
+    <a href="{{ path_for('models') }}">Models</a>
     <span aria-hidden="true">·</span>
-    <a href="{{ url_for('chat') }}" class="active">Chat</a>
+    <a href="{{ path_for('chat') }}" class="active">Chat</a>
     <span aria-hidden="true">·</span>
-    <a href="{{ url_for('logs') }}">Logs</a>
+    <a href="{{ path_for('logs') }}">Logs</a>
     <span aria-hidden="true">·</span>
-    <a href="{{ url_for('developer') }}">Developer</a>
+    <a href="{{ path_for('developer') }}">Developer</a>
   </nav>
   <main>
     <h1>Chat</h1>
@@ -36,27 +36,28 @@
 {% if phase == "footer" %}</pre>
       </div>
     </section>
-    {% if error %}<div class="flash">{{ error }}</div>{% endif %}
+    {% if error %}<div class="flash" role="alert">{{ error }}</div>{% endif %}
+    {% if omitted %}<p class="warn">{{ omitted }} older turns omitted — the history exceeded the 75&nbsp;% context limit and was truncated server-side.</p>{% endif %}
     <section class="card">
       <h2>Send</h2>
-      <form method="post" action="{{ url_for('chat_send') }}">
+      <form method="post" action="{{ path_for('chat_send') }}">
         <label for="message">Message</label>
         <textarea id="message" name="message" rows="4" required autofocus></textarea>
         <div class="inline">
           <label for="temperature">temperature</label>
-          <input id="temperature" name="temperature" type="text" value="{{ temperature }}" size="4">
+          <input id="temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="{{ temperature }}">
           <label for="max_tokens">max_tokens</label>
-          <input id="max_tokens" name="max_tokens" type="text" value="{{ max_tokens }}" size="6">
+          <input id="max_tokens" name="max_tokens" type="number" min="1" step="1" {% if max_model_len %}max="{{ max_model_len }}"{% endif %} value="{{ max_tokens }}">
           <button type="submit">Send</button>
         </div>
       </form>
-      <form method="post" action="{{ url_for('chat_reset') }}" class="inline">
+      <form method="post" action="{{ path_for('chat_reset') }}" class="inline">
         <button type="submit">Reset conversation</button>
       </form>
     </section>
   </main>
   <footer>
-    <span>gateway <code>http://localhost:8080/v1</code></span>
+    <span>gateway <code>http://localhost:{{ gateway_port }}/v1</code></span>
     <span aria-hidden="true">·</span>
     <span>active <code>{{ active_alias or "none" }}</code></span>
   </footer>

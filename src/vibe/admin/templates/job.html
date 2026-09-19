@@ -7,7 +7,7 @@
 {% if not_found %}
 <h1>Job not found</h1>
 <p>No job with id <code>{{ job_id }}</code> on the controller — it may have been purged from its history.</p>
-<p><a href="{{ url_for('models') }}">Back to models</a> · <a href="{{ url_for('dashboard') }}">Dashboard</a></p>
+<p><a href="{{ path_for('models') }}">Back to models</a> · <a href="{{ path_for('dashboard') }}">Dashboard</a></p>
 {% else %}
 <h1>Job <code>{{ job_id }}</code></h1>
 <dl class="inline-dl">
@@ -17,9 +17,13 @@
   <dt>State</dt><dd><span class="badge badge-{{ latest_state|lower }}">{{ latest_state }}</span></dd>
 </dl>
 
+{% if outcome_unknown %}
+<div class="flash" role="status">This job is no longer running but never reached a final state — its outcome is unknown (the controller may have restarted).</div>
+{% endif %}
+
 {% if terminal %}
   {% if error_view %}
-<div class="flash">Job failed. Last container log lines:</div>
+<div class="flash" role="alert">Job failed. Last container log lines:</div>
 <pre class="logs">{{ log_lines|join("\n") }}</pre>
   {% else %}
 <p>Job finished successfully.</p>
@@ -38,6 +42,6 @@
   </li>
 {% endfor %}
 </ul>
-<p><a href="{{ url_for('models') }}">Back to models</a> · <a href="{{ url_for('dashboard') }}">Dashboard</a></p>
+<p><a href="{{ path_for('models') }}">Back to models</a> · <a href="{{ path_for('dashboard') }}">Dashboard</a></p>
 {% endif %}
 {% endblock content %}

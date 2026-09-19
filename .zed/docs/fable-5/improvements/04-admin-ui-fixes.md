@@ -1,6 +1,6 @@
 # 04 — Admin UI Fixes
 
-> Priority: P1 · Depends on: 01-proto-additions (IMP-04.9, 04.13), 02-controller-hardening (IMP-02.25) · Status: Planned
+> Priority: P1 · Depends on: 01-proto-additions (IMP-04.9, 04.13), 02-controller-hardening (IMP-02.25) · Status: Implemented
 
 ## Summary
 
@@ -97,15 +97,16 @@ fails.
 
 ## Task breakdown
 
-- [ ] IMP-04.1–04.3 — security middleware, CSP, cookie attrs.
-- [ ] IMP-04.4–04.10 — chat route + sessions.
-- [ ] IMP-04.11, 04.12 — logs route.
-- [ ] IMP-04.15, 04.16 — helpers + gather.
-- [ ] IMP-04.17, 04.18, 04.21, 04.22, 04.23 — developer/register flow.
-- [ ] IMP-04.24, 04.25 — dashboard.
-- [ ] IMP-04.26–04.30 — templates, HEAD, a11y.
-- [ ] After doc 01: IMP-04.13, 04.19, 04.20 — remove side channels and `_preview_yaml`.
-- [ ] Tests per `07-testing-and-acceptance.md` §Admin.
+- [x] IMP-04.1–04.3 — security middleware, CSP, cookie attrs.
+- [x] IMP-04.4–04.10 — chat route + sessions.
+- [x] IMP-04.11, 04.12 — logs route.
+- [x] IMP-04.13, 04.14 — jobs page without `known_jobs`; refresh/unknown rules.
+- [x] IMP-04.15, 04.16 — helpers + gather.
+- [x] IMP-04.17, 04.18, 04.21, 04.22, 04.23 — developer/register flow.
+- [x] IMP-04.24, 04.25 — dashboard.
+- [x] IMP-04.26–04.30 — templates, HEAD, a11y.
+- [x] After doc 01: IMP-04.13, 04.19, 04.20 — remove side channels and `_preview_yaml`.
+- [x] Tests per `07-testing-and-acceptance.md` §Admin.
 
 ## Acceptance criteria
 

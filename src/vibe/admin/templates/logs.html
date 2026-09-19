@@ -5,7 +5,7 @@
 <h1>Logs</h1>
 
 <section class="card">
-  <form method="get" action="{{ url_for('logs') }}" class="inline">
+  <form method="get" action="{{ path_for('logs') }}" class="inline">
     <label for="tail">Tail</label>
     <select name="tail" id="tail">
       {% for option in tails %}
@@ -13,7 +13,7 @@
       {% endfor %}
     </select>
     <button type="submit">Show</button>
-    <a href="{{ url_for('logs_stream') }}">follow stream</a>
+    <a href="{{ path_for('logs_stream') }}">follow stream</a>
   </form>
 </section>
 

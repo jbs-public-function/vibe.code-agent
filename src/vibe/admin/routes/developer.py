@@ -7,10 +7,13 @@ entry point to the guided registration flow. `POST /developer/downloads`
 starts a download stream in a background task and 303-redirects to its
 progress page, which auto-refreshes every 2 s until the download finishes.
 `GET /developer/register` pre-fills the registration form from a cached repo;
-`POST /developer/register` proposes the entry and shows the YAML preview;
-`POST /developer/register/confirm` writes it to `models.yaml` and reloads the
-registry. Zero JavaScript (NFR-04.5/NFR-01.1); every controller call goes
-through the shared `grpc()` deadline helper (NFR-01.5).
+`POST /developer/register` proposes the entry and shows the controller's
+`yaml_preview` verbatim (IMP-04.19); `POST /developer/register/confirm`
+re-proposes, diffs against the previewed values, writes to `models.yaml` and
+reloads the registry (IMP-04.22). `POST /developer/reload` is the standalone
+"Reload registry" recovery button (IMP-04.17). Zero JavaScript
+(NFR-04.5/NFR-01.1); every controller call goes through the shared `grpc()`
+deadline helper (NFR-01.5).
 """
 
 from __future__ import annotations
@@ -18,21 +21,23 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Sequence
+from contextlib import suppress
 from typing import cast
 
-import yaml
 from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import Response
 
 from vibe.admin.routes import (
     GRPC_TIMEOUT,
+    aclose,
     client_of,
-    grpc,
+    grpc_flash,
     parse_form,
     redirect,
     redirect_with_flash,
     render,
+    safe_grpc,
 )
 from vibe.client import ControllerUnavailable
 from vibe.gen.vibe.v1 import control_pb2
@@ -41,6 +46,7 @@ from vibe.zedsettings import ZedEntry, zed_settings_json
 router = APIRouter()
 
 # Defaults for the register form; the controller fills 0/"" as "auto" (FR-04.5).
+# IMP-04.23: passed into the template — never hardcoded there a second time.
 _QUANTIZATION_OPTIONS = ("auto", "awq", "gptq", "none")
 _TOOL_PARSER_OPTIONS = ("auto", "hermes", "llama3_json")
 
@@ -80,19 +86,34 @@ def _register_form(form: dict[str, str], repo: str = "") -> dict[str, str]:
     }
 
 
-def _spec_from_form(form: dict[str, str]) -> control_pb2.RegistrationSpec:
-    """Build a `RegistrationSpec`; blank/auto values stay 0/"" (auto upstream)."""
+def _spec_from_form(
+    form: dict[str, str],
+) -> tuple[control_pb2.RegistrationSpec, list[str]]:
+    """Build a `RegistrationSpec`; blank/auto values stay 0/"" (auto upstream).
 
-    def _int(key: str) -> int:
+    IMP-04.18: unparseable numeric fields (`"80a0"`, `"0.7x"`) produce an
+    error message instead of being silently coerced to 0.
+    """
+    errors: list[str] = []
+
+    def _int(key: str, label: str) -> int:
+        raw = form.get(key, "").strip()
+        if not raw:
+            return 0
         try:
-            return int(form.get(key, "").strip())
+            return int(raw)
         except ValueError:
+            errors.append(f"{label} must be a whole number, got {raw!r}")
             return 0
 
-    def _float(key: str) -> float:
+    def _float(key: str, label: str) -> float:
+        raw = form.get(key, "").strip()
+        if not raw:
+            return 0.0
         try:
-            return float(form.get(key, "").strip())
+            return float(raw)
         except ValueError:
+            errors.append(f"{label} must be a number, got {raw!r}")
             return 0.0
 
     quantization = form.get("quantization", "").strip()
@@ -102,46 +123,55 @@ def _spec_from_form(form: dict[str, str]) -> control_pb2.RegistrationSpec:
     if tool_parser == "auto":
         tool_parser = ""
     tags = [tag.strip() for tag in form.get("tags", "").split(",") if tag.strip()]
-    return control_pb2.RegistrationSpec(
+    spec = control_pb2.RegistrationSpec(
         hf_repo=form.get("repo", "").strip(),
         alias=form.get("alias", "").strip(),
         quantization=quantization,
-        max_model_len=_int("max_model_len"),
-        gpu_memory_utilization=_float("gpu_mem"),
-        host_port=_int("port"),
+        max_model_len=_int("max_model_len", "max model len"),
+        gpu_memory_utilization=_float("gpu_mem", "GPU mem fraction"),
+        host_port=_int("port", "port"),
         tool_parser=tool_parser,
         use_case=form.get("use_case", "").strip(),
         tags=tags,
     )
+    return spec, errors
 
 
-def _preview_yaml(
-    entry: control_pb2.RegistrationSpec | control_pb2.ModelInfo, tool_parser: str
-) -> str:
-    """An illustrative `models.yaml` snippet for the register preview (FR-04.7d)."""
-    extra_args = (
-        ["--enable-auto-tool-choice", "--tool-call-parser", tool_parser]
-        if tool_parser
-        else []
-    )
-    data = {
-        "models": [
-            {
-                "alias": entry.alias,
-                "display_name": entry.display_name or entry.alias,
-                "hf_repo": entry.hf_repo,
-                "quantization": entry.quantization or "none",
-                "max_model_len": entry.max_model_len,
-                "gpu_memory_utilization": entry.gpu_memory_utilization,
-                "container_name": f"vibe-{entry.alias}",
-                "host_port": entry.host_port,
-                "extra_args": extra_args,
-                "use_case": entry.use_case,
-                "tags": list(entry.tags),
-            }
-        ]
+def _confirm_values(model: control_pb2.ModelInfo, tool_parser: str) -> dict[str, str]:
+    """The controller-filled values hidden on the preview page (IMP-04.22).
+
+    The confirm POST re-proposes these and diffs against them, so alias/port
+    cannot drift between what was previewed and what gets written.
+    """
+    return {
+        "repo": model.hf_repo,
+        "alias": model.alias,
+        "quantization": model.quantization or "auto",
+        "max_model_len": str(model.max_model_len) if model.max_model_len else "",
+        "gpu_mem": f"{model.gpu_memory_utilization:g}"
+        if model.gpu_memory_utilization
+        else "",
+        "port": str(model.host_port) if model.host_port else "",
+        "tool_parser": tool_parser or "auto",
+        "use_case": model.use_case,
+        "tags": ", ".join(model.tags),
     }
-    return yaml.safe_dump(data, sort_keys=False)
+
+
+def _diff_preview(
+    previewed: dict[str, str], proposed: control_pb2.ModelInfo, tool_parser: str
+) -> list[str]:
+    """Drift between the previewed values and a fresh proposal (IMP-04.22)."""
+    fresh = _confirm_values(proposed, tool_parser)
+    drift: list[str] = []
+    for key in ("repo", "alias", "port", "quantization", "max_model_len", "gpu_mem"):
+        if fresh[key] != previewed.get(key, ""):
+            drift.append(
+                f"{key} changed since the preview "
+                f"({previewed.get(key, '') or 'auto'} → {fresh[key] or 'auto'}) — "
+                "review the preview and confirm again"
+            )
+    return drift
 
 
 # -- downloads (FR-04.7a) ---------------------------------------------------
@@ -157,27 +187,24 @@ async def _start_download(
 
     Like `start_background_job`, but for `DownloadProgress` streams: the first
     event carries the download id and the rest of the stream is drained by a
-    task held in `app.state.background_tasks`. The latest event and the start
-    time are recorded on the app state so the progress page can show the
-    current file and elapsed time.
+    task held in `app.state.background_tasks`. Progress is read from the
+    controller's `ListDownloads` on every page render — no admin-side
+    side channels (IMP-04.20).
     """
     client = client_of(request)
     agen = client.download(repo, include=include, revision=revision)
-    first = await asyncio.wait_for(anext(agen), timeout=GRPC_TIMEOUT)
+    try:
+        first = await asyncio.wait_for(anext(agen), timeout=GRPC_TIMEOUT)
+    except asyncio.TimeoutError:
+        with suppress(Exception):
+            await aclose(agen)  # IMP-04.15: release the stream on deadline
+        raise
     download_id = first.id
-    if not hasattr(request.app.state, "download_live"):
-        request.app.state.download_live = {}
-    if not hasattr(request.app.state, "download_started"):
-        request.app.state.download_started = {}
-    live = cast(dict[str, control_pb2.DownloadProgress], request.app.state.download_live)
-    started = cast(dict[str, float], request.app.state.download_started)
-    live[download_id] = first
-    started[download_id] = time.time()
 
     async def drain() -> None:
         try:
-            async for event in agen:
-                live[download_id] = event
+            async for _ in agen:
+                pass
         except Exception:
             pass  # a background download must never raise into the loop
 
@@ -192,10 +219,17 @@ async def _start_download(
 async def developer_page(request: Request) -> Response:
     """Downloads, HF cache, disk usage, register entry and Zed block (FR-04.7)."""
     client = client_of(request)
-    status = await grpc(client.status())
-    downloads = await grpc(client.list_downloads())
-    cache = await grpc(client.list_cache())
-    models = await grpc(client.list_models())
+    # IMP-04.16: the four independent calls run concurrently under the shared
+    # 3 s budget instead of 4 × 3 s back-to-back.
+    (status, status_error), (downloads, downloads_error), (cache, cache_error), (
+        models,
+        models_error,
+    ) = await asyncio.gather(
+        safe_grpc(client.status()),
+        safe_grpc(client.list_downloads()),
+        safe_grpc(client.list_cache()),
+        safe_grpc(client.list_models()),
+    )
     controller_down = any(value is None for value in (status, downloads, cache))
     zed_json: str | None = None
     if models is not None:
@@ -226,6 +260,7 @@ async def developer_page(request: Request) -> Response:
             "disk_free": _fmt_size(cache.disk_free_bytes) if cache is not None else "—",
             "zed_json": zed_json,
         },
+        error=status_error or downloads_error or cache_error or models_error,
     )
 
 
@@ -259,8 +294,9 @@ async def developer_downloads_post(request: Request) -> Response:
 async def download_page(request: Request, download_id: str) -> Response:
     """Progress page for one download, refreshing every 2 s until done (FR-04.7a)."""
     client = client_of(request)
-    status = await grpc(client.status())
-    downloads = await grpc(client.list_downloads())
+    (status, status_error), (downloads, downloads_error) = await asyncio.gather(
+        safe_grpc(client.status()), safe_grpc(client.list_downloads())
+    )
     controller_down = status is None or downloads is None
     info = next(
         (download for download in (downloads or []) if download.id == download_id),
@@ -277,15 +313,15 @@ async def download_page(request: Request, download_id: str) -> Response:
                 "not_found": True,
                 "download_id": download_id,
             },
+            error=status_error or downloads_error,
         )
-    live = cast(
-        dict[str, control_pb2.DownloadProgress],
-        getattr(request.app.state, "download_live", {}),
+    # IMP-04.20: current file and timestamps come straight from `DownloadInfo`;
+    # the admin keeps no `download_live`/`download_started` side channels.
+    elapsed_s = (
+        time.time() - info.started_at_unix_ms / 1000.0
+        if info.started_at_unix_ms
+        else None
     )
-    latest = live.get(download_id) if live else None
-    started = cast(
-        dict[str, float], getattr(request.app.state, "download_started", {})
-    ).get(download_id)
     pct = round(min(max(info.progress, 0.0), 1.0) * 100)
     return render(
         request,
@@ -299,10 +335,13 @@ async def download_page(request: Request, download_id: str) -> Response:
             "info": info,
             "progress_pct": f"{pct}",
             "progress_class": f"bar-{min(100, pct // 5 * 5)}",
-            "current_file": latest.current_file if latest is not None else "",
-            "elapsed_s": time.time() - started if started is not None else None,
+            "current_file": info.current_file,
+            "elapsed_s": elapsed_s,
+            "bytes_done_label": _fmt_size(info.bytes_done),
+            "bytes_total_label": _fmt_size(info.bytes_total),
             "refresh": not info.done,
         },
+        error=status_error or downloads_error,
     )
 
 
@@ -312,11 +351,15 @@ async def download_page(request: Request, download_id: str) -> Response:
 async def download_cancel(request: Request, download_id: str) -> Response:
     """Stop a download cooperatively and reload its page (FR-04.2, FR-04.7a)."""
     client = client_of(request)
-    cancelled = await grpc(client.cancel_download(download_id))
     target = f"/developer/downloads/{download_id}"
+    try:
+        cancelled, error = await grpc_flash(client.cancel_download(download_id))
+    except KeyError:
+        # IMP-04.21: an unknown id is a user-visible outcome, not a 500.
+        return redirect_with_flash(target, "unknown download")
     if cancelled is None:
         return redirect_with_flash(
-            target, "controller unreachable — try again in a moment"
+            target, error or "controller unreachable — try again in a moment"
         )
     if cancelled:
         return redirect_with_flash(target, "download cancelled")
@@ -330,7 +373,7 @@ async def download_cancel(request: Request, download_id: str) -> Response:
 async def cache_confirm(request: Request, repo: str) -> Response:
     """Confirmation page before deleting a cached repo (FR-04.7b)."""
     client = client_of(request)
-    status = await grpc(client.status())
+    status, error = await safe_grpc(client.status())
     return render(
         request,
         "cache_rm_confirm.html",
@@ -340,6 +383,7 @@ async def cache_confirm(request: Request, repo: str) -> Response:
             "active_alias": status.active_alias if status is not None else "",
             "repo": repo,
         },
+        error=error,
     )
 
 
@@ -347,16 +391,20 @@ async def cache_confirm(request: Request, repo: str) -> Response:
 async def cache_remove(request: Request, repo: str) -> Response:
     """Delete a cached repo and flash the outcome (FR-04.7b)."""
     client = client_of(request)
-    result = await grpc(client.remove_cached(repo))
+    try:
+        result, error = await grpc_flash(client.remove_cached(repo))
+    except KeyError:
+        # IMP-04.21: an unknown repo is a user-visible outcome, not a 500.
+        return redirect_with_flash("/developer", "unknown repo")
     if result is None:
         return redirect_with_flash(
-            "/developer", "controller unreachable — try again in a moment"
+            "/developer", error or "controller unreachable — try again in a moment"
         )
-    removed, error = result
+    removed, remove_error = result
     if removed:
         return redirect_with_flash("/developer", f"removed {repo} from the HF cache")
     return redirect_with_flash(
-        "/developer", f"could not remove {repo}: {error or 'unknown error'}"
+        "/developer", f"could not remove {repo}: {remove_error or 'unknown error'}"
     )
 
 
@@ -367,13 +415,14 @@ async def _render_register(
     request: Request,
     *,
     form: dict[str, str],
+    confirm: dict[str, str] | None,
     errors: list[str],
     warnings: list[str],
     preview: str | None,
 ) -> Response:
     """Render the register form/preview page with the usual chrome (FR-04.7d)."""
     client = client_of(request)
-    status = await grpc(client.status())
+    status, error = await safe_grpc(client.status())
     return render(
         request,
         "register_preview.html",
@@ -382,10 +431,15 @@ async def _render_register(
             "controller_down": status is None,
             "active_alias": status.active_alias if status is not None else "",
             "form": form,
+            "confirm": confirm,
             "errors": errors,
             "warnings": warnings,
             "preview": preview,
+            # IMP-04.23: options live in one place (this module).
+            "quantization_options": _QUANTIZATION_OPTIONS,
+            "tool_parser_options": _TOOL_PARSER_OPTIONS,
         },
+        error=error,
     )
 
 
@@ -395,6 +449,7 @@ async def register_form(request: Request, repo: str = "") -> Response:
     return await _render_register(
         request,
         form=_register_form({}, repo),
+        confirm=None,
         errors=[],
         warnings=[],
         preview=None,
@@ -403,77 +458,141 @@ async def register_form(request: Request, repo: str = "") -> Response:
 
 @router.post("/developer/register", name="developer_register")
 async def register_post(request: Request) -> Response:
-    """Propose a registration and show the YAML preview (FR-04.7d)."""
+    """Propose a registration and show the controller's YAML preview (FR-04.7d)."""
     client = client_of(request)
     form = await parse_form(request)
     if not form.get("repo", "").strip():
         return redirect_with_flash("/developer/register", "enter an HF repo to register")
-    spec = _spec_from_form(form)
-    proposal = await grpc(client.propose_registration(spec))
+    filled = _register_form(form)
+    spec, parse_errors = _spec_from_form(form)
+    if parse_errors:
+        # IMP-04.18: re-render the form with the messages; no proposal is made.
+        return await _render_register(
+            request,
+            form=filled,
+            confirm=None,
+            errors=parse_errors,
+            warnings=[],
+            preview=None,
+        )
+    proposal, proposal_error = await grpc_flash(client.propose_registration(spec))
     if proposal is None:
         return redirect_with_flash(
-            "/developer", "controller unreachable — try again in a moment"
+            "/developer",
+            proposal_error or "controller unreachable — try again in a moment",
         )
-    filled = _register_form(form)
     if proposal.errors:
         return await _render_register(
             request,
             form=filled,
+            confirm=None,
             errors=list(proposal.errors),
             warnings=list(proposal.warnings),
             preview=None,
         )
-    preview = _preview_yaml(proposal.model, spec.tool_parser)
+    # IMP-04.19: the controller's serialization is authoritative (XR-3).
     return await _render_register(
         request,
         form=filled,
+        confirm=_confirm_values(proposal.model, spec.tool_parser),
         errors=[],
         warnings=list(proposal.warnings),
-        preview=preview,
+        preview=proposal.model.yaml_preview,
     )
 
 
 @router.post("/developer/register/confirm", name="developer_register_confirm")
 async def register_confirm(request: Request) -> Response:
-    """Write the registration and reload the registry (FR-04.7d)."""
+    """Write the registration and reload the registry (FR-04.7d).
+
+    IMP-04.22: the spec is re-proposed first and diffed against the values
+    previewed on the previous page, so alias/port cannot drift between
+    preview and write.
+    """
     client = client_of(request)
     form = await parse_form(request)
-    spec = _spec_from_form(form)
-    filled = _register_form(form)
-    write = await grpc(client.write_registration(spec))
-    if write is None:
-        return redirect_with_flash(
-            "/developer", "controller unreachable — try again in a moment"
-        )
-    if not write.ok:
-        proposal = await grpc(client.propose_registration(spec))
-        preview = (
-            _preview_yaml(proposal.model, spec.tool_parser)
-            if proposal is not None
-            else None
-        )
+    previewed = _register_form(form)
+    spec, parse_errors = _spec_from_form(form)
+    if parse_errors:
         return await _render_register(
             request,
-            form=filled,
+            form=previewed,
+            confirm=dict(form),
+            errors=parse_errors,
+            warnings=[],
+            preview=None,
+        )
+    proposal, proposal_error = await grpc_flash(client.propose_registration(spec))
+    if proposal is None:
+        return redirect_with_flash(
+            "/developer",
+            proposal_error or "controller unreachable — try again in a moment",
+        )
+    if proposal.errors:
+        return await _render_register(
+            request,
+            form=previewed,
+            confirm=dict(form),
+            errors=list(proposal.errors),
+            warnings=[],
+            preview=proposal.model.yaml_preview,
+        )
+    drift = _diff_preview(dict(form), proposal.model, spec.tool_parser)
+    if drift:
+        return await _render_register(
+            request,
+            form=previewed,
+            confirm=_confirm_values(proposal.model, spec.tool_parser),
+            errors=drift,
+            warnings=[],
+            preview=proposal.model.yaml_preview,
+        )
+    write, write_error = await grpc_flash(client.write_registration(spec))
+    if write is None:
+        return redirect_with_flash(
+            "/developer",
+            write_error or "controller unreachable — try again in a moment",
+        )
+    if not write.ok:
+        return await _render_register(
+            request,
+            form=previewed,
+            confirm=_confirm_values(proposal.model, spec.tool_parser),
             errors=list(write.errors),
             warnings=[],
-            preview=preview,
+            preview=proposal.model.yaml_preview,
         )
-    errors = await grpc(client.reload_registry())
+    errors, reload_error = await grpc_flash(client.reload_registry())
     if errors is None:
         return redirect_with_flash(
-            "/developer", "controller unreachable — try again in a moment"
+            "/developer",
+            reload_error or "controller unreachable — try again in a moment",
         )
     if errors:
-        proposal = await grpc(client.propose_registration(spec))
-        preview = (
-            _preview_yaml(proposal.model, spec.tool_parser)
-            if proposal is not None
-            else None
-        )
+        # IMP-04.17: the write succeeded but the reload failed — the error
+        # page offers the standalone Reload registry recovery button.
         return await _render_register(
-            request, form=filled, errors=list(errors), warnings=[], preview=preview
+            request,
+            form=previewed,
+            confirm=_confirm_values(proposal.model, spec.tool_parser),
+            errors=list(errors),
+            warnings=[],
+            preview=proposal.model.yaml_preview,
         )
     return redirect_with_flash(
         "/models", f"alias {spec.alias} added — models.yaml updated"
     )
+
+
+@router.post("/developer/reload", name="developer_reload")
+async def developer_reload(request: Request) -> Response:
+    """Standalone registry hot-reload (IMP-04.17, FR-04.7d)."""
+    client = client_of(request)
+    errors, error = await grpc_flash(client.reload_registry())
+    if errors is None:
+        return redirect_with_flash(
+            "/developer", error or "controller unreachable — try again in a moment"
+        )
+    if errors:
+        return redirect_with_flash("/developer", f"reload failed: {errors[0]}")
+    return redirect_with_flash("/developer", "registry reloaded")

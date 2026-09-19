@@ -20,17 +20,18 @@
   <div class="card">
     <h2>GPU</h2>
     <dl>
-      <dt>Memory</dt><dd>{{ gpu.used_mib|mib }} / {{ gpu.total_mib|mib }} MiB</dd>
+      <dt>Memory</dt><dd>{{ gpu.used_mib|thousands }} / {{ gpu.total_mib|thousands }} MiB</dd>
       <dt>Utilization</dt><dd>{{ util_pct }}%</dd>
     </dl>
-    <div class="bar" title="memory {{ mem_pct }}%"><div class="fill {{ bar_class }}"></div></div>
+    <div class="bar" role="progressbar" aria-label="memory" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ mem_pct }}" title="memory {{ mem_pct }}%"><div class="fill {{ bar_class }}"></div></div>
+    <p class="dim">memory {{ mem_pct }}%</p>
     <h3>Compute processes</h3>
     {% if gpu.processes %}
     <table>
       <thead><tr><th>PID</th><th>Name</th><th>MiB</th></tr></thead>
       <tbody>
       {% for process in gpu.processes %}
-        <tr><td>{{ process.pid }}</td><td>{{ process.name }}</td><td>{{ process.used_mib|mib }}</td></tr>
+        <tr><td>{{ process.pid }}</td><td>{{ process.name }}</td><td>{{ process.used_mib|thousands }}</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -47,7 +48,7 @@
     </dl>
     {% if current_job.id %}
     <h2>Current job</h2>
-    <p><a href="{{ url_for('job', job_id=current_job.id) }}">{{ current_job.id }}</a>
+    <p><a href="{{ path_for('job', job_id=current_job.id) }}">{{ current_job.id }}</a>
        · {{ current_job.kind|jobkind }} · <code>{{ current_job.alias }}</code></p>
     {% endif %}
   </div>
