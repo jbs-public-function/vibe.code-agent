@@ -1,6 +1,6 @@
 # 03 — Gateway, `vibe serve` Lifecycle, and CLI Fixes
 
-> Priority: P1 · Depends on: 02-controller-hardening (IMP-02.25 for error classes) · Status: Planned
+> Priority: P1 · Depends on: 02-controller-hardening (IMP-02.25 for error classes) · Status: Implemented
 
 ## Summary
 
@@ -80,15 +80,15 @@ serving guard (doc 05).
 
 ## Task breakdown
 
-- [ ] IMP-03.1–03.3 — `serve.py` signal ownership, `FIRST_COMPLETED` wait, drain.
-- [ ] IMP-03.4 — shared `load_config`.
-- [ ] IMP-03.5–03.7 — swap coordinator bound + attach.
-- [ ] IMP-03.8 — logging module + call sites in gateway/serve (controller/admin follow in their docs).
-- [ ] IMP-03.9, 03.12 — proxy error class + header handling.
-- [ ] IMP-03.10, 03.11, 03.13, 03.14 — app/router polish + spec doc update.
-- [ ] IMP-03.15–03.20 — CLI fixes; regenerate `laboratory/common.py` expectations (doc 05 IMP-05.7).
-- [ ] IMP-03.21 — README snippet + parity test.
-- [ ] Tests per `07-testing-and-acceptance.md` §Gateway/serve/CLI.
+- [x] IMP-03.1–03.3 — `serve.py` signal ownership, `FIRST_COMPLETED` wait, drain.
+- [x] IMP-03.4 — shared `load_config`.
+- [x] IMP-03.5–03.7 — swap coordinator bound + attach.
+- [x] IMP-03.8 — logging module + call sites in gateway/serve (controller/admin follow in their docs).
+- [x] IMP-03.9, 03.12 — proxy error class + header handling.
+- [x] IMP-03.10, 03.11, 03.13, 03.14 — app/router polish + spec doc update.
+- [x] IMP-03.15–03.20 — CLI fixes; regenerate `laboratory/common.py` expectations (doc 05 IMP-05.7).
+- [x] IMP-03.21 — README snippet + parity test.
+- [x] Tests per `07-testing-and-acceptance.md` §Gateway/serve/CLI.
 
 ## Acceptance criteria
 

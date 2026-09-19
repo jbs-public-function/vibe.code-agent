@@ -8,6 +8,8 @@ advertises 2048 without tools, and the agent default is `qwen2.5-coder-7b`.
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -119,3 +121,17 @@ def test_zed_settings_json_round_trips(valid_registry_dict: dict) -> None:
     text = zed_settings_json(registry.all())
     assert json.loads(text) == build_zed_settings(registry.all())
     assert "\n  " in text  # indent=2
+
+
+def test_readme_zed_block_matches_build_zed_settings() -> None:
+    """IMP-03.21: the README's fenced JSON block is exactly `vibe zed-settings`
+    output for the repo's current `models.yaml` (never hand-maintained)."""
+    readme = Path(__file__).resolve().parents[1] / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    start = text.index("## Gateway & Zed integration")
+    end = text.index("## Admin UI")
+    match = re.search(r"```json\n(.*?)\n```", text[start:end], re.DOTALL)
+    assert match is not None, "no ```json block in the README Zed section"
+    block = json.loads(match.group(1))
+    registry = Registry.load(Registry.default_path())
+    assert block == build_zed_settings(registry.all())

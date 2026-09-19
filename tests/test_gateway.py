@@ -150,6 +150,7 @@ class _ChunkedStream(httpx.AsyncByteStream):
 
     def __init__(self, chunks: list[bytes]) -> None:
         self._chunks: list[bytes] = chunks
+        self.aclosed = False
 
     @override
     async def __aiter__(self) -> AsyncIterator[bytes]:
@@ -158,7 +159,7 @@ class _ChunkedStream(httpx.AsyncByteStream):
 
     @override
     async def aclose(self) -> None:
-        pass
+        self.aclosed = True
 
 
 def make_request(
@@ -289,7 +290,6 @@ def test_decide_active_but_busy_retries_quickly() -> None:
     for state in (
         control_pb2.LOADING,
         control_pb2.UNLOADING,
-        control_pb2.ERROR,
         control_pb2.AVAILABLE,
         control_pb2.MODEL_STATE_UNSPECIFIED,
     ):
@@ -315,6 +315,43 @@ def test_decide_active_but_busy_retries_quickly() -> None:
     decision = decide("llama-3.1-8b", KNOWN_ALIASES, status, False, None)
     assert isinstance(decision, Retry)
     assert decision.status == 503 and decision.after == 10
+
+
+def test_decide_active_error_reports_and_hints() -> None:
+    """IMP-03.13: ERROR is terminal — Retry-After 30, `last_error` + hint."""
+    status = make_status(active_alias="llama-3.1-8b", state=control_pb2.ERROR)
+    status.last_error = "container died during startup"
+    decision = decide("llama-3.1-8b", KNOWN_ALIASES, status, False, None)
+    assert decision == Retry(
+        503,
+        30,
+        {
+            "message": (
+                "model 'llama-3.1-8b' is in ERROR: container died during "
+                "startup. Run: vibe load llama-3.1-8b"
+            ),
+            "type": "model_not_ready",
+            "code": "model_not_ready",
+        },
+    )
+    # Without a last_error the hint still appears.
+    decision = decide(
+        "llama-3.1-8b",
+        KNOWN_ALIASES,
+        make_status(active_alias="llama-3.1-8b", state=control_pb2.ERROR),
+        False,
+        None,
+    )
+    assert isinstance(decision, Retry)
+    assert decision.after == 30
+    assert "Run: vibe load llama-3.1-8b" in (decision.error["message"] or "")
+
+
+def test_decide_active_error_swappable_when_swap_on() -> None:
+    """IMP-03.13: with swap-on-request, ERROR is treated as swappable."""
+    status = make_status(active_alias="llama-3.1-8b", state=control_pb2.ERROR)
+    decision = decide("llama-3.1-8b", KNOWN_ALIASES, status, True, None)
+    assert decision == Swap("llama-3.1-8b")
 
 
 def test_decide_not_loaded_swap_off() -> None:
@@ -527,6 +564,108 @@ async def test_stream_proxy_connect_error_raises_upstream_error() -> None:
         await client.aclose()
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadError("read failed"),
+        httpx.WriteError("write failed"),
+        httpx.CloseError("close failed"),
+        httpx.ProxyError("proxy failed"),
+    ],
+)
+async def test_stream_proxy_transport_errors_raise_upstream_error(
+    error: httpx.TransportError,
+) -> None:
+    """IMP-03.9: every httpx transport failure maps to `UpstreamError`."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        raise error
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(UpstreamError):
+            await stream_proxy(
+                make_request(), "http://127.0.0.1:8020", b"{}", client
+            )
+    finally:
+        await client.aclose()
+
+
+async def test_stream_proxy_preserves_duplicate_response_headers() -> None:
+    """IMP-03.12: repeated upstream headers (set-cookie) are not merged."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers=[
+                ("content-type", "application/json"),
+                ("set-cookie", "a=1"),
+                ("set-cookie", "b=2"),
+            ],
+            stream=_ChunkedStream([b"ok"]),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        response = await stream_proxy(
+            make_request(), "http://127.0.0.1:8020", b"{}", client
+        )
+        cookies = response.headers.getlist("set-cookie")
+        assert cookies == ["a=1", "b=2"]
+        async for _ in response.body_iterator:
+            pass
+    finally:
+        await client.aclose()
+
+
+async def test_stream_proxy_drops_host_and_sets_x_forwarded_host() -> None:
+    """IMP-03.12: the client's Host is not forwarded; it becomes X-Forwarded-Host."""
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(200, stream=_ChunkedStream([b"ok"]))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        response = await stream_proxy(
+            make_request(headers={"host": "gateway.example:8080"}),
+            "http://127.0.0.1:8020",
+            b"{}",
+            client,
+        )
+        async for _ in response.body_iterator:
+            pass
+    finally:
+        await client.aclose()
+    forwarded = {name.lower(): value for name, value in captured["headers"].items()}
+    assert forwarded["x-forwarded-host"] == "gateway.example:8080"
+    assert forwarded["host"] == "127.0.0.1:8020"  # httpx's own target host
+
+
+async def test_stream_proxy_client_disconnect_closes_upstream() -> None:
+    """A client going away mid-SSE closes the upstream stream."""
+    stream = _ChunkedStream([b"chunk1", b"chunk2"])
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        response = await stream_proxy(
+            make_request(), "http://127.0.0.1:8020", b"{}", client
+        )
+        iterator = cast(Any, response.body_iterator)
+        first = await anext(iterator)
+        assert first == b"chunk1"
+        # The client went away mid-stream: closing the iterator must close
+        # the upstream httpx stream.
+        await iterator.aclose()
+        assert stream.aclosed is True
+    finally:
+        await client.aclose()
+
+
 # -- swap ------------------------------------------------------------------
 
 
@@ -622,11 +761,11 @@ async def test_swap_post_check_failure_fails() -> None:
 
 async def test_swap_controller_error_fails() -> None:
     client = FakeControllerClient()
-    client.load_error = JobInProgress("a job is already running")
+    client.load_error = RuntimeError("controller exploded")
     coordinator = SwapCoordinator(client, timeout_s=5.0)
     with pytest.raises(SwapFailed) as excinfo:
         await coordinator.ensure_ready("m")
-    assert "a job is already running" in str(excinfo.value)
+    assert "controller exploded" in str(excinfo.value)
     assert coordinator.in_flight_alias is None
 
 
@@ -643,11 +782,14 @@ class UpstreamRecorder:
         self.chunks: list[bytes] | None = None  # None → the default body
         self.default_body: bytes = b'{"ok": true}'
         self.raise_connect_error: bool = False
+        self.error: Exception | None = None
 
     async def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if self.raise_connect_error:
             raise httpx.ConnectError("connection refused")
+        if self.error is not None:
+            raise self.error
         return httpx.Response(
             self.status,
             headers=self.headers,
@@ -876,11 +1018,12 @@ async def test_app_health_controller_down(
     async with asgi_client(app) as ac:
         response = await ac.get("/health")
     assert response.status_code == 200  # /health is never a 503 (FR-03.10)
+    # IMP-03.10: the controller's state is unknown while it is down.
     assert response.json() == {
         "gateway": "ok",
         "controller": "down",
         "active": None,
-        "state": "AVAILABLE",
+        "state": None,
     }
 
 
@@ -1001,3 +1144,201 @@ async def test_app_shutdown_closes_dependencies(
     async with app.router.lifespan_context(app):
         pass
     assert client.closed is True
+
+
+# -- IMP-03 additions --------------------------------------------------------
+
+
+async def test_swap_attach_to_cli_initiated_load() -> None:
+    """IMP-03.7: a controller-side JobInProgress for the *same* alias is
+    attached to by polling GetStatus instead of failing the request."""
+    client = FakeControllerClient()
+    client.load_error = JobInProgress("a job is already running")
+    client.status_script.extend(
+        [
+            control_pb2.Status(
+                state=control_pb2.LOADING,
+                current_job=control_pb2.Job(
+                    kind=control_pb2.LOAD, alias="m", terminal=False
+                ),
+            ),
+            make_status(active_alias="m", state=control_pb2.READY, host_port=8030),
+        ]
+    )
+    coordinator = SwapCoordinator(client, timeout_s=5.0)
+    assert await coordinator.ensure_ready("m") == 8030
+    assert client.load_calls == ["m"]  # the gateway's load was still attempted
+    assert coordinator.in_flight_alias is None
+
+
+async def test_swap_job_in_progress_other_alias_conflicts() -> None:
+    """IMP-03.7: a controller-side job for a *different* alias is a conflict."""
+    client = FakeControllerClient()
+    client.load_error = JobInProgress("a job is already running")
+    client.status_script.append(
+        control_pb2.Status(
+            state=control_pb2.LOADING,
+            current_job=control_pb2.Job(
+                kind=control_pb2.LOAD, alias="other", terminal=False
+            ),
+        )
+    )
+    coordinator = SwapCoordinator(client, timeout_s=5.0)
+    with pytest.raises(SwapConflict):
+        await coordinator.ensure_ready("m")
+    assert coordinator.in_flight_alias is None
+
+
+async def test_swap_hung_stream_fails_after_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """IMP-03.5: a load stream that never terminates expires the job."""
+    monkeypatch.setattr("vibe.gateway.swap._LOAD_STREAM_MARGIN", 0.1)
+    client = FakeControllerClient()
+    client.load_script = [make_event(control_pb2.LOADING, terminal=False), 60.0]
+    coordinator = SwapCoordinator(client, timeout_s=5.0, load_timeout_s=0.1)
+    with pytest.raises(SwapFailed) as excinfo:
+        await coordinator.ensure_ready("m")
+    assert "did not finish" in str(excinfo.value)
+    # The slot is cleared: a later request starts a fresh load (FR-03.6).
+    assert coordinator.in_flight_alias is None
+
+
+async def test_app_head_health_200_empty(
+    settings: Settings, upstream: UpstreamRecorder
+) -> None:
+    client = FakeControllerClient()
+    client.status_value = make_status(
+        active_alias="qwen2.5-coder-7b",
+        state=control_pb2.READY,
+        host_port=8030,
+    )
+    app = build_test_app(settings, client, upstream)
+    async with asgi_client(app) as ac:
+        response = await ac.head("/health")
+    assert response.status_code == 200
+    assert response.content == b""
+
+
+async def test_app_head_root_404(
+    settings: Settings, upstream: UpstreamRecorder
+) -> None:
+    app = build_test_app(settings, FakeControllerClient(), upstream)
+    async with asgi_client(app) as ac:
+        response = await ac.head("/")
+    assert response.status_code == 404
+    assert response.content == b""
+
+
+async def test_app_active_loading_retry_after_10(
+    settings: Settings, upstream: UpstreamRecorder
+) -> None:
+    """HTTP-level Retry-After: 10 for the active-but-LOADING alias."""
+    client = FakeControllerClient()
+    client.infos = [make_info("qwen2.5-coder-7b")]
+    client.status_value = make_status(
+        active_alias="qwen2.5-coder-7b", state=control_pb2.LOADING
+    )
+    app = build_test_app(settings, client, upstream)
+    async with asgi_client(app) as ac:
+        response = await ac.post(
+            "/v1/chat/completions", json={"model": "qwen2.5-coder-7b"}
+        )
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "10"
+    assert response.json()["error"]["type"] == "model_not_ready"
+    assert upstream.requests == []
+
+
+async def test_app_active_error_retry_after_30_with_last_error(
+    settings: Settings, upstream: UpstreamRecorder
+) -> None:
+    """IMP-03.13 at the HTTP level: last_error + reload hint, Retry-After 30."""
+    client = FakeControllerClient()
+    client.infos = [make_info("qwen2.5-coder-7b")]
+    client.status_value = make_status(
+        active_alias="qwen2.5-coder-7b", state=control_pb2.ERROR
+    )
+    client.status_value.last_error = "container died"
+    app = build_test_app(settings, client, upstream)
+    async with asgi_client(app) as ac:
+        response = await ac.post(
+            "/v1/chat/completions", json={"model": "qwen2.5-coder-7b"}
+        )
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "30"
+    body = response.json()["error"]
+    assert "container died" in body["message"]
+    assert "vibe load qwen2.5-coder-7b" in body["message"]
+
+
+async def test_app_snapshot_ttl_refreshes_after_5s(
+    settings: Settings,
+    upstream: UpstreamRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NFR-03.2: the snapshot is reused within 5 s and refreshed after."""
+    clock = {"now": 100.0}
+    monkeypatch.setattr(
+        gateway_app.time, "monotonic", lambda: clock["now"]
+    )
+    client = FakeControllerClient()
+    client.infos = [make_info("qwen2.5-coder-7b")]
+    client.status_value = make_status(
+        active_alias="qwen2.5-coder-7b",
+        state=control_pb2.READY,
+        host_port=8030,
+    )
+    app = build_test_app(settings, client, upstream)
+    async with asgi_client(app) as ac:
+        await ac.get("/v1/models")
+        await ac.get("/v1/models")  # within the TTL: snapshot reused
+    assert client.list_calls == 1
+    clock["now"] += 5.1  # past SNAPSHOT_TTL
+    async with asgi_client(app) as ac:
+        await ac.get("/v1/models")
+    assert client.list_calls == 2
+
+
+async def test_app_read_error_502_invalidates_cache(
+    settings: Settings, upstream: UpstreamRecorder
+) -> None:
+    """IMP-03.9: httpx.ReadError maps to 502 + snapshot invalidation."""
+    client = FakeControllerClient()
+    client.infos = [make_info("qwen2.5-coder-7b")]
+    client.status_value = make_status(
+        active_alias="qwen2.5-coder-7b",
+        state=control_pb2.READY,
+        host_port=8030,
+    )
+    upstream.error = httpx.ReadError("connection dropped mid-response")
+    app = build_test_app(settings, client, upstream)
+    async with asgi_client(app) as ac:
+        first = await ac.post(
+            "/v1/chat/completions", json={"model": "qwen2.5-coder-7b"}
+        )
+        second = await ac.post(
+            "/v1/chat/completions", json={"model": "qwen2.5-coder-7b"}
+        )
+    assert first.status_code == 502
+    assert second.status_code == 502
+    assert client.list_calls == 2  # FR-03.9: the snapshot was re-fetched
+
+
+async def test_app_413_rejected_on_content_length_before_read(
+    settings: Settings,
+    upstream: UpstreamRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IMP-03.11: an oversized Content-Length is rejected up front."""
+    monkeypatch.setattr(gateway_app, "BODY_LIMIT", 16)
+    client = FakeControllerClient()
+    client.infos = [make_info("qwen2.5-coder-7b")]
+    app = build_test_app(settings, client, upstream)
+    async with asgi_client(app) as ac:
+        response = await ac.post(
+            "/v1/chat/completions",
+            content=b"{\"model\": \"x\"}",
+            headers={"content-length": "1024"},
+        )
+    assert response.status_code == 413
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert client.list_calls == 0  # rejected before touching the controller

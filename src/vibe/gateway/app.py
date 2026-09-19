@@ -13,6 +13,11 @@ swap coordinator into a Starlette app:
 The gateway holds no model state of its own: routing comes from a
 `ListModels`/`GetStatus` snapshot cached for at most `SNAPSHOT_TTL` seconds
 and invalidated on upstream 502s (NFR-03.2, FR-03.9).
+
+IMP-03.8 (ADR-10): every decision point emits a structured log line via
+`logging.getLogger("vibe.gateway")` with `extra={alias, upstream, status,
+elapsed_ms, reason}` — decision outcome, 502 + invalidation, controller-down
+transitions and 413 rejections (swap lifecycle logs live in `swap.py`).
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from vibe import logging as vlog
 from vibe.client import ControllerClient
 from vibe.config import Settings
 from vibe.gen.vibe.v1 import control_pb2
@@ -37,6 +43,8 @@ from vibe.gateway.models import build_models_payload, state_name
 from vibe.gateway.proxy import UpstreamError, stream_proxy
 from vibe.gateway.router import Proxy, Retry, Swap, decide
 from vibe.gateway.swap import SwapConflict, SwapCoordinator, SwapFailed, SwapTimeout
+
+logger = vlog.get_logger("vibe.gateway")
 
 # NFR-03.4: request bodies up to 32 MiB. Module-level so tests can shrink it.
 BODY_LIMIT = 32 * 1024 * 1024
@@ -70,6 +78,19 @@ def _controller_down() -> JSONResponse:
     )
 
 
+def _too_large() -> JSONResponse:
+    """413 for bodies exceeding `BODY_LIMIT` (NFR-03.4, IMP-03.11)."""
+    logger.info("request rejected", extra={"status": 413, "reason": "body too large"})
+    return _error_response(
+        413,
+        {
+            "message": "request body too large",
+            "type": "invalid_request_error",
+            "code": None,
+        },
+    )
+
+
 @dataclass
 class _Snapshot:
     """A routing snapshot: controller status + registry, with its fetch time."""
@@ -92,6 +113,7 @@ class _SnapshotCache:
         self._ttl = ttl
         self._lock = asyncio.Lock()
         self._snapshot: _Snapshot | None = None
+        self._controller_ok: bool | None = None  # None = never talked to it
 
     def invalidate(self) -> None:
         """Drop the snapshot so the next request re-asks the controller."""
@@ -109,10 +131,20 @@ class _SnapshotCache:
             try:
                 infos = await self._client.list_models()
                 status = await self._client.status()
-            except Exception:
+            except Exception as exc:
                 # ControllerUnavailable or any gRPC error: controller down.
+                if self._controller_ok is not False:
+                    # IMP-03.8: log controller-down *transitions* only.
+                    logger.info(
+                        "controller down",
+                        extra={"reason": f"{type(exc).__name__}: {exc}"},
+                    )
+                    self._controller_ok = False
                 self._snapshot = None
                 return None
+            if self._controller_ok is not True:
+                logger.info("controller back")
+                self._controller_ok = True
             snapshot = _Snapshot(time.monotonic(), status, infos)
             self._snapshot = snapshot
             return snapshot
@@ -132,7 +164,9 @@ def build_app(
         timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
     )
     cache = _SnapshotCache(ctl, SNAPSHOT_TTL)
-    coordinator = SwapCoordinator(ctl, settings.vibe_swap_timeout)
+    coordinator = SwapCoordinator(
+        ctl, settings.vibe_swap_timeout, settings.vibe_load_timeout
+    )
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -145,11 +179,22 @@ def build_app(
                 except Exception:
                     pass  # shutdown must not raise
 
-    async def proxy_or_502(request: Request, upstream: str, body: bytes) -> Response:
+    async def proxy_or_502(
+        request: Request, upstream: str, body: bytes, alias: str | None
+    ) -> Response:
         try:
             return await stream_proxy(request, upstream, body, transport)
         except UpstreamError as exc:
             cache.invalidate()  # FR-03.9: re-ask the controller next request
+            logger.info(
+                "upstream failure",
+                extra={
+                    "alias": alias or "",
+                    "upstream": upstream,
+                    "status": 502,
+                    "reason": str(exc),
+                },
+            )
             return _error_response(
                 502,
                 {
@@ -159,13 +204,21 @@ def build_app(
                 },
             )
 
-    async def models_endpoint(request: Request) -> JSONResponse:
+    def _body_for_head(response: JSONResponse) -> Response:
+        """Empty-body twin of `response` for HEAD requests."""
+        return Response(status_code=response.status_code, headers=response.headers)
+
+    async def models_endpoint(request: Request) -> Response:
         snapshot = await cache.get()
         if snapshot is None:
-            return _controller_down()
-        return JSONResponse(build_models_payload(snapshot.infos, snapshot.status))
+            response: JSONResponse = _controller_down()
+        else:
+            response = JSONResponse(build_models_payload(snapshot.infos, snapshot.status))
+        if request.method == "HEAD":
+            return _body_for_head(response)
+        return response
 
-    async def health_endpoint(request: Request) -> JSONResponse:
+    async def health_endpoint(request: Request) -> Response:
         try:
             snapshot = await asyncio.wait_for(
                 cache.get(), timeout=_HEALTH_REFRESH_TIMEOUT
@@ -173,39 +226,47 @@ def build_app(
         except asyncio.TimeoutError:
             snapshot = None
         if snapshot is None:
-            return JSONResponse(
-                {
-                    "gateway": "ok",
-                    "controller": "down",
-                    "active": None,
-                    "state": "AVAILABLE",
-                }
-            )
-        status = snapshot.status
-        return JSONResponse(
-            {
+            # IMP-03.10: the controller's state is unknown while it is down.
+            payload: dict[str, str | None] = {
+                "gateway": "ok",
+                "controller": "down",
+                "active": None,
+                "state": None,
+            }
+        else:
+            status = snapshot.status
+            payload = {
                 "gateway": "ok",
                 "controller": "ok",
                 "active": status.active_alias or None,
                 "state": state_name(status.state),
             }
-        )
+        response = JSONResponse(payload)
+        if request.method == "HEAD":
+            return _body_for_head(response)
+        return response
 
     async def post_endpoint(request: Request) -> Response:
+        started = time.monotonic()
         # NFR-03.4: buffer the body bounded at BODY_LIMIT so the `model`
         # field can be inspected before routing.
-        body = b""
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                # IMP-03.11: reject oversized bodies up front, before
+                # reading a single chunk.
+                if int(content_length) > BODY_LIMIT:
+                    return _too_large()
+            except ValueError:
+                pass  # malformed length: fall through to the streamed check
+        parts: list[bytes] = []
+        size = 0
         async for chunk in request.stream():
-            body += chunk
-            if len(body) > BODY_LIMIT:
-                return _error_response(
-                    413,
-                    {
-                        "message": "request body too large",
-                        "type": "invalid_request_error",
-                        "code": None,
-                    },
-                )
+            parts.append(chunk)
+            size += len(chunk)
+            if size > BODY_LIMIT:
+                return _too_large()
+        body = b"".join(parts)
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
@@ -229,8 +290,30 @@ def build_app(
             settings.vibe_swap_on_request,
             coordinator.in_flight_alias,
         )
+        # IMP-03.8: structured decision-outcome log.
         if isinstance(decision, Proxy):
-            return await proxy_or_502(request, decision.upstream, body)
+            log_extra: dict[str, object] = {
+                "alias": model or "",
+                "kind": "proxy",
+                "upstream": decision.upstream,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+            }
+        elif isinstance(decision, Swap):
+            log_extra = {
+                "alias": decision.alias,
+                "kind": "swap",
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+            }
+        else:
+            log_extra = {
+                "alias": model or "",
+                "kind": "retry",
+                "status": decision.status,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+            }
+        logger.info("decision", extra=log_extra)
+        if isinstance(decision, Proxy):
+            return await proxy_or_502(request, decision.upstream, body, model)
         if isinstance(decision, Retry):
             return _error_response(
                 decision.status, decision.error, decision.after or None
@@ -270,7 +353,7 @@ def build_app(
         # The active model just changed: drop the stale routing snapshot.
         cache.invalidate()
         return await proxy_or_502(
-            request, f"http://127.0.0.1:{port}", body
+            request, f"http://127.0.0.1:{port}", body, decision.alias
         )
 
     async def not_found_endpoint(request: Request) -> JSONResponse:
@@ -286,8 +369,8 @@ def build_app(
         )
 
     routes = [
-        Route("/health", health_endpoint, methods=["GET"]),
-        Route("/v1/models", models_endpoint, methods=["GET"]),
+        Route("/health", health_endpoint, methods=["GET", "HEAD"]),
+        Route("/v1/models", models_endpoint, methods=["GET", "HEAD"]),
         Route("/v1/chat/completions", post_endpoint, methods=["POST"]),
         Route("/v1/completions", post_endpoint, methods=["POST"]),
         Route("/v1/embeddings", post_endpoint, methods=["POST"]),

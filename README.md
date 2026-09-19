@@ -160,7 +160,13 @@ make status
 
 The Phase 2 OpenAI-compatible gateway serves every registry alias at a single endpoint, `http://localhost:8080/v1`. Start it with `make serve` (or `vibe serve`), load a model with `vibe load <alias>`, and run `make chat` to stream a test chat through the gateway.
 
-To use it from Zed, add the following to `.zed/settings.json` (project) or your global `settings.json`:
+To use it from Zed, generate the `openai_compatible` provider block for your current `models.yaml` and paste it into `.zed/settings.json` (project) or your global `settings.json`:
+
+```bash
+uv run vibe zed-settings
+```
+
+Re-run the command after editing `models.yaml` — the block below is generated from the stock registry, never maintained by hand. For the stock registry it prints:
 
 ```json
 {
@@ -171,34 +177,52 @@ To use it from Zed, add the following to `.zed/settings.json` (project) or your 
         "available_models": [
           {
             "name": "qwen2.5-coder-7b",
-            "display_name": "Qwen2.5 Coder 7B (local vLLM)",
+            "display_name": "Qwen2.5 Coder 7B Instruct (AWQ)",
             "max_tokens": 32768,
             "max_output_tokens": 4096,
             "max_completion_tokens": 4096,
-            "capabilities": { "tools": true, "images": false, "parallel_tool_calls": false, "prompt_cache_key": false }
+            "capabilities": {
+              "tools": true,
+              "images": false,
+              "parallel_tool_calls": false,
+              "prompt_cache_key": false
+            }
           },
           {
             "name": "llama-3.1-8b",
-            "display_name": "Llama 3.1 8B (local vLLM)",
+            "display_name": "Llama 3.1 8B Instruct (AWQ INT4)",
             "max_tokens": 16384,
             "max_output_tokens": 4096,
             "max_completion_tokens": 4096,
-            "capabilities": { "tools": true, "images": false, "parallel_tool_calls": false, "prompt_cache_key": false }
+            "capabilities": {
+              "tools": true,
+              "images": false,
+              "parallel_tool_calls": false,
+              "prompt_cache_key": false
+            }
           },
           {
             "name": "deepseek-r1-14b",
-            "display_name": "DeepSeek R1 14B (local vLLM)",
+            "display_name": "DeepSeek R1 Distill Qwen 14B (AWQ)",
             "max_tokens": 7984,
             "max_output_tokens": 2048,
             "max_completion_tokens": 2048,
-            "capabilities": { "tools": false, "images": false, "parallel_tool_calls": false, "prompt_cache_key": false }
+            "capabilities": {
+              "tools": false,
+              "images": false,
+              "parallel_tool_calls": false,
+              "prompt_cache_key": false
+            }
           }
         ]
       }
     }
   },
   "agent": {
-    "default_model": { "provider": "vibe-local", "model": "qwen2.5-coder-7b" }
+    "default_model": {
+      "provider": "vibe-local",
+      "model": "qwen2.5-coder-7b"
+    }
   }
 }
 ```

@@ -11,15 +11,17 @@ from enum import Enum
 from typing import Any, NoReturn, cast
 
 import typer
+from google.protobuf import descriptor
 from google.protobuf.json_format import MessageToDict
+from google.protobuf.message import Message
 from pydantic import ValidationError
 
 from vibe.client import ControllerClient, ControllerUnavailable
-from vibe.config import Settings
+from vibe.config import ConfigError, Settings, load_config
 from vibe.errors import EXIT_ALIAS, EXIT_CONFIG, EXIT_OK, EXIT_RUNTIME
 from vibe.gen.vibe.v1 import control_pb2
 from vibe.jobs import JobEvent, JobInProgress
-from vibe.registry import Registry, RegistryError
+from vibe.registry import REGISTER_PORT_MAX, REGISTER_PORT_MIN, Registry
 from vibe.serve import run_serve
 from vibe.zedsettings import ZedEntry, zed_settings_json
 
@@ -54,6 +56,18 @@ class ToolParser(str, Enum):
     llama3_json = "llama3_json"
 
 
+class Component(str, Enum):
+    """Allowed `--only` values for `vibe serve` (IMP-03.17).
+
+    Typer maps Enum options to its own choice type, so typos become usage
+    errors (exit 2) and `--help` lists the choices.
+    """
+
+    controller = "controller"
+    gateway = "gateway"
+    admin = "admin"
+
+
 def _run[T](coro: Coroutine[Any, Any, T]) -> T:
     """Run an async command body.
 
@@ -82,15 +96,69 @@ def _load_settings() -> Settings:
 
 def _load_config() -> tuple[Settings, Registry]:
     """Load settings and the registry, printing every validation error (FR-00.4)."""
-    settings = _load_settings()
     try:
-        registry = Registry.load(Registry.default_path())
-    except RegistryError as exc:
+        return load_config()
+    except ConfigError as exc:
         print("config error:", file=sys.stderr)
         for line in exc.errors:
             print(f"  {line}", file=sys.stderr)
         raise typer.Exit(EXIT_CONFIG) from exc
-    return settings, registry
+
+
+_INT64_TYPES = {
+    descriptor.FieldDescriptor.TYPE_INT64,
+    descriptor.FieldDescriptor.TYPE_UINT64,
+    descriptor.FieldDescriptor.TYPE_SINT64,
+    descriptor.FieldDescriptor.TYPE_FIXED64,
+    descriptor.FieldDescriptor.TYPE_SFIXED64,
+}
+
+
+def _cast_int64s(desc: Any, data: dict[str, Any]) -> None:
+    """Recursively cast 64-bit fields from proto3-JSON strings to `int`.
+
+    `desc` is a field descriptor — `Descriptor` in pure-Python protobuf, the
+    upb descriptor class under the C++ runtime — so it is typed loosely.
+    """
+    for field in desc.fields:
+        name = field.name
+        if field.type in _INT64_TYPES:
+            value = data.get(name)
+            if value is None:
+                continue
+            if field.is_repeated:
+                data[name] = [int(item) for item in value]
+            else:
+                data[name] = int(value)
+        elif (
+            field.type == descriptor.FieldDescriptor.TYPE_MESSAGE
+            and field.message_type is not None
+        ):
+            value = data.get(name)
+            if isinstance(value, dict):
+                _cast_int64s(field.message_type, value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        _cast_int64s(field.message_type, item)
+
+
+def to_json_dict(msg: Message) -> dict[str, Any]:
+    """proto message → JSON dict in the CLI's stable `--json` shape (IMP-03.15).
+
+    `--json` output is a contract (the laboratory reads it): keys are
+    snake_case (`preserving_proto_field_name=True`), every field is present
+    (`always_print_fields_with_no_presence=True`, so e.g. `active_alias`
+    always exists), and 64-bit integers are real JSON numbers rather than
+    proto3-JSON strings.
+    """
+    data = MessageToDict(
+        msg,
+        always_print_fields_with_no_presence=True,
+        preserving_proto_field_name=True,
+    )
+    _cast_int64s(msg.DESCRIPTOR, data)
+    return data
 
 
 def _print_event(event: JobEvent) -> None:
@@ -132,9 +200,15 @@ def _table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
 # -- Phase 4 helpers (FR-04.3..FR-04.5, FR-04.8) ---------------------------
 
 
-def _exit_unavailable(exc: ControllerUnavailable) -> NoReturn:
-    """Standard controller-down exit for the Phase 4 commands (FR-04.3)."""
-    print("controller unreachable — start it with `vibe serve`", file=sys.stderr)
+def _exit_unavailable(exc: ControllerUnavailable, target: str) -> NoReturn:
+    """Standard controller-down exit (FR-04.3, IMP-03.19).
+
+    One message style everywhere: name the target and point at `vibe serve`.
+    """
+    print(
+        f"controller unreachable at {target} — start it with `vibe serve`",
+        file=sys.stderr,
+    )
     raise typer.Exit(EXIT_RUNTIME) from exc
 
 
@@ -189,11 +263,12 @@ async def _list() -> None:
     try:
         models = await client.list_models()
     except ControllerUnavailable as exc:
-        print(str(exc), file=sys.stderr)
-        raise typer.Exit(EXIT_RUNTIME) from exc
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME) from exc
+    finally:
+        await client.close()
 
     headers = ("ALIAS", "DISPLAY NAME", "REPO", "PORT", "STATE")
     rows = [
@@ -254,11 +329,12 @@ async def _load(
         print(str(exc), file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME) from exc
     except ControllerUnavailable as exc:
-        print(str(exc), file=sys.stderr)
-        raise typer.Exit(EXIT_RUNTIME) from exc
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME) from exc
+    finally:
+        await client.close()
     if final_state == control_pb2.ERROR:
         raise typer.Exit(EXIT_RUNTIME)
 
@@ -282,11 +358,12 @@ async def _unload() -> None:
         print(str(exc), file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME) from exc
     except ControllerUnavailable as exc:
-        print(str(exc), file=sys.stderr)
-        raise typer.Exit(EXIT_RUNTIME) from exc
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME) from exc
+    finally:
+        await client.close()
     if final_state == control_pb2.ERROR:
         raise typer.Exit(EXIT_RUNTIME)
 
@@ -319,11 +396,12 @@ async def _jobs(job_id: str) -> None:
         )
         raise typer.Exit(EXIT_RUNTIME) from None
     except ControllerUnavailable as exc:
-        print(str(exc), file=sys.stderr)
-        raise typer.Exit(EXIT_RUNTIME) from exc
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME) from exc
+    finally:
+        await client.close()
     kind = control_pb2.JobKind.Name(job.kind)
     print(
         f"job {job.id}: kind={kind} alias={job.alias or '-'} "
@@ -334,31 +412,25 @@ async def _jobs(job_id: str) -> None:
 async def _status(json_: bool) -> None:
     settings = _load_settings()
     client = ControllerClient(settings)
+    gpu: control_pb2.GpuStats | None = None
     try:
         status = await client.status()
+        if not json_:
+            try:
+                gpu = await client.gpu()
+            except RuntimeError as exc:  # GPU stats are best-effort (Phase 0)
+                print(f"warning: {exc}", file=sys.stderr)
     except ControllerUnavailable as exc:
-        print(str(exc), file=sys.stderr)
-        raise typer.Exit(EXIT_RUNTIME) from exc
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME) from exc
+    finally:
+        await client.close()
 
     if json_:
-        print(
-            json.dumps(
-                MessageToDict(
-                    status, always_print_fields_with_no_presence=True
-                ),
-                indent=2,
-            )
-        )
+        print(json.dumps(to_json_dict(status), indent=2))
         return
-
-    try:
-        gpu = await client.gpu()
-    except RuntimeError as exc:  # GPU stats are best-effort (see Phase 0 status)
-        gpu = None
-        print(f"warning: {exc}", file=sys.stderr)
 
     state = control_pb2.ModelState.Name(status.state) if status.state else "-"
     started = "-"
@@ -404,23 +476,24 @@ async def _logs(tail: int, follow: bool) -> None:
         async for line in client.logs(tail=tail, follow=follow):
             print(line.line, flush=True)
     except ControllerUnavailable as exc:
-        print(str(exc), file=sys.stderr)
-        raise typer.Exit(EXIT_RUNTIME) from exc
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME) from exc
+    finally:
+        await client.close()
 
 
 @app.command()
 def serve(
-    only: str | None = typer.Option(
+    only: Component | None = typer.Option(
         None,
         "--only",
         help="Run a single component: controller, gateway, or admin",
     ),
 ) -> None:
     """Start the control plane: controller, gateway, and admin (FR-02.9)."""
-    raise typer.Exit(run_serve(only))
+    raise typer.Exit(run_serve(only.value if only is not None else None))
 
 
 @app.command()
@@ -472,9 +545,15 @@ async def _download(
             print(f"downloaded {hf_repo}")
             return
     except ControllerUnavailable as exc:
-        _exit_unavailable(exc)
+        _exit_unavailable(exc, client.target)
+    except typer.Exit:
+        # IMP-03.16: `typer.Exit` subclasses `RuntimeError`; re-raise it so
+        # the generic handler below does not print a spurious `error:` line.
+        raise
     except Exception as exc:
         _exit_runtime(exc)
+    finally:
+        await client.close()
     if not terminal_seen:
         print("error: download stream ended without a terminal event", file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME)
@@ -492,9 +571,11 @@ async def _downloads() -> None:
     try:
         infos = await client.list_downloads()
     except ControllerUnavailable as exc:
-        _exit_unavailable(exc)
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         _exit_runtime(exc)
+    finally:
+        await client.close()
     if not infos:
         print("no downloads")
         return
@@ -524,16 +605,15 @@ async def _cache_list(json_: bool) -> None:
     try:
         cache = await client.list_cache()
     except ControllerUnavailable as exc:
-        _exit_unavailable(exc)
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         _exit_runtime(exc)
+    finally:
+        await client.close()
     if json_:
         print(
             json.dumps(
-                [
-                    MessageToDict(entry, always_print_fields_with_no_presence=True)
-                    for entry in cache.entries
-                ],
+                [to_json_dict(entry) for entry in cache.entries],
                 indent=2,
             )
         )
@@ -568,9 +648,11 @@ async def _cache_rm(repo: str) -> None:
     try:
         removed, error = await client.remove_cached(repo)
     except ControllerUnavailable as exc:
-        _exit_unavailable(exc)
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         _exit_runtime(exc)
+    finally:
+        await client.close()
     if not removed:
         print(f"not removed: {error or repo}", file=sys.stderr)
         raise typer.Exit(EXIT_RUNTIME)
@@ -589,9 +671,11 @@ async def _cache_du() -> None:
     try:
         cache = await client.list_cache()
     except ControllerUnavailable as exc:
-        _exit_unavailable(exc)
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         _exit_runtime(exc)
+    finally:
+        await client.close()
     print(
         f"total: {_fmt_size(cache.disk_total_bytes)} / "
         f"free: {_fmt_size(cache.disk_free_bytes)}"
@@ -612,7 +696,9 @@ def register(
         None, "--gpu-mem", help="GPU memory fraction in (0, 1] (0/omitted = auto)."
     ),
     port: int | None = typer.Option(
-        None, "--port", help="Host port (0/omitted = next free in 8010-8099)."
+        None,
+        "--port",
+        help=f"Host port (0/omitted = next free in {REGISTER_PORT_MIN}-{REGISTER_PORT_MAX}).",
     ),
     tool_parser: ToolParser | None = typer.Option(
         None, "--tool-parser", help="Tool-call parser for automatic tool choice."
@@ -662,36 +748,32 @@ async def _register(
     client = ControllerClient(settings)
     try:
         proposal = await client.propose_registration(spec)
-    except ControllerUnavailable as exc:
-        _exit_unavailable(exc)
-    except Exception as exc:
-        _exit_runtime(exc)
-    for warning in proposal.warnings:
-        print(f"warning: {warning}", file=sys.stderr)
-    if proposal.errors:
-        for error in proposal.errors:
-            print(f"error: {error}", file=sys.stderr)
-        raise typer.Exit(EXIT_CONFIG)
-    try:
+        for warning in proposal.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        if proposal.errors:
+            for error in proposal.errors:
+                print(f"error: {error}", file=sys.stderr)
+            raise typer.Exit(EXIT_CONFIG)
         write = await client.write_registration(spec)
-    except ControllerUnavailable as exc:
-        _exit_unavailable(exc)
-    except Exception as exc:
-        _exit_runtime(exc)
-    if not write.ok:
-        for error in write.errors:
-            print(f"error: {error}", file=sys.stderr)
-        raise typer.Exit(EXIT_CONFIG)
-    try:
+        if not write.ok:
+            for error in write.errors:
+                print(f"error: {error}", file=sys.stderr)
+            raise typer.Exit(EXIT_CONFIG)
         errors = await client.reload_registry()
+        if errors:
+            for error in errors:
+                print(f"error: {error}", file=sys.stderr)
+            raise typer.Exit(EXIT_CONFIG)
     except ControllerUnavailable as exc:
-        _exit_unavailable(exc)
+        _exit_unavailable(exc, client.target)
+    except typer.Exit:
+        # IMP-03.16: `typer.Exit` subclasses `RuntimeError`; re-raise it so
+        # the generic handler below does not print a spurious `error:` line.
+        raise
     except Exception as exc:
         _exit_runtime(exc)
-    if errors:
-        for error in errors:
-            print(f"error: {error}", file=sys.stderr)
-        raise typer.Exit(EXIT_CONFIG)
+    finally:
+        await client.close()
     model = proposal.model
     print(f"registered {model.alias} — http://127.0.0.1:{model.host_port}/v1")
     print("models.yaml updated")
@@ -709,9 +791,11 @@ async def _zed_settings() -> None:
     try:
         models = await client.list_models()
     except ControllerUnavailable as exc:
-        _exit_unavailable(exc)
+        _exit_unavailable(exc, client.target)
     except Exception as exc:
         _exit_runtime(exc)
+    finally:
+        await client.close()
     print(zed_settings_json(cast(Sequence[ZedEntry], models)))
 
 

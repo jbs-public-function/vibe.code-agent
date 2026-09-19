@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from vibe.registry import Registry, RegistryError
 
 DEFAULT_BIND = "127.0.0.1"
 
@@ -68,3 +70,34 @@ class Settings(BaseSettings):
     @property
     def controller_target(self) -> str:
         return f"{self.vibe_bind}:{CONTROLLER_PORT}"
+
+
+class ConfigError(Exception):
+    """Settings or `models.yaml` failed to load; `errors` is human-readable."""
+
+    def __init__(self, errors: list[str]) -> None:
+        self.errors = errors
+        super().__init__("\n".join(errors))
+
+
+def load_config() -> tuple[Settings, Registry]:
+    """Load settings and the registry, raising `ConfigError` on any problem.
+
+    Shared by `cli.py` (which translates `ConfigError` to `typer.Exit(2)`) and
+    `serve.py` (which maps it to `SystemExit(2)`) so validation messages stay
+    in one place (IMP-03.4).
+    """
+    errors: list[str] = []
+    try:
+        settings = Settings()
+    except ValidationError as exc:
+        for err in exc.errors():
+            loc = ".".join(str(part) for part in err["loc"])
+            errors.append(f"{loc}: {err['msg']}" if loc else str(err["msg"]))
+        raise ConfigError(errors) from exc
+    try:
+        registry = Registry.load(Registry.default_path())
+    except RegistryError as exc:
+        errors.extend(exc.errors)
+        raise ConfigError(errors) from exc
+    return settings, registry

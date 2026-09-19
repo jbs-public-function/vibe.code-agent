@@ -38,7 +38,7 @@ optionally, asks it to swap models when a request names a non-active alias.
 | FR-03.7 | Unknown `model` → `404` with `type: "model_not_found"` and the list of valid aliases. Missing `model` field → `400`. |
 | FR-03.8 | If the active vLLM is `LOADING`/`UNLOADING`, return `503` + `Retry-After: 10` (do not queue). |
 | FR-03.9 | Upstream connection failures (container died) → `502` and the gateway triggers a `GetStatus` refresh; it never caches stale routing for more than 5 s. |
-| FR-03.10 | `GET /health` → `{"gateway":"ok","controller":"ok|down","active":"<alias>|null","state":"..."}` with `200` if gateway is up regardless of model state. |
+| FR-03.10 | `GET /health` → `{"gateway":"ok","controller":"ok|down","active":"<alias>|null","state":"..."}` with `200` if gateway is up regardless of model state. While the controller is down, `state` is `null` (IMP-03.10). |
 | FR-03.11 | `scripts/test_chat.py` rewritten to target `http://localhost:8080/v1` and accept `--model <alias>` (defaults to the active one from `/v1/models`). |
 
 ### Non-functional
@@ -119,6 +119,7 @@ sequenceDiagram
 | other known alias | swap on, job for **different** alias | 503, `Retry-After: 30` |
 | unknown | — | 404 `model_not_found` |
 | missing | — | 400 |
+| controller down | — | 503 `Retry-After: 5`, body `{"error":{"message":"controller unreachable","type":"controller_unavailable","code":"controller_unavailable"}}` (IMP-03.14) |
 
 ### File layout
 

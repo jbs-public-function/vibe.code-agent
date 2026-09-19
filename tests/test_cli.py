@@ -26,8 +26,22 @@ class FakeClient:
     """Recording in-memory stand-in for the Phase 4 client contract."""
 
     def __init__(self) -> None:
+        self.target = "test:50051"
         self.models: list[control_pb2.ModelInfo] = []
         self.models_error: Exception | None = None
+        self.status_value: control_pb2.Status = control_pb2.Status()
+        self.status_error: Exception | None = None
+        self.gpu_value: control_pb2.GpuStats = control_pb2.GpuStats()
+        self.gpu_error: Exception | None = None
+        self.load_events: list[control_pb2.JobEvent] = []
+        self.load_error: Exception | None = None
+        self.load_calls: list[tuple[str, bool, bool, int | None]] = []
+        self.unload_events: list[control_pb2.JobEvent] = []
+        self.unload_error: Exception | None = None
+        self.log_lines: list[control_pb2.LogLine] = []
+        self.logs_error: Exception | None = None
+        self.job_value: control_pb2.Job = control_pb2.Job()
+        self.get_job_error: Exception | None = None
         self.download_infos: list[control_pb2.DownloadInfo] = []
         self.download_events: list[control_pb2.DownloadProgress] = []
         self.download_error: Exception | None = None
@@ -49,12 +63,66 @@ class FakeClient:
         self.reload_errors: list[str] = []
         self.reload_calls: int = 0
         self.calls: list[str] = []
+        self.closed: bool = False
+
+    async def close(self) -> None:
+        """IMP-03.18: every command closes its client; tracked separately from
+        `calls` so existing exact-call assertions stay valid."""
+        self.closed = True
 
     async def list_models(self) -> list[control_pb2.ModelInfo]:
         self.calls.append("list_models")
         if self.models_error is not None:
             raise self.models_error
         return list(self.models)
+
+    async def status(self) -> control_pb2.Status:
+        self.calls.append("status")
+        if self.status_error is not None:
+            raise self.status_error
+        return self.status_value
+
+    async def gpu(self) -> control_pb2.GpuStats:
+        self.calls.append("gpu")
+        if self.gpu_error is not None:
+            raise self.gpu_error
+        return self.gpu_value
+
+    async def load(
+        self,
+        alias: str,
+        force: bool = False,
+        keep_failed: bool = False,
+        timeout_s: int | None = None,
+    ) -> AsyncIterator[control_pb2.JobEvent]:
+        self.calls.append("load")
+        self.load_calls.append((alias, force, keep_failed, timeout_s))
+        if self.load_error is not None:
+            raise self.load_error
+        for event in self.load_events:
+            yield event
+
+    async def unload(self) -> AsyncIterator[control_pb2.JobEvent]:
+        self.calls.append("unload")
+        if self.unload_error is not None:
+            raise self.unload_error
+        for event in self.unload_events:
+            yield event
+
+    async def logs(
+        self, tail: int | None = None, follow: bool = False
+    ) -> AsyncIterator[control_pb2.LogLine]:
+        self.calls.append("logs")
+        if self.logs_error is not None:
+            raise self.logs_error
+        for line in self.log_lines:
+            yield line
+
+    async def get_job(self, job_id: str) -> control_pb2.Job:
+        self.calls.append("get_job")
+        if self.get_job_error is not None:
+            raise self.get_job_error
+        return self.job_value
 
     async def list_downloads(self) -> list[control_pb2.DownloadInfo]:
         self.calls.append("list_downloads")
@@ -186,13 +254,19 @@ def test_download_terminal_error_exits_one(runner: CliRunner, fake_client: FakeC
     assert result.exit_code == 1
     assert "download failed: 401: gated repo — check HF_TOKEN" in result.stderr
     assert "downloaded" not in result.stdout
+    # IMP-03.16: the typer.Exit is not re-caught — no spurious `error:` line.
+    assert "error:" not in result.stderr
 
 
 def test_download_controller_down_exits_one(runner: CliRunner, fake_client: FakeClient) -> None:
     fake_client.download_error = ControllerUnavailable("down")
     result = runner.invoke(app, ["download", "org/repo"])
     assert result.exit_code == 1
-    assert "controller unreachable — start it with `vibe serve`" in result.stderr
+    # IMP-03.19: one controller-down message style, with the target named.
+    assert (
+        "controller unreachable at test:50051 — start it with `vibe serve`"
+        in result.stderr
+    )
 
 
 def test_downloads_table(runner: CliRunner, fake_client: FakeClient) -> None:
@@ -250,8 +324,10 @@ def test_cache_list_table_and_json(runner: CliRunner, fake_client: FakeClient) -
     as_json = runner.invoke(app, ["cache", "list", "--json"])
     assert as_json.exit_code == 0
     data = json.loads(as_json.stdout)
-    assert data[0]["repoId"] == "org/a"
-    assert data[0]["sizeBytes"] == str(3 * 1024**3)
+    # IMP-03.15: snake_case keys, real integers.
+    assert data[0]["repo_id"] == "org/a"
+    assert data[0]["size_bytes"] == 3 * 1024**3
+    assert isinstance(data[0]["size_bytes"], int)
     assert data[1]["aliases"] == []
 
 
@@ -439,4 +515,219 @@ def test_zed_settings_controller_down_exits_one(
     fake_client.models_error = ControllerUnavailable("down")
     result = runner.invoke(app, ["zed-settings"])
     assert result.exit_code == 1
-    assert "controller unreachable — start it with `vibe serve`" in result.stderr
+    assert (
+        "controller unreachable at test:50051 — start it with `vibe serve`"
+        in result.stderr
+    )
+
+
+# -- IMP-03 additions: Phase 0-3 commands + --json contract -------------------
+
+
+def test_list_table(runner: CliRunner, fake_client: FakeClient) -> None:
+    fake_client.models = [
+        control_pb2.ModelInfo(
+            alias="a", display_name="A", hf_repo="org/a", host_port=8030,
+            state=control_pb2.READY,
+        ),
+        control_pb2.ModelInfo(
+            alias="b", display_name="B", hf_repo="org/b", host_port=0,
+            state=control_pb2.AVAILABLE,
+        ),
+    ]
+    result = runner.invoke(app, ["list"])
+    assert result.exit_code == 0
+    assert "ALIAS" in result.stdout and "STATE" in result.stdout
+    assert "a" in result.stdout and "8030" in result.stdout and "READY" in result.stdout
+    assert "-" in result.stdout
+    assert fake_client.calls == ["list_models"]
+    assert fake_client.closed is True
+
+
+def test_list_controller_down_exits_one(runner: CliRunner, fake_client: FakeClient) -> None:
+    fake_client.models_error = ControllerUnavailable("down")
+    result = runner.invoke(app, ["list"])
+    assert result.exit_code == 1
+    assert (
+        "controller unreachable at test:50051 — start it with `vibe serve`"
+        in result.stderr
+    )
+
+
+def test_load_streams_events_and_exits_zero(
+    runner: CliRunner, fake_client: FakeClient
+) -> None:
+    fake_client.load_events = [
+        control_pb2.JobEvent(state=control_pb2.LOADING, message="starting", terminal=False),
+        control_pb2.JobEvent(state=control_pb2.READY, message="ready", terminal=True),
+    ]
+    result = runner.invoke(app, ["load", "a"])
+    assert result.exit_code == 0
+    assert "[LOADING]" in result.stdout and "starting" in result.stdout
+    assert "[READY]" in result.stdout and "ready" in result.stdout
+    assert fake_client.load_calls == [("a", False, False, None)]
+    assert fake_client.closed is True
+
+
+def test_load_unknown_alias_exits_three(
+    runner: CliRunner, fake_client: FakeClient
+) -> None:
+    fake_client.load_error = KeyError("a")
+    result = runner.invoke(app, ["load", "a"])
+    assert result.exit_code == 3
+    assert "unknown alias 'a'" in result.stderr
+
+
+def test_load_terminal_error_exits_one(
+    runner: CliRunner, fake_client: FakeClient
+) -> None:
+    fake_client.load_events = [
+        control_pb2.JobEvent(state=control_pb2.ERROR, message="boom", terminal=True)
+    ]
+    result = runner.invoke(app, ["load", "a"])
+    assert result.exit_code == 1
+    assert "[ERROR]" in result.stdout
+
+
+def test_unload_prints_events(
+    runner: CliRunner, fake_client: FakeClient
+) -> None:
+    fake_client.unload_events = [
+        control_pb2.JobEvent(state=control_pb2.AVAILABLE, message="done", terminal=True)
+    ]
+    result = runner.invoke(app, ["unload"])
+    assert result.exit_code == 0
+    assert "[AVAILABLE]" in result.stdout and "done" in result.stdout
+    assert fake_client.calls == ["unload"]
+    assert fake_client.closed is True
+
+
+def test_status_text(runner: CliRunner, fake_client: FakeClient) -> None:
+    fake_client.status_value = control_pb2.Status(
+        active_alias="qwen2.5-coder-7b",
+        state=control_pb2.READY,
+        container_id="c1",
+        host_port=8030,
+    )
+    fake_client.gpu_value = control_pb2.GpuStats(
+        used_mib=4096, total_mib=16384, utilization_pct=25
+    )
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert "Active model: qwen2.5-coder-7b (READY)" in result.stdout
+    assert "Endpoint: http://127.0.0.1:8030/v1" in result.stdout
+    assert "GPU: 4096 / 16384 MiB (25%)" in result.stdout
+    assert fake_client.closed is True
+
+
+def test_status_json_int_and_snake_case(
+    runner: CliRunner, fake_client: FakeClient
+) -> None:
+    """IMP-03.15: `status --json` is snake_case with real integers."""
+    fake_client.status_value = control_pb2.Status(
+        active_alias="qwen2.5-coder-7b",
+        state=control_pb2.READY,
+        container_id="c" * 12,
+        host_port=8030,
+        started_at_unix=1726000000,
+        current_job=control_pb2.Job(
+            kind=control_pb2.LOAD,
+            alias="qwen2.5-coder-7b",
+            started_at_unix_ms=1726000000123,
+            finished_at_unix_ms=1726000000456,
+            terminal=True,
+        ),
+    )
+    result = runner.invoke(app, ["status", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["active_alias"] == "qwen2.5-coder-7b"
+    assert data["state"] == "READY"
+    assert data["host_port"] == 8030
+    assert data["started_at_unix"] == 1726000000
+    assert isinstance(data["started_at_unix"], int)
+    assert data["current_job"]["started_at_unix_ms"] == 1726000000123
+    assert isinstance(data["current_job"]["started_at_unix_ms"], int)
+    # proto3-JSON camelCase is gone.
+    assert "startedAtUnix" not in data
+    assert "activeAlias" not in data
+
+
+def test_to_json_dict_schema() -> None:
+    """IMP-03.15 schema test: snake_case, int64 as `int`, all fields present."""
+    status = cli.to_json_dict(
+        control_pb2.Status(active_alias="x", started_at_unix=1726000000)
+    )
+    # Every scalar field is present (proto3 no-presence included), and
+    # `active_alias` always exists — the key the laboratory reads.
+    for key in (
+        "active_alias",
+        "state",
+        "container_id",
+        "host_port",
+        "started_at_unix",
+        "last_error",
+    ):
+        assert key in status
+    assert status["started_at_unix"] == 1726000000
+    assert isinstance(status["started_at_unix"], int)
+    entry = cli.to_json_dict(
+        control_pb2.CacheEntry(repo_id="org/a", size_bytes=3 * 2**30)
+    )
+    assert entry["size_bytes"] == 3 * 2**30
+    assert isinstance(entry["size_bytes"], int)
+    assert "sizeBytes" not in entry
+    # Nested int64 fields are cast too.
+    status = cli.to_json_dict(
+        control_pb2.Status(
+            current_job=control_pb2.Job(started_at_unix_ms=1726000000123)
+        )
+    )
+    assert status["current_job"]["started_at_unix_ms"] == 1726000000123
+    assert isinstance(status["current_job"]["started_at_unix_ms"], int)
+
+
+def test_jobs_prints_summary(runner: CliRunner, fake_client: FakeClient) -> None:
+    fake_client.job_value = control_pb2.Job(
+        id="j1", kind=control_pb2.LOAD, alias="a", terminal=True
+    )
+    result = runner.invoke(app, ["jobs", "j1"])
+    assert result.exit_code == 0
+    assert "job j1: kind=LOAD alias=a terminal=True last_error=-" in result.stdout
+    assert fake_client.calls == ["get_job"]
+    assert fake_client.closed is True
+
+
+def test_logs_prints_lines(runner: CliRunner, fake_client: FakeClient) -> None:
+    fake_client.log_lines = [
+        control_pb2.LogLine(line="hello"),
+        control_pb2.LogLine(line="world"),
+    ]
+    result = runner.invoke(app, ["logs", "--tail", "10"])
+    assert result.exit_code == 0
+    assert result.stdout.splitlines() == ["hello", "world"]
+    assert fake_client.calls == ["logs"]
+    assert fake_client.closed is True
+
+
+def test_validate_ok(runner: CliRunner) -> None:
+    """`validate` reads the real repo `models.yaml`; no controller needed."""
+    result = runner.invoke(app, ["validate"])
+    assert result.exit_code == 0
+    assert "configuration OK" in result.stdout
+    assert "model(s) registered" in result.stdout
+
+
+def test_serve_only_unknown_component_is_usage_error(runner: CliRunner) -> None:
+    """IMP-03.17: a `--only` typo is a usage error (exit 2), not a runtime one."""
+    result = runner.invoke(app, ["serve", "--only", "bogus"])
+    assert result.exit_code == 2
+    assert "bogus" in result.stderr
+
+
+def test_serve_only_help_lists_choices(runner: CliRunner) -> None:
+    """IMP-03.17: `--help` shows the allowed components."""
+    result = runner.invoke(app, ["serve", "--help"])
+    assert result.exit_code == 0
+    for choice in ("controller", "gateway", "admin"):
+        assert choice in result.stdout

@@ -61,6 +61,8 @@ def decide(
     - missing/empty/non-string `model` → 400
     - unknown alias → 404 with the valid aliases
     - active alias, READY with a port → `Proxy`
+    - active alias, ERROR → 503, Retry-After 30, `last_error` + reload hint
+      (or `Swap` when swap-on-request is on, IMP-03.13)
     - active alias, any other state (or port 0) → 503, Retry-After 10
     - known-but-inactive alias:
         - swap off → 503, Retry-After 30 (`model_not_loaded`)
@@ -91,6 +93,24 @@ def decide(
     if model == status.active_alias:
         if status.state == control_pb2.READY and status.host_port > 0:
             return Proxy(f"http://127.0.0.1:{status.host_port}")
+        if status.state == control_pb2.ERROR:
+            # IMP-03.13: a terminal error will not recover by retrying every
+            # 10 s — tell the client what failed and how to reload. With
+            # swap-on-request, ERROR is swappable like any other busy state.
+            if swap_on_request:
+                return Swap(model)
+            detail = f": {status.last_error}" if status.last_error else ""
+            return Retry(
+                503,
+                30,
+                {
+                    "message": (
+                        f"model '{model}' is in ERROR{detail}. Run: vibe load {model}"
+                    ),
+                    "type": "model_not_ready",
+                    "code": "model_not_ready",
+                },
+            )
         return Retry(
             503,
             10,

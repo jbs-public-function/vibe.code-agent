@@ -36,33 +36,33 @@ Docker + nvidia-ctk) the first time the system runs for real.
 
 ### Gateway / serve / CLI (`tests/test_gateway.py`, new `test_serve.py`, `test_cli.py`)
 
-- [ ] `HEAD /`, `HEAD /health` (404 / 200, empty body).
-- [ ] HTTP-level `Retry-After: 10` for active-but-LOADING (only `decide` is tested).
-- [ ] Snapshot TTL: patch `time.monotonic` → refresh after 5 s, reuse before.
-- [ ] `httpx.ReadError`/`WriteError` during `send` → 502 + invalidation (IMP-03.9).
-- [ ] Duplicate upstream headers preserved (IMP-03.12).
-- [ ] Client disconnect mid-SSE → upstream `aclose()`.
-- [ ] Swap coordinator: `JobInProgress` from a CLI-initiated load (IMP-03.7); hung stream → `SwapFailed` after bound (IMP-03.5).
-- [ ] `serve.py`: component crash propagates non-zero (IMP-03.2); SIGTERM runs `grpc_srv.stop` (IMP-03.1); `--only` validation.
-- [ ] CLI: `list`, `load`, `unload`, `status [--json]`, `logs`, `validate`, `serve --only` (only Phase-4 commands are tested today); `status --json` fields are `int` and snake_case (IMP-03.15); no spurious `error:` line on `typer.Exit` (IMP-03.16).
-- [ ] README Zed block == `build_zed_settings(registry)` (IMP-03.21).
-- [ ] 413 when `Content-Length` exceeds the limit up front (IMP-03.11).
+- [x] `HEAD /`, `HEAD /health` (404 / 200, empty body).
+- [x] HTTP-level `Retry-After: 10` for active-but-LOADING (only `decide` is tested).
+- [x] Snapshot TTL: patch `time.monotonic` → refresh after 5 s, reuse before.
+- [x] `httpx.ReadError`/`WriteError` during `send` → 502 + invalidation (IMP-03.9).
+- [x] Duplicate upstream headers preserved (IMP-03.12).
+- [x] Client disconnect mid-SSE → upstream `aclose()`.
+- [x] Swap coordinator: `JobInProgress` from a CLI-initiated load (IMP-03.7); hung stream → `SwapFailed` after bound (IMP-03.5).
+- [x] `serve.py`: component crash propagates non-zero (IMP-03.2); SIGTERM runs `grpc_srv.stop` (IMP-03.1); `--only` validation.
+- [x] CLI: `list`, `load`, `unload`, `status [--json]`, `logs`, `validate`, `serve --only` (only Phase-4 commands are tested today); `status --json` fields are `int` and snake_case (IMP-03.15); no spurious `error:` line on `typer.Exit` (IMP-03.16).
+- [x] README Zed block == `build_zed_settings(registry)` (IMP-03.21).
+- [x] 413 when `Content-Length` exceeds the limit up front (IMP-03.11).
 
 ### Admin (`tests/test_admin.py`)
 
-- [ ] Dashboard gateway probe uses an injected `MockTransport` (tests currently hit the real `127.0.0.1:8080`).
-- [ ] `/logs/stream?tail=0&follow=1` with a quiet stream stays open (IMP-04.11).
-- [ ] Chat: first token after 5 s still streams (IMP-04.4); `RuntimeError` mid-stream renders its message (IMP-04.5); not-READY `POST /chat` does **not** persist the user turn (IMP-04.6); truncation drops oldest turns at 75 % (IMP-04.7).
-- [ ] Cross-origin POST → 403; same-origin passes; `Host` outside allow-list → 403 (IMP-04.1).
-- [ ] `HEAD /` → 200 (IMP-04.28).
-- [ ] Controller-down on every POST route (`/models/load`, `/models/unload`, `/chat`, `/developer/downloads`, `/developer/register[/confirm]`, cancel/remove).
-- [ ] `register_confirm` failure paths (write `ok=False`; `reload_registry` errors → "Reload registry" button present, IMP-04.17); `GET /developer/register?repo=` prefill + `_suggest_alias`.
-- [ ] Job page for a CLI-started job shows kind/alias after IMP-01.1 (and `—` fallback before).
-- [ ] `SessionStore` TTL sweep, LRU cap, turn cap (IMP-04.9).
-- [ ] Script/style-free assertion extended to every route incl. `/developer/register`, `/developer/downloads/<id>`, `/developer/cache/<repo>/confirm`; assert `"style="` absent.
-- [ ] Flash round-trip with quotes/semicolons/unicode; >4 KiB truncated.
-- [ ] No absolute self-links in rendered HTML (IMP-04.26).
-- [ ] Lifespan runs under tests (`asgi_lifespan`) so `app.state.http` closes without resource warnings.
+- [x] Dashboard gateway probe uses an injected `MockTransport` (tests currently hit the real `127.0.0.1:8080`).
+- [x] `/logs/stream?tail=0&follow=1` with a quiet stream stays open (IMP-04.11).
+- [x] Chat: first token after 5 s still streams (IMP-04.4); `RuntimeError` mid-stream renders its message (IMP-04.5); not-READY `POST /chat` does **not** persist the user turn (IMP-04.6); truncation drops oldest turns at 75 % (IMP-04.7).
+- [x] Cross-origin POST → 403; same-origin passes; `Host` outside allow-list → 403 (IMP-04.1).
+- [x] `HEAD /` → 200 (IMP-04.28).
+- [x] Controller-down on every POST route (`/models/load`, `/models/unload`, `/chat`, `/developer/downloads`, `/developer/register[/confirm]`, cancel/remove).
+- [x] `register_confirm` failure paths (write `ok=False`; `reload_registry` errors → "Reload registry" button present, IMP-04.17); `GET /developer/register?repo=` prefill + `_suggest_alias`.
+- [x] Job page for a CLI-started job shows kind/alias after IMP-01.1 (and `—` fallback before).
+- [x] `SessionStore` TTL sweep, LRU cap, turn cap (IMP-04.9).
+- [x] Script/style-free assertion extended to every route incl. `/developer/register`, `/developer/downloads/<id>`, `/developer/cache/<repo>/confirm`; assert `"style="` absent.
+- [x] Flash round-trip with quotes/semicolons/unicode; >4 KiB truncated.
+- [x] No absolute self-links in rendered HTML (IMP-04.26).
+- [x] Lifespan runs under tests (`asgi_lifespan`) so `app.state.http` closes without resource warnings.
 
 ### Laboratory (`tests/test_lab_common.py`, `test_lab_scripts.py`, new `tests/test_lab_compat.py`)
 
