@@ -36,6 +36,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def hf_cache_hub_dir() -> Path | None:
+    """The `<VIBE_DATA_DIR>/hub` snapshots dir, or None for HF's default.
+
+    IMP-05.5 single rule: `VIBE_DATA_DIR` **is** `HF_HOME`; snapshots must
+    land under `$HF_HOME/hub/models--*` so `from_pretrained` and the Phase-4
+    cache scanner (which scans `HF_HOME/hub`) see them.
+    """
+    cache_dir = os.environ.get("VIBE_DATA_DIR")
+    if cache_dir:
+        return Path(cache_dir).expanduser() / "hub"
+    return None
+
+
 def _snapshot_download(
     repo_id: str,
     allow_patterns: list[str] | None,
@@ -43,9 +56,10 @@ def _snapshot_download(
 ) -> str:
     """Download a snapshot and return its local path (seam for tests).
 
-    Downloads into `$VIBE_DATA_DIR` when set, else HF's default cache
-    (`~/.cache/huggingface`, ADR-8): huggingface_hub defaults there, so no
-    explicit `cache_dir` is passed in that case.
+    IMP-05.5: snapshots land under `$HF_HOME/hub/models--*`. When
+    `VIBE_DATA_DIR` is set it is passed as `<VIBE_DATA_DIR>/hub`; otherwise
+    huggingface_hub's own `HF_HOME` default (`~/.cache/huggingface/hub`) is
+    used and no explicit `cache_dir` is passed.
     """
     from huggingface_hub import snapshot_download
 
@@ -55,9 +69,9 @@ def _snapshot_download(
         "revision": revision,
         "token": os.environ.get("HF_TOKEN"),
     }
-    cache_dir = os.environ.get("VIBE_DATA_DIR")
-    if cache_dir:
-        kwargs["cache_dir"] = str(Path(cache_dir).expanduser())
+    hub_dir = hf_cache_hub_dir()
+    if hub_dir is not None:
+        kwargs["cache_dir"] = str(hub_dir)
     return str(snapshot_download(**kwargs))
 
 
@@ -75,13 +89,10 @@ def main(argv: list[str] | None = None) -> int:
     seed = common.parse_seed(args.seed)
     run.log_line(f"seed: {seed}")
 
-    # Downloads do not train: the estimate is tiny (NFR-05.3), and serving
-    # can safely coexist, but the guard is still honored (NFR-05.4).
+    # Downloads do not train: the VRAM estimate is tiny (NFR-05.3), and
+    # serving can safely coexist, so the serving guard is deliberately
+    # skipped (IMP-05.11 — a network-only operation holds no GPU state).
     allowed, message = common.vram_guard(0.2, force=args.force)
-    common.log(run, message)
-    if not allowed:
-        return common.EXIT_RUNTIME
-    allowed, message = common.serving_guard(args.allow_coexist)
     common.log(run, message)
     if not allowed:
         return common.EXIT_RUNTIME

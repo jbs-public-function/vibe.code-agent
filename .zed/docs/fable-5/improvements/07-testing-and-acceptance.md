@@ -1,6 +1,6 @@
 # 07 — Testing Gaps and GPU/Docker Acceptance Runbook
 
-> Priority: P1 · Depends on: 05-laboratory-fixes P0s (for §Laboratory runbook) · Status: Planned
+> Priority: P1 · Depends on: 05-laboratory-fixes P0s (for §Laboratory runbook) · Status: Part 1 implemented (all §Controller/Gateway/Admin/Laboratory unit-test checkboxes ticked as of commits `bda05ce`–lab); Part 2 GPU/Docker acceptance runbook **pending execution on the target machine** (requires RTX 4070 Ti SUPER + Docker daemon + nvidia-ctk; not available in the implementation environment).
 
 ## Summary
 
@@ -66,15 +66,15 @@ Docker + nvidia-ctk) the first time the system runs for real.
 
 ### Laboratory (`tests/test_lab_common.py`, `test_lab_scripts.py`, new `tests/test_lab_compat.py`)
 
-- [ ] `serving_guard` fed genuine `MessageToDict(Status(...))` output; `LOADING`/`UNLOADING` treated as busy (IMP-05.8).
-- [ ] `parse_seed(None)` actually seeds RNGs — assert `torch.initial_seed()`/`random.getstate()` deterministic (IMP-05.9).
-- [ ] Compat (marker `lab`, skipped when `trl` absent): `inspect.signature(SFTTrainer.__init__)` has `processing_class`; `SFTConfig(max_length=…)` accepted; `AutoModelForCausalLM.from_pretrained` accepts `dtype=` (IMP-05.1, 05.16).
-- [ ] `download.py` honours `HF_HOME/hub/` layout given `VIBE_DATA_DIR` (IMP-05.5).
-- [ ] Resume: `out` exists without `checkpoint-*` → starts fresh, no `ValueError` (IMP-05.12).
-- [ ] `inference_gguf` estimate per backend; `_guess_params_from_name` on `Qwen2.5-7B-Instruct-Q4_K_M.gguf`-style names (IMP-05.27).
-- [ ] `distill`: `_run_cli` `FileNotFoundError` surfaces as a clean error; teacher timeout retry; `--train-only` with a corrupt cache line; flag passthrough (IMP-05.17–05.20).
-- [ ] `export`: `--awq` leaves no bf16 shards; calibration from `messages` rows; `--quantization awq` passed to `vibe register`; `--base` used for merge (IMP-05.22–05.26).
-- [ ] Shell-level check (`make lab-check`): `docker run … vibe --help` works inside the lab image and `--network host` reaches `127.0.0.1:50051` (IMP-05.2).
+- [x] `serving_guard` fed genuine `MessageToDict(Status(...))` output (camelCase + snake_case shapes); `LOADING`/`UNLOADING` treated as busy (IMP-05.8).
+- [x] `parse_seed(None)` actually seeds RNGs — deterministic `random` state + fake numpy/torch seed calls asserted; printed to stdout (IMP-05.9).
+- [x] Compat (marker `lab`, skipped when `trl` absent): `inspect.signature(SFTTrainer.__init__)` has `processing_class`; `SFTConfig(max_length=…)` accepted; `AutoModelForCausalLM.from_pretrained` accepts `dtype=` (IMP-05.1, 05.16).
+- [x] `download.py` honours `HF_HOME/hub/` layout given `VIBE_DATA_DIR` (IMP-05.5).
+- [x] Resume: `out` exists without `checkpoint-*` → `get_last_checkpoint` returns `None`, no `ValueError` (IMP-05.12).
+- [x] `inference_gguf` estimate per backend (llamacpp 4-bit vs transformers fp16); `_guess_params_from_name` on `Qwen2.5-7B-Instruct-Q4_K_M.gguf`-style names (IMP-05.27).
+- [x] `distill`: `_run_cli` `FileNotFoundError` surfaces as a clean error; teacher timeout retry; `--train-only` with a corrupt cache line; flag passthrough (IMP-05.17–05.20).
+- [x] `export`: `--awq` leaves no bf16 shards; calibration from `messages` rows; `--quantization awq` passed to `vibe register`; `--base` used for merge (IMP-05.22–05.26).
+- [ ] Shell-level check (`make lab-check`): `docker run … vibe --help` works inside the lab image and `--network host` reaches `127.0.0.1:50051` (IMP-05.2). — requires Docker + the GPU target machine; deferred to the §D runbook.
 
 ## Part 2 — Manual acceptance runbook (target machine)
 

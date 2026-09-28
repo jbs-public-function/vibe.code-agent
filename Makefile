@@ -65,14 +65,19 @@ tls-stop:  ; docker rm -f vibe-caddy
 kill-ghosts: stop
 
 # Laboratory (FR-05.2/05.3): build the pinned pytorch image, drop into a shell
-# or run one lab script with the host laboratory/ bind-mounted at /lab and the
-# shared HF cache mounted at /root/.cache/huggingface (ADR-8). `-e HF_TOKEN`
-# forwards the token only when it is set in make's environment (.env exports
-# it); unset is fine for non-gated repos.
+# or run one lab script. IMP-05.2: --network host lets the lab reach the
+# controller/gateway on the host's loopback, and the repo is mounted at the
+# SAME absolute path the host sees (`-v $$(pwd):$$(pwd)`,
+# `-w $$(pwd)/laboratory`) so paths `vibe register`/`export.py` write inside
+# the container resolve identically on the host. The shared HF cache is
+# mounted at /root/.cache/huggingface (ADR-8, IMP-05.5). `-e HF_TOKEN` and
+# `-e VLLM_IMAGE_TAG` forward the values only when set in make's environment
+# (.env exports them); unset is fine for non-gated repos / non-register CLI
+# use.
 .PHONY: lab-build lab lab-run
 lab-build: ; docker build -f laboratory/Dockerfile --build-arg LAB_IMAGE_TAG=$(LAB_IMAGE_TAG) -t $(LAB_IMAGE) .
-lab:      ; docker run --rm -it --gpus all --ipc=host -v $$(pwd)/laboratory:/lab -w /lab -e PATH=/workspace/.venv/bin:$$PATH -e HF_TOKEN -v $(LAB_HF):/root/.cache/huggingface $(LAB_IMAGE)
-lab-run:  ; docker run --rm --gpus all --ipc=host -v $$(pwd)/laboratory:/lab -w /lab -e PATH=/workspace/.venv/bin:$$PATH -e HF_TOKEN -v $(LAB_HF):/root/.cache/huggingface $(LAB_IMAGE) $(CMD)
+lab:      ; docker run --rm -it --gpus all --ipc=host --network host -v $$(pwd):$$(pwd) -w $$(pwd)/laboratory -e HF_TOKEN -e VLLM_IMAGE_TAG -v $(LAB_HF):/root/.cache/huggingface $(LAB_IMAGE)
+lab-run:  ; docker run --rm --gpus all --ipc=host --network host -v $$(pwd):$$(pwd) -w $$(pwd)/laboratory -e HF_TOKEN -e VLLM_IMAGE_TAG -v $(LAB_HF):/root/.cache/huggingface $(LAB_IMAGE) $(CMD)
 
 # Regenerate the committed codegen (NFR-02.2). Run this after editing
 # proto/vibe/v1/control.proto; `make proto` must leave the tree clean.

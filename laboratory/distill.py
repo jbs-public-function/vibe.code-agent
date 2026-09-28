@@ -10,7 +10,8 @@ Two sequential phases (the spec's VRAM table implies they cannot overlap):
 
 By default the script stops after phase 1 and prints instructions to run
 `vibe unload` and re-run with `--train-only`. `--auto-swap` runs `vibe
-unload` itself and trains in one go; `--train-only` skips phase 1.
+unload` itself, waits for the GPU to become AVAILABLE, and trains in one go;
+`--train-only` skips phase 1.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,14 @@ import common
 
 GATEWAY_URL = "http://localhost:8080"
 DEFAULT_CONCURRENCY = 4
+# IMP-05.18: swap-on-request can hold a request for VIBE_LOAD_TIMEOUT
+# (default 600 s); 600 s is the safe default, overridable with --timeout.
+DEFAULT_TIMEOUT = 600.0
+# IMP-05.19: poll interval/timeout after `vibe unload` until AVAILABLE.
+AVAIL_POLL_INTERVAL = 2.0
+AVAIL_POLL_TIMEOUT = 300.0
+VRAM_STABLE_GIB = 0.1
+CLI_TIMEOUT = 300.0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,6 +68,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="teacher sampling temperature (default: 0.7)",
     )
     parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"per-request HTTP timeout in seconds (default: {DEFAULT_TIMEOUT:g})",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="max_tokens for teacher completions (default: model default)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help=f"concurrent teacher requests (default: {DEFAULT_CONCURRENCY})",
+    )
+    parser.add_argument(
         "--auto-swap",
         action="store_true",
         help="run `vibe unload` after generation and train in one go",
@@ -67,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip generation and train from the cached teacher JSONL",
     )
+    common.add_training_args(parser)
     common.add_common_args(parser)
     return parser
 
@@ -108,46 +137,54 @@ async def _generate_teacher(
     out_cache: Path,
     temperature: float,
     n: int | None,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_tokens: int | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> int:
     """Generate teacher completions over the gateway, appending to `out_cache`.
 
     Pure-async seam (tests drive it with a fake httpx AsyncClient).
     Resumable: prompts whose idx is already in `out_cache` are skipped, so a
-    partially completed cache can be re-run. Requests POST
-    `{"model": alias, "messages": [...], "temperature": ...}` to
-    `{GATEWAY_URL}/v1/chat/completions` with concurrency capped by an
-    asyncio.Semaphore; each request is retried once before aborting with an
-    error that mentions `vibe load <alias>`. Returns the rows written by this
-    call.
+    partially completed cache can be re-run. IMP-05.18: one shared
+    `httpx.AsyncClient` per run with the `--timeout`; `--max-tokens` is sent
+    in the payload; concurrency is capped by an asyncio.Semaphore and the
+    task group is an `asyncio.TaskGroup`, so one failing row cancels its
+    siblings (IMP-05.20). Each request is retried once before aborting with
+    an error that mentions `vibe load <alias>`. Cache rows keep the full
+    `messages` the teacher saw plus the assistant completion (IMP-05.21).
+    Returns the rows written by this call.
     """
     selected = prompts[:n] if n is not None else prompts
-    existing = (
-        {row["idx"] for row in common.parse_jsonl(out_cache)}
-        if out_cache.is_file()
-        else set()
-    )
+    try:
+        existing = (
+            {row["idx"] for row in common.parse_jsonl(out_cache)}
+            if out_cache.is_file()
+            else set()
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"teacher cache {out_cache} is corrupt: {exc}") from exc
     semaphore = asyncio.Semaphore(concurrency)
     written = 0
 
-    async def generate(i: int, prompt: dict) -> None:
+    async def generate(i: int, prompt: dict, client: httpx.AsyncClient) -> None:
         nonlocal written
         if i in existing:
             return
-        payload = {
+        payload: dict[str, Any] = {
             "model": alias,
             "messages": prompt["messages"],
             "temperature": temperature,
         }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         last_error: Exception | None = None
         for _attempt in range(2):
             try:
                 async with semaphore:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
-                        resp = await client.post(
-                            f"{GATEWAY_URL}/v1/chat/completions",
-                            json=payload,
-                        )
+                    resp = await client.post(
+                        f"{GATEWAY_URL}/v1/chat/completions",
+                        json=payload,
+                    )
                 resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"]
                 out_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +194,7 @@ async def _generate_teacher(
                             {
                                 "idx": i,
                                 "prompt": prompt["prompt"],
+                                "messages": prompt["messages"],
                                 "completion": content,
                             }
                         )
@@ -172,18 +210,66 @@ async def _generate_teacher(
             f"reachable at {GATEWAY_URL}/v1"
         )
 
-    await asyncio.gather(*(generate(i, prompt) for i, prompt in enumerate(selected)))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            async with asyncio.TaskGroup() as group:
+                for i, prompt in enumerate(selected):
+                    group.create_task(generate(i, prompt, client))
+        except* RuntimeError as group_err:
+            # One failing row cancels its siblings (TaskGroup); surface the
+            # first failure as a plain RuntimeError for the caller.
+            raise group_err.exceptions[0]
     return written
 
 
-def _run_cli(argv: list[str]) -> int:
-    """Run a vibe CLI command, streaming its output; returns its exit code (seam)."""
-    proc = subprocess.run(argv, capture_output=True, text=True, check=False)
-    if proc.stdout:
-        print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
-    return proc.returncode
+def _run_cli(argv: list[str], timeout: float = CLI_TIMEOUT) -> int:
+    """Run a vibe CLI command, inheriting stdio; returns its exit code (seam).
+
+    IMP-05.20: no `capture_output` — output streams live to the run console —
+    and a timeout bounds the call. A missing CLI surfaces as a clean
+    `RuntimeError` instead of a raw FileNotFoundError traceback.
+    """
+    try:
+        return subprocess.run(argv, check=False, timeout=timeout).returncode
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"command not found: {' '.join(argv)} — the `vibe` CLI is required "
+            f"({exc})"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"command timed out after {timeout:g}s: {' '.join(argv)}") from exc
+
+
+def _poll_until_available(timeout_s: float = AVAIL_POLL_TIMEOUT) -> bool:
+    """Poll the controller until AVAILABLE and free VRAM stabilises (IMP-05.19).
+
+    `vibe unload` completes while the container is still being torn down
+    (state may linger at UNLOADING with VRAM held), so phase 2 must wait for
+    the terminal AVAILABLE state **and** two consecutive stable
+    `free_vram_gib()` readings before training. Without a visible GPU the
+    state check alone gates (free VRAM is unmeasurable there).
+    """
+    deadline = time.monotonic() + timeout_s
+    last_free: float | None = None
+    seen_available = False
+    while time.monotonic() < deadline:
+        status = common.status_snapshot()
+        state = (status or {}).get("state")
+        if state == "AVAILABLE":
+            free = common.free_vram_gib()
+            if seen_available and (
+                free is None
+                or (last_free is not None and abs(free - last_free) <= VRAM_STABLE_GIB)
+            ):
+                return True
+            seen_available = True
+            if free is not None:
+                last_free = free
+        else:
+            seen_available = False
+            last_free = None
+        time.sleep(AVAIL_POLL_INTERVAL)
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -193,6 +279,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.auto_swap and args.train_only:
         print("usage error: --auto-swap and --train-only are mutually exclusive", file=sys.stderr)
         return common.EXIT_USAGE
+
+    # IMP-05.15: validate arguments and data before start_run so usage
+    # errors do not litter runs/.
+    try:
+        prompt_rows = common.parse_jsonl(Path(args.prompts))
+        prompts = format_prompts(prompt_rows)
+    except (OSError, ValueError) as exc:
+        print(f"usage error: {exc}", file=sys.stderr)
+        return common.EXIT_USAGE
+
+    from finetune_lora import _slug
+
+    teacher_cache = common.DATA_DIR / f"{_slug(args.student)}.teacher.jsonl"
+    teacher_rows: list[dict] = []
+    if args.train_only:
+        # IMP-05.20: a corrupt cache line reports the file:line, not a traceback.
+        try:
+            teacher_rows = common.parse_jsonl(teacher_cache)
+        except (OSError, ValueError) as exc:
+            print(f"usage error: teacher cache {exc}", file=sys.stderr)
+            return common.EXIT_USAGE
+        if not teacher_rows:
+            print(
+                f"usage error: --train-only but teacher cache {teacher_cache} is empty — "
+                "run without --train-only first",
+                file=sys.stderr,
+            )
+            return common.EXIT_USAGE
+
     run = common.start_run(
         "distill",
         list(argv) if argv is not None else sys.argv[1:],
@@ -201,16 +316,6 @@ def main(argv: list[str] | None = None) -> int:
     common.setup_logging()
     seed = common.parse_seed(args.seed)
     run.log_line(f"seed: {seed}")
-
-    from finetune_lora import _slug
-
-    try:
-        prompt_rows = common.parse_jsonl(Path(args.prompts))
-        prompts = format_prompts(prompt_rows)
-    except (OSError, ValueError) as exc:
-        print(f"usage error: {exc}", file=sys.stderr)
-        return common.EXIT_USAGE
-    teacher_cache = common.DATA_DIR / f"{_slug(args.student)}.teacher.jsonl"
 
     if not args.train_only:
         # Phase 1 — the teacher must be READY; vLLM manages its own VRAM, so
@@ -223,6 +328,9 @@ def main(argv: list[str] | None = None) -> int:
                     teacher_cache,
                     args.temperature,
                     args.n,
+                    timeout=args.timeout,
+                    max_tokens=args.max_tokens,
+                    concurrency=args.concurrency,
                 )
             )
         except Exception as exc:
@@ -233,11 +341,23 @@ def main(argv: list[str] | None = None) -> int:
             {"teacher_completions": written, "teacher_cache": str(teacher_cache)}
         )
         if args.auto_swap:
-            rc = _run_cli(["vibe", "unload"])
+            try:
+                rc = _run_cli(["vibe", "unload"])
+            except RuntimeError as exc:
+                common.log(run, f"{exc} — training skipped")
+                return common.EXIT_RUNTIME
             if rc != 0:
                 common.log(run, f"`vibe unload` failed (exit {rc}) — training skipped")
                 return common.EXIT_RUNTIME
-            common.log(run, "teacher unloaded — proceeding to training")
+            common.log(run, "`vibe unload` issued — waiting for the GPU to become AVAILABLE")
+            if not _poll_until_available():
+                common.log(
+                    run,
+                    f"timed out after {AVAIL_POLL_TIMEOUT:g}s waiting for AVAILABLE "
+                    "after `vibe unload` — training skipped",
+                )
+                return common.EXIT_RUNTIME
+            common.log(run, "GPU available after unload — proceeding to training")
         else:
             print(
                 "teacher generation done. Unload the teacher (`vibe unload`) "
@@ -246,36 +366,39 @@ def main(argv: list[str] | None = None) -> int:
             )
             run.log_line("teacher generation done — run `vibe unload` and re-run with --train-only")
             return common.EXIT_OK
-    elif not teacher_cache.is_file() or not common.parse_jsonl(teacher_cache):
-        print(
-            f"usage error: --train-only but teacher cache {teacher_cache} is empty — "
-            "run without --train-only first",
-            file=sys.stderr,
-        )
-        return common.EXIT_USAGE
 
     # Phase 2 — SFT the student on the teacher cache (teacher must be
     # unloaded; the serving guard enforces that unless --allow-coexist).
     from finetune_lora import _sft_train
+    from finetune_lora import _target_modules
     from finetune_lora import _training_estimate_gib
     from finetune_lora import format_samples
 
-    teacher_rows = common.parse_jsonl(teacher_cache)
+    if not teacher_rows:
+        try:
+            teacher_rows = common.parse_jsonl(teacher_cache)
+        except (OSError, ValueError) as exc:
+            print(f"usage error: teacher cache {exc}", file=sys.stderr)
+            return common.EXIT_USAGE
+        if not teacher_rows:
+            print(
+                f"usage error: teacher cache {teacher_cache} is empty — "
+                "run without --train-only first",
+                file=sys.stderr,
+            )
+            return common.EXIT_USAGE
     samples = format_samples(teacher_rows)
     common.log(run, f"samples: {len(samples)}")
 
     from inference_hf import _load_config
 
     config = _load_config(args.student)
-    params = common.model_params_billions(config)
-    if params is None:
+    estimate = _training_estimate_gib(config, args.qlora, args.max_seq_len, args.r)
+    if estimate is None:
         print("model params unknown — VRAM guard skipped", file=sys.stderr)
     else:
-        # Distill trains the student without QLoRA (finetune_lora defaults).
-        allowed, message = common.vram_guard(
-            _training_estimate_gib(params, qlora=False),
-            force=args.force,
-        )
+        run.write_metrics({"estimate_vram_gib": round(estimate, 3)})
+        allowed, message = common.vram_guard(estimate, force=args.force)
         common.log(run, message)
         if not allowed:
             return common.EXIT_RUNTIME
@@ -290,12 +413,17 @@ def main(argv: list[str] | None = None) -> int:
             base=args.student,
             samples=samples,
             out=out.resolve(),
-            qlora=False,
-            r=16,
-            alpha=32,
-            epochs=1,
-            max_seq_len=2048,
-            grad_accum=4,
+            qlora=args.qlora,
+            r=args.r,
+            alpha=args.alpha,
+            target_modules=_target_modules(args.target_modules),
+            epochs=args.epochs,
+            max_seq_len=args.max_seq_len,
+            grad_accum=args.grad_accum,
+            save_steps=args.save_steps,
+            lr=args.lr,
+            warmup_ratio=args.warmup_ratio,
+            lr_scheduler=args.lr_scheduler,
             seed=seed,
             run=run,
         )
@@ -305,6 +433,8 @@ def main(argv: list[str] | None = None) -> int:
     common.log(run, f"adapter: {adapter}")
     run.write_metrics({"out": str(adapter), "samples": len(samples), "seed": seed})
     common.print_peak_vram(run)
+    if estimate is not None:
+        common.record_estimate_vs_peak(run, estimate)
     return common.EXIT_OK
 
 

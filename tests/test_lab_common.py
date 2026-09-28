@@ -130,7 +130,7 @@ def test_vram_guard_never_raises_when_imports_missing(monkeypatch: pytest.Monkey
     assert common.vram_guard(17.0, force=False)[0] is True
 
 
-# -- serving_guard (NFR-05.4) -----------------------------------------------
+# -- serving_guard (NFR-05.4, IMP-05.2/05.8) ---------------------------------
 
 
 def test_serving_guard_refuses_ready(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -141,7 +141,7 @@ def test_serving_guard_refuses_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     allowed, message = common.serving_guard(allow_coexist=False)
     assert allowed is False
-    assert message == "a model is READY on the GPU — run `vibe unload` first (or pass --allow-coexist)"
+    assert "run `vibe unload` first" in message
 
 
 def test_serving_guard_ready_with_allow_coexist(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -151,12 +151,29 @@ def test_serving_guard_ready_with_allow_coexist(monkeypatch: pytest.MonkeyPatch)
     assert "--allow-coexist" in message
 
 
-def test_serving_guard_non_null_alias(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-null active alias refuses even if state is not READY."""
+def test_serving_guard_loading_busy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LOADING is busy even without an alias (IMP-05.8)."""
     monkeypatch.setattr(
         common,
         "_vibe_status_json",
         lambda: '{"state": "LOADING", "active_alias": "qwen2.5-coder-7b"}',
+    )
+    allowed, _message = common.serving_guard(allow_coexist=False)
+    assert allowed is False
+
+
+def test_serving_guard_unloading_busy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(common, "_vibe_status_json", lambda: '{"state": "UNLOADING"}')
+    allowed, _message = common.serving_guard(allow_coexist=False)
+    assert allowed is False
+
+
+def test_serving_guard_current_job_busy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A current_job in flight is busy even in AVAILABLE state (IMP-05.8)."""
+    monkeypatch.setattr(
+        common,
+        "_vibe_status_json",
+        lambda: '{"state": "AVAILABLE", "current_job": {"id": "job-1", "kind": 1, "alias": "x"}}',
     )
     allowed, _message = common.serving_guard(allow_coexist=False)
     assert allowed is False
@@ -170,14 +187,18 @@ def test_serving_guard_available(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     allowed, message = common.serving_guard(allow_coexist=False)
     assert allowed is True
-    assert message == "no model is READY on the GPU"
+    assert message == "no model is busy on the GPU"
 
 
 def test_serving_guard_no_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """IMP-05.2: an unreachable controller hard-fails, never silently skips."""
     monkeypatch.setattr(common, "_vibe_status_json", lambda: None)
     allowed, message = common.serving_guard(allow_coexist=False)
+    assert allowed is False
+    assert "serving guard cannot check the GPU" in message
+    allowed, message = common.serving_guard(allow_coexist=True)
     assert allowed is True
-    assert message == "controller not reachable — serving guard skipped"
+    assert "--allow-coexist" in message
 
 
 def test_serving_guard_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,15 +207,65 @@ def test_serving_guard_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(common, "_vibe_status_json", missing)
     allowed, message = common.serving_guard(allow_coexist=False)
-    assert allowed is True
-    assert message == "vibe CLI not found — guard skipped"
+    assert allowed is False
+    assert "serving guard cannot check the GPU" in message
 
 
 def test_serving_guard_bad_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(common, "_vibe_status_json", lambda: "not json")
     allowed, message = common.serving_guard(allow_coexist=False)
-    assert allowed is True
-    assert "could not parse" in message
+    assert allowed is False
+    assert "serving guard cannot check the GPU" in message
+
+
+def test_serving_guard_genuine_messagedict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """IMP-05.8: the guard parses genuine `MessageToDict(Status(...))` output.
+
+    CamelCase keys with `always_print_fields_with_no_presence=True`
+    (protobuf 7.x) is what a plain MessageToDict emits; READY must be busy.
+    """
+    from google.protobuf.json_format import MessageToDict
+    from vibe.gen.vibe.v1 import control_pb2
+
+    status = control_pb2.Status(
+        active_alias="qwen2.5-coder-7b",
+        state=control_pb2.READY,
+        current_job=control_pb2.Job(id="", kind=control_pb2.LOAD, alias=""),
+    )
+    raw = json.dumps(MessageToDict(status, always_print_fields_with_no_presence=True))
+    assert "activeAlias" in raw and "active_alias" not in raw
+    monkeypatch.setattr(common, "_vibe_status_json", lambda: raw)
+    allowed, _message = common.serving_guard(allow_coexist=False)
+    assert allowed is False
+
+
+def test_serving_guard_snake_case_cli_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The actual `vibe status --json` contract: snake_case, real ints (IMP-03.15)."""
+    from google.protobuf.json_format import MessageToDict
+    from vibe.gen.vibe.v1 import control_pb2
+
+    status = control_pb2.Status(
+        active_alias="qwen2.5-coder-7b",
+        state=control_pb2.LOADING,
+        started_at_unix=1234567890,
+        current_job=control_pb2.Job(id="job-9", kind=control_pb2.LOAD, alias="x"),
+    )
+    raw = json.dumps(
+        MessageToDict(
+            status,
+            always_print_fields_with_no_presence=True,
+            preserving_proto_field_name=True,
+        )
+    )
+    assert "active_alias" in raw and "activeAlias" not in raw
+    monkeypatch.setattr(common, "_vibe_status_json", lambda: raw)
+    allowed, _message = common.serving_guard(allow_coexist=False)
+    assert allowed is False
+
+
+def _grpc_unavailable(timeout: float) -> str:
+    """Stand-in for `_status_via_grpc` in a torch-free env without the package."""
+    raise ImportError("vibe")
 
 
 def test_vibe_status_json_runs_cli(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -204,14 +275,34 @@ def test_vibe_status_json_runs_cli(monkeypatch: pytest.MonkeyPatch) -> None:
         calls.append((argv, kwargs))
         return SimpleNamespace(returncode=0, stdout='{"state": "AVAILABLE"}')
 
+    monkeypatch.setattr(common, "_status_via_grpc", _grpc_unavailable)
     monkeypatch.setattr(common.subprocess, "run", fake_run)
     assert common._vibe_status_json() == '{"state": "AVAILABLE"}'
     argv, kwargs = calls[0]
     assert argv == ["vibe", "status", "--json"]
-    assert kwargs["timeout"] == 5
+    assert kwargs["timeout"] == 15  # IMP-05.11
+
+
+def test_vibe_status_json_prefers_grpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """IMP-05.11: a direct gRPC GetStatus is preferred over the CLI."""
+    calls: list[tuple] = []
+
+    def fake_grpc(timeout: float) -> str:
+        calls.append(("grpc", timeout))
+        return '{"state": "AVAILABLE"}'
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(("cli", kwargs))
+        return SimpleNamespace(returncode=0, stdout='{"state": "READY"}')
+
+    monkeypatch.setattr(common, "_status_via_grpc", fake_grpc)
+    monkeypatch.setattr(common.subprocess, "run", fake_run)
+    assert common._vibe_status_json() == '{"state": "AVAILABLE"}'
+    assert calls == [("grpc", 15.0)]
 
 
 def test_vibe_status_json_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(common, "_status_via_grpc", _grpc_unavailable)
     monkeypatch.setattr(
         common.subprocess,
         "run",
@@ -224,6 +315,7 @@ def test_vibe_status_json_file_not_found(monkeypatch: pytest.MonkeyPatch) -> Non
     def boom(argv: list[str], **kwargs: object) -> SimpleNamespace:
         raise FileNotFoundError("vibe")
 
+    monkeypatch.setattr(common, "_status_via_grpc", _grpc_unavailable)
     monkeypatch.setattr(common.subprocess, "run", boom)
     with pytest.raises(FileNotFoundError):
         common._vibe_status_json()
@@ -231,6 +323,7 @@ def test_vibe_status_json_file_not_found(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_serving_guard_end_to_end_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     """serving_guard parses the real subprocess seam's stdout."""
+    monkeypatch.setattr(common, "_status_via_grpc", _grpc_unavailable)
     monkeypatch.setattr(
         common.subprocess,
         "run",
@@ -316,10 +409,43 @@ def test_model_params_billions_missing_keys() -> None:
 # -- parse_seed -------------------------------------------------------------
 
 
-def test_parse_seed_none_prints_choice(capsys: pytest.CaptureFixture[str]) -> None:
+def test_parse_seed_none_prints_choice_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
+    """IMP-05.9: the generated seed is printed to stdout, not stderr."""
     seed = common.parse_seed(None)
     assert isinstance(seed, int)
-    assert f"seed: {seed}" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert f"seed: {seed}" in captured.out
+    assert captured.err == ""
+
+
+def test_parse_seed_none_applies_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """IMP-05.9: parse_seed(None) actually seeds random/numpy/torch.
+
+    numpy and torch are not root deps, so they are faked in sys.modules
+    (the same pattern the print_peak_vram test uses for torch).
+    """
+    numpy_seeds: list[int] = []
+    fake_numpy = types.ModuleType("numpy")
+    fake_numpy.random = types.SimpleNamespace(  # type: ignore[attr-defined]
+        seed=lambda s: numpy_seeds.append(s)
+    )
+    torch_seeds: list[int] = []
+    fake_torch = types.ModuleType("torch")
+    fake_cuda = types.ModuleType("torch.cuda")
+    fake_cuda.is_available = lambda: False  # type: ignore[attr-defined]
+    fake_torch.cuda = fake_cuda  # type: ignore[attr-defined]
+    fake_torch.manual_seed = lambda s: torch_seeds.append(s)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "numpy", fake_numpy)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    seed = common.parse_seed(None)
+    assert numpy_seeds == [seed]
+    assert torch_seeds == [seed]
+    # Python's random module was seeded too: the next draw must equal a
+    # fresh Random(seed) draw (deterministic, IMP-05.9/FR-05.10).
+    import random as stdlib_random
+
+    assert common.random.random() == stdlib_random.Random(seed).random()
 
 
 def test_parse_seed_explicit_without_torch() -> None:

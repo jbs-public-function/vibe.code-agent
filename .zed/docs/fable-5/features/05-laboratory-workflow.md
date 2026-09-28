@@ -1,6 +1,11 @@
 # 05 — Laboratory Workflow
 
 > Phase 5 · Depends on: 00-foundation, 03-openai-gateway, 04-model-scripts · Status: Implemented
+>
+> **Pending GPU verification** (doc 05 fixes landed, doc 07 §D runbook not yet run on the target machine):
+> - bitsandbytes/autoawq kernel smoke tests (D4/D5) — the "known-good" claim below is provisional until then.
+> - Peak-VRAM numbers for the estimator table (IMP-05.10 `estimate_vs_peak` recording).
+> - The AWQ decision (keep autoawq / switch to llmcompressor / drop) per `laboratory/README.md`'s decision tree.
 
 ## Summary
 
@@ -124,7 +129,7 @@ Implication for `distill.py`: teacher generation and student training are **sequ
 | --- | --- | --- |
 | CUDA userland | 12.x from image; driver 13.3 is backward compatible | cu12x wheels; relies on same driver compat |
 | Risk on rolling OS | low — pinned image | medium — system python/glibc updates |
-| bitsandbytes/autoawq wheels | prebuilt in image path, known-good | may need rebuild after system updates |
+| bitsandbytes/autoawq wheels | pending GPU verification (doc 07 D4/D5); do not assume known-good yet | may need rebuild after system updates |
 | Convenience | one extra shell | direct editor integration |
 | **Recommendation** | **default** | opt-in for quick iteration |
 

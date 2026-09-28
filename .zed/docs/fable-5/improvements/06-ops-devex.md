@@ -1,6 +1,6 @@
 # 06 — Ops, Deploy, and Developer Experience
 
-> Priority: P2 · Depends on: — · Status: Planned
+> Priority: P2 · Depends on: — · Status: Implemented (a4b3630…; controller logger wiring in `bda05ce` follow-up)
 
 ## Summary
 
@@ -38,14 +38,22 @@ Nothing here changes runtime behaviour of the control plane beyond logging.
 
 ## Task breakdown
 
-- [ ] IMP-06.1, 06.2, 06.10 — `pyproject.toml`, `make typecheck`, `make check`.
-- [ ] IMP-06.3 — Makefile fixes.
-- [ ] IMP-06.4 — README refresh (coordinate with IMP-03.21 test).
-- [ ] IMP-06.5, 06.6 — deploy files + docs.
-- [ ] IMP-06.7 — `test_chat.py`.
-- [ ] IMP-06.8 — `vibe/logging.py` + call sites; `.env.example` keys.
-- [ ] IMP-06.9 — HEAD tests.
-- [ ] IMP-06.11 — dev-workflow note under `.zed/docs/`.
+- [x] IMP-06.1, 06.2, 06.10 — `pyproject.toml`, `make typecheck`, `make check`.
+- [x] IMP-06.3 — Makefile fixes (proto via `$(PY)`, chat without hardcoded model, help without port literals, `tls-stop` + persistent volume).
+- [x] IMP-06.4 — README refresh (Makefile rows, `.env` key table, Troubleshooting; Zed snippet replaced per IMP-03.21).
+- [x] IMP-06.5, 06.6 — deploy files (`%h`, `Wants=`, `Restart=`, Caddyfile bare ports + notes) + docs.
+- [x] IMP-06.7 — `test_chat.py` (no read timeout; lists aliases and exits 1 when none active).
+- [x] IMP-06.8 — `vibe/logging.py` + call sites in serve/gateway/admin/controller; `.env.example` keys.
+- [x] IMP-06.9 — HEAD tests (admin `HEAD /` → 200; gateway `HEAD /` 404 / `HEAD /health` 200).
+- [x] IMP-06.11 — `.zed/docs/fable-5/dev-workflow.md`.
+
+## Implementation notes
+
+- IMP-06.1: `pyright>=1.1` in the `dev` group + `[tool.pyright]` (`include = ["src", "tests"]`, `pythonVersion = "3.12"`); `uv sync` no longer prunes an ad-hoc pyright install.
+- IMP-06.8: `vibe.logging.configure(level)` reads `VIBE_LOG_LEVEL`/`VIBE_LOG_JSON`; key=value lines to stdout with `extra={...}` k=v passthrough. Gateway/admin/serve/controller loggers wired in docs 03/04/02 respectively.
+- IMP-06.5: units use `%h/projects/vibe.code-agent`, `EnvironmentFile=…/.env`, `Wants=vibe-controller.service`, `Restart=always`/`RestartSec=2`; `loginctl enable-linger` documented.
+- IMP-06.6: Caddyfile site addresses are bare `:8443`/`:8444`; `caddy trust` + `X-Forwarded-*` notes added.
+- IMP-06.10: `make check` = `uv lock --check && uv run --offline pytest -q && uv run pyright && uv sync --dry-run --offline` (torch-free root assertion, NFR-05.1).
 
 ## Acceptance criteria
 

@@ -4,11 +4,11 @@ version = "0.1.0"
 description = "Fine-tuning, distillation, and model export experiments for vibe (Phase 5)"
 requires-python = ">=3.12"
 dependencies = [
-    "torch",
-    "transformers",
+    "torch==2.7.1+cu126",
+    "transformers>=5.17,<6",
     "accelerate",
-    "peft",
-    "trl",
+    "peft>=0.21,<1",
+    "trl>=1.13,<2",
     "datasets",
     "bitsandbytes",
     "autoawq==0.2.7.post3",
@@ -16,15 +16,19 @@ dependencies = [
     "huggingface-hub",
     "safetensors",
     "httpx",
+    "nvidia-ml-py>=13.0.0",
 ]
 
 [project.optional-dependencies]
 llamacpp = ["llama-cpp-python"]
 
+# IMP-05.4: torch 2.7.1+cu126 matches the pytorch/pytorch:2.7.1-cuda12.6
+# base image so the venv and the image's CUDA userland agree (one torch).
+# IMP-05.7: transformers/trl/peft upper bounds stop silent major jumps.
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
+torch = { index = "pytorch-cu126" }

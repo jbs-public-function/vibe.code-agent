@@ -22,9 +22,12 @@ from vibe.docker_ctl import DockerCtl, DockerError
 from vibe.gen.vibe.v1 import control_pb2_grpc
 from vibe.gpu import GpuStats, get_gpu_stats
 from vibe.jobs import JobRunner
+from vibe.logging import get_logger
 from vibe.registry import Registry
 
 SERVICE_NAME = "vibe.v1.ModelController"
+
+_log = get_logger("vibe.controller")
 
 
 class DockerHealthServicer(health.HealthServicer):
@@ -127,7 +130,7 @@ async def run(server: grpc.aio.Server, install_signals: bool = True) -> None:
     """
     await server.start()
     address = getattr(server, "bound_address", None) or "(unknown address)"
-    print(f"vibe controller listening on {address}")
+    _log.info("listening", extra={"address": address})
     loop = asyncio.get_running_loop()
 
     stop_task: asyncio.Task | None = None
@@ -157,7 +160,7 @@ async def run(server: grpc.aio.Server, install_signals: bool = True) -> None:
     servicer = getattr(server, "servicer", None)
     if servicer is not None:
         servicer.downloads.close()  # IMP-02.14: executor shutdown
-    print("controller stopped")
+    _log.info("stopped")
 
 
 def main(settings: Settings, registry: Registry) -> int:

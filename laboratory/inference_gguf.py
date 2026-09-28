@@ -1,7 +1,9 @@
 """Run GGUF inference via transformers or llama-cpp-python (FR-05.6, NFR-05.3, FR-05.10).
 
-Same prompt/chat/metrics interface as inference_hf.py; the VRAM estimate
-assumes Q4 GGUF weights (0.55 GiB per billion params).
+Same prompt/chat/metrics interface as inference_hf.py. The VRAM estimate
+assumes Q4 GGUF weights (0.55 GiB per billion params) for the llamacpp
+backend; the transformers backend dequantizes the GGUF to fp16 on load, so
+it is estimated with the fp16 weight cost (IMP-05.27).
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import common
 
 BACKENDS = ("transformers", "llamacpp")
 GGUF_BYTES_PER_PARAM = common.BYTES_PER_PARAM["4bit"]  # Q4_K_M ≈ 4-bit
+DEFAULT_N_CTX = 2048
 
 _PARAM_RE = re.compile(r"(\d+(?:\.\d+)?)[bB]")
 
@@ -37,14 +40,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend",
         choices=list(BACKENDS),
-        default="transformers",
-        help="inference backend (default: transformers)",
+        default="llamacpp",
+        help="inference backend (default: llamacpp)",
     )
     parser.add_argument(
         "--n-gpu-layers",
         type=int,
         default=-1,
         help="layers to offload for the llamacpp backend (default: all)",
+    )
+    parser.add_argument(
+        "--n-ctx",
+        type=int,
+        default=DEFAULT_N_CTX,
+        help=f"context window for the llamacpp backend (default: {DEFAULT_N_CTX})",
     )
     parser.add_argument("--prompt", default=None, help="one-shot prompt (default: --chat)")
     parser.add_argument("--chat", action="store_true", help="interactive loop reading prompts from stdin")
@@ -102,7 +111,23 @@ def _guess_params_from_name(name: str) -> float | None:
     return None
 
 
-def _load_gguf_model(gguf_path: Path, backend: str, n_gpu_layers: int) -> tuple[Any, Any]:
+def _bytes_per_param(backend: str) -> float:
+    """Weight bytes per billion params for the VRAM estimate (IMP-05.27).
+
+    transformers dequantizes the GGUF to fp16 on load (a 7B Q4 file needs
+    ~14.5 GiB, not ~4 GiB); llama.cpp keeps the quantized weights.
+    """
+    if backend == "transformers":
+        return common.BYTES_PER_PARAM["fp16"]
+    return GGUF_BYTES_PER_PARAM
+
+
+def _load_gguf_model(
+    gguf_path: Path,
+    backend: str,
+    n_gpu_layers: int,
+    n_ctx: int = DEFAULT_N_CTX,
+) -> tuple[Any, Any]:
     """Load a GGUF file with the selected backend (seam; lazy heavy imports).
 
     Returns `(model, tokenizer)`; the llamacpp backend combines both roles
@@ -110,12 +135,18 @@ def _load_gguf_model(gguf_path: Path, backend: str, n_gpu_layers: int) -> tuple[
     from the same directory as the GGUF file (download.py the repo first).
     """
     if backend == "llamacpp":
-        from llama_cpp import Llama  # pyright: ignore[reportMissingImports]
-
+        try:
+            from llama_cpp import Llama  # pyright: ignore[reportMissingImports]
+        except ImportError as exc:
+            raise RuntimeError(
+                "llama_cpp is not installed — install the `llamacpp` extra: "
+                "`uv sync --project laboratory --extra llamacpp` (or "
+                "`uv pip install llama-cpp-python`)"
+            ) from exc
         model = Llama(
             model_path=str(gguf_path),
             n_gpu_layers=n_gpu_layers,
-            n_ctx=2048,
+            n_ctx=n_ctx,
             verbose=False,
         )
         return model, model
@@ -129,7 +160,7 @@ def _load_gguf_model(gguf_path: Path, backend: str, n_gpu_layers: int) -> tuple[
         str(model_dir),
         gguf_file=gguf_path.name,
         device_map="auto",
-        torch_dtype=torch.float16,
+        dtype=torch.float16,  # IMP-05.16: torch_dtype= removed in transformers ≥4.56
     )
     model.eval()
     return model, tokenizer
@@ -181,6 +212,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.prompt is None and not args.chat:
         print("usage error: pass --prompt '...' or --chat", file=sys.stderr)
         return common.EXIT_USAGE
+    try:
+        gguf_path = _resolve_gguf(args.gguf)
+    except ValueError as exc:
+        print(f"usage error: {exc}", file=sys.stderr)
+        return common.EXIT_USAGE
+
     run = common.start_run(
         "inference_gguf",
         list(argv) if argv is not None else sys.argv[1:],
@@ -190,16 +227,11 @@ def main(argv: list[str] | None = None) -> int:
     seed = common.parse_seed(args.seed)
     run.log_line(f"seed: {seed}")
 
-    try:
-        gguf_path = _resolve_gguf(args.gguf)
-    except ValueError as exc:
-        print(f"usage error: {exc}", file=sys.stderr)
-        return common.EXIT_USAGE
     params = _guess_params_from_name(gguf_path.name)
     if params is None:
         print("model size unknown from filename — VRAM guard skipped", file=sys.stderr)
     else:
-        estimate = common.estimate_vram_gib(params, GGUF_BYTES_PER_PARAM)
+        estimate = common.estimate_vram_gib(params, _bytes_per_param(args.backend))
         allowed, message = common.vram_guard(estimate, force=args.force)
         common.log(run, message)
         if not allowed:
@@ -210,7 +242,9 @@ def main(argv: list[str] | None = None) -> int:
         return common.EXIT_RUNTIME
 
     try:
-        model, tokenizer = _load_gguf_model(gguf_path, args.backend, args.n_gpu_layers)
+        model, tokenizer = _load_gguf_model(
+            gguf_path, args.backend, args.n_gpu_layers, args.n_ctx
+        )
     except Exception as exc:
         common.log(run, f"model load failed: {exc}")
         return common.EXIT_RUNTIME
@@ -237,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                 "tokens": n_tokens,
                 "tokens_per_sec": round(tokens_per_sec, 2),
                 "model_params_billions": params,
-                "precision": "4bit",
+                "precision": "4bit" if args.backend == "llamacpp" else "fp16",
                 "backend": args.backend,
             }
         )

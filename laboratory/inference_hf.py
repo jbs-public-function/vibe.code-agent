@@ -41,6 +41,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", default=None, help="one-shot prompt (default: --chat)")
     parser.add_argument("--chat", action="store_true", help="interactive loop reading prompts from stdin")
     parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="send the prompt verbatim instead of applying the tokenizer chat template",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=256,
@@ -118,17 +123,39 @@ def _load_pipeline(model: str, load_kwargs: dict[str, Any]) -> tuple[Any, Any]:
     if load_kwargs.get("load_in_4bit"):
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",  # IMP-05.28
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
     else:
-        kwargs["torch_dtype"] = (
+        kwargs["dtype"] = (  # IMP-05.16: torch_dtype= removed in transformers ≥4.56
             torch.bfloat16 if load_kwargs.get("dtype") == "bf16" else torch.float16
         )
     tokenizer = AutoTokenizer.from_pretrained(model)
     model_obj = AutoModelForCausalLM.from_pretrained(model, **kwargs)
     model_obj.eval()
     return model_obj, tokenizer
+
+
+def _apply_chat_template(tokenizer: Any, prompt: str, raw: bool) -> str:
+    """Format `prompt` with the tokenizer's chat template, unless `--raw`.
+
+    IMP-05.28: chat models format a bare prompt as a user turn (with a
+    generation prompt); `--raw` opts out. Any failure degrades to the raw
+    prompt — generation still works, just without chat formatting.
+    """
+    if raw:
+        return prompt
+    if not getattr(tokenizer, "chat_template", None):
+        return prompt
+    try:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:  # noqa: BLE001 — best-effort formatting
+        return prompt
 
 
 def _stream_tokens(
@@ -140,22 +167,52 @@ def _stream_tokens(
     """Generate from `prompt`, yielding one token string at a time (seam).
 
     The real implementation runs `model.generate` on a background thread with
-    transformers' TextIteratorStreamer; tests monkeypatch this to yield
-    canned tokens without torch.
+    transformers' TextIteratorStreamer and records the full output ids under
+    `gen_kwargs["state"]["output_ids"]` (via a keyword-argument `state`
+    dict) so the caller can count real generated tokens; tests monkeypatch
+    this to yield canned tokens without torch.
     """
     import torch  # pyright: ignore[reportMissingImports]
     from threading import Thread
     from transformers import TextIteratorStreamer  # pyright: ignore[reportMissingImports]
 
+    state: dict[str, Any] | None = gen_kwargs.pop("state", None)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-    thread = Thread(
-        target=model.generate,
-        kwargs={**inputs, "streamer": streamer, **gen_kwargs},
-    )
+    holder: dict[str, Any] = {}
+
+    def run_generate() -> None:
+        holder["output"] = model.generate(**inputs, streamer=streamer, **gen_kwargs)
+
+    thread = Thread(target=run_generate)
     thread.start()
     yield from streamer
     thread.join()
+    if state is not None:
+        output = holder.get("output")
+        if output is not None:
+            state["output_ids"] = output[0] if len(output) else None
+
+
+def _count_output_tokens(
+    tokenizer: Any,
+    prompt: str,
+    output_ids: Any,
+    chunk_count: int,
+) -> int:
+    """Generated-token count from `len(output_ids)` minus the prompt (IMP-05.28).
+
+    Streamer text chunks can split mid-token, so the count comes from the
+    decoded ids, not from the number of yielded chunks; the chunk count is
+    only a fallback for the monkeypatched test seam.
+    """
+    if output_ids is None:
+        return chunk_count
+    try:
+        input_len = len(tokenizer(prompt, return_tensors="pt")["input_ids"][0])
+        return max(int(len(output_ids)) - int(input_len), 0)
+    except Exception:  # noqa: BLE001
+        return chunk_count
 
 
 def _generate(
@@ -166,14 +223,18 @@ def _generate(
     gen_kwargs: dict[str, Any],
     params: float | None,
     precision: str,
+    raw: bool,
 ) -> None:
     """Stream one generation to stdout and record tokens/s in metrics (FR-05.5)."""
+    prompt = _apply_chat_template(tokenizer, prompt, raw)
     start = time.perf_counter()
-    n_tokens = 0
-    for token in _stream_tokens(model, tokenizer, prompt, **gen_kwargs):
+    state: dict[str, Any] = {}
+    chunk_count = 0
+    for token in _stream_tokens(model, tokenizer, prompt, state=state, **gen_kwargs):
         print(token, end="", flush=True)
-        n_tokens += 1
+        chunk_count += 1
     print()
+    n_tokens = _count_output_tokens(tokenizer, prompt, state.get("output_ids"), chunk_count)
     elapsed = time.perf_counter() - start
     tokens_per_sec = n_tokens / elapsed if elapsed > 0 else 0.0
     common.log(run, f"tokens/s: {tokens_per_sec:.1f} ({n_tokens} tokens)")
@@ -196,6 +257,10 @@ def main(argv: list[str] | None = None) -> int:
         return common.EXIT_USAGE
     if args.prompt is None and not args.chat:
         print("usage error: pass --prompt '...' or --chat", file=sys.stderr)
+        return common.EXIT_USAGE
+    if args.load_in_4bit and args.dtype:
+        # IMP-05.28: --load-in-4bit implies 4-bit; --dtype would be ignored.
+        print("usage error: --load-in-4bit and --dtype are mutually exclusive", file=sys.stderr)
         return common.EXIT_USAGE
     run = common.start_run(
         "inference_hf",
@@ -238,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         gen_kwargs["temperature"] = args.temperature
 
     if args.prompt is not None:
-        _generate(run, model, tokenizer, args.prompt, gen_kwargs, params, precision)
+        _generate(run, model, tokenizer, args.prompt, gen_kwargs, params, precision, args.raw)
     else:
         print("chat mode: type prompts, Ctrl-D to exit", file=sys.stderr)
         while True:
@@ -248,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
                 break
             if not prompt.strip():
                 continue
-            _generate(run, model, tokenizer, prompt, gen_kwargs, params, precision)
+            _generate(run, model, tokenizer, prompt, gen_kwargs, params, precision, args.raw)
     run.write_metrics({"seed": seed})
     common.print_peak_vram(run)
     return common.EXIT_OK

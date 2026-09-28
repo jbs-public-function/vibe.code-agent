@@ -1,5 +1,14 @@
 # vibe.code-agent — Post-implementation Improvement Plans
 
+> **Implementation status** (updated as fixes land):
+> - ✅ `01-proto-additions` — Implemented (`bda05ce`)
+> - ✅ `02-controller-hardening` — Implemented (`bda05ce`)
+> - ✅ `03-gateway-serve-cli` — Implemented (`6fe271f`)
+> - ✅ `04-admin-ui-fixes` — Implemented (`8baff1f`)
+> - ✅ `05-laboratory-fixes` — Implemented except IMP-05.3 (GPU-gated AWQ check; runbook D5)
+> - ✅ `06-ops-devex` — Implemented (`a4b3630` + follow-ups)
+> - ◐ `07-testing-and-acceptance` — Part 1 (tests) implemented; Part 2 (GPU/Docker acceptance runbook) pending execution on the target machine.
+
 Planning index for fixes and improvements identified by reviewing the Phase 0–5 implementation
 (commits `a6561a6` → `b101d0c`). The feature docs in [`../features/`](../features/README.md) remain the
 specification; these documents describe **deviations, defects, and hardening work** discovered after the

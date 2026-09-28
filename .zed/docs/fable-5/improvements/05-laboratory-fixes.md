@@ -1,6 +1,28 @@
 # 05 — Laboratory Fixes and GPU Hardening
 
-> Priority: **P0** · Depends on: 03-gateway-serve-cli (IMP-03.15 for the `--json` contract) · Status: Planned
+> Priority: **P0** · Depends on: 03-gateway-serve-cli (IMP-03.15 for the `--json` contract) · Status: Implemented
+>
+> Implementation notes (2026-09-19):
+> - **IMP-05.3** is implemented on the documentation/runbook side only — the
+>   GPU-gated verification (`make lab-run CMD='python -c "import awq, awq_ext"'`,
+>   doc 07 runbook D5) requires the target machine and is **pending**. The
+>   fallback decision tree (keep autoawq / switch to llmcompressor / drop AWQ
+>   export) is documented in `laboratory/README.md`; `autoawq` was kept in the
+>   lock and was **not** churned for this.
+> - **IMP-05.4**: option (b) was taken — the lock now resolves
+>   `torch==2.7.1+cu126` (index `https://download.pytorch.org/whl/cu126`),
+>   matching the `pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel` base image.
+>   `uv lock --check` passes at the root, the root env stays torch-free
+>   (NFR-05.1), and the re-lock succeeded on attempt 2 of 3.
+> - **IMP-05.2 guard decision**: when the CLI/controller is unreachable,
+>   `serving_guard` **hard-fails** (scripts exit 1 with a clear message)
+>   rather than silently skipping — a silent skip voids NFR-05.4 on the first
+>   real run (e.g. a missing `--network host` would go unnoticed).
+>   `--allow-coexist` is the override in every branch. `download.py` skips
+>   the guard entirely (network-only op, IMP-05.11).
+> - **IMP-05.7**: `nvidia-ml-py>=13` added to lab deps (the `pynvml` fallback
+>   in `common.py` now fires); `transformers>=5.17,<6`, `trl>=1.13,<2`,
+>   `peft>=0.21,<1` pins added so the lock cannot silently jump majors.
 
 ## Summary
 
@@ -103,15 +125,15 @@ applied.
 
 ## Task breakdown
 
-- [ ] **P0** IMP-05.1 — port `_sft_train`; add signature compat test.
-- [ ] **P0** IMP-05.2 — Makefile `--network host` + same-path mount; Dockerfile `--all-packages`; `serving_guard` hard-fails (not skips) when the CLI/controller is unreachable **and** a `--allow-coexist` override is absent? → decide; at minimum log loudly.
-- [ ] **P0** IMP-05.3 — runbook step 5; branch: keep autoawq / switch to llmcompressor / drop AWQ.
-- [ ] IMP-05.4–05.7 — Dockerfile/lock alignment, `HF_HOME`, PATH, llama.cpp arch, deps.
-- [ ] IMP-05.8–05.11 — `common.py` guard key, seed, estimator, timeouts.
-- [ ] IMP-05.12–05.16 — `finetune_lora.py`.
-- [ ] IMP-05.17–05.21 — `distill.py`.
-- [ ] IMP-05.22–05.26 — `export.py`.
-- [ ] IMP-05.27–05.29 — inference scripts, README.
+- [x] **P0** IMP-05.1 — port `_sft_train`; add signature compat test (`tests/test_lab_compat.py`).
+- [x] **P0** IMP-05.2 — Makefile `--network host` + same-path mount; Dockerfile `--all-packages`; `serving_guard` **hard-fails** when the CLI/controller is unreachable (decision documented above).
+- [x] **P0** IMP-05.3 — runbook step 5 verified present (doc 07 D5); decision tree documented in `laboratory/README.md`; GPU verification pending (target machine).
+- [x] IMP-05.4–05.7 — Dockerfile/lock alignment (torch 2.7.1+cu126), `HF_HOME`, PATH, llama.cpp arch, deps + pins + nvidia-ml-py.
+- [x] IMP-05.8–05.11 — `common.py` guard keys (snake_case + camelCase, busy = READY/LOADING/UNLOADING or current_job), seed, estimator, timeouts, gRPC-first status.
+- [x] IMP-05.12–05.16 — `finetune_lora.py`.
+- [x] IMP-05.17–05.21 — `distill.py`.
+- [x] IMP-05.22–05.26 — `export.py`.
+- [x] IMP-05.27–05.29 — inference scripts, README.
 - [ ] Run the GPU runbook (`07-testing-and-acceptance.md` §Laboratory) and record peak VRAM per step in `features/05-laboratory-workflow.md`.
 
 ## Acceptance criteria
