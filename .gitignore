@@ -203,6 +203,11 @@ laboratory/runs/
 .pip-cache/
 .uv-cache/
 
+# Jev user schemas are local state (open question, improvements-2 README);
+# only the placeholder is committed. Built-ins ship in the package instead.
+jev/*
+!jev/.gitkeep
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data

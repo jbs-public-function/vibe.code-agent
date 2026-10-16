@@ -122,6 +122,36 @@ class ModelControllerStub:
                 request_serializer=vibe_dot_v1_dot_control__pb2.WriteRegistrationRequest.SerializeToString,
                 response_deserializer=vibe_dot_v1_dot_control__pb2.WriteRegistrationResponse.FromString,
                 _registered_method=True)
+        self.GetActiveJev = channel.unary_unary(
+                '/vibe.v1.ModelController/GetActiveJev',
+                request_serializer=vibe_dot_v1_dot_control__pb2.GetActiveJevRequest.SerializeToString,
+                response_deserializer=vibe_dot_v1_dot_control__pb2.ActiveJev.FromString,
+                _registered_method=True)
+        self.ListJevSchemas = channel.unary_unary(
+                '/vibe.v1.ModelController/ListJevSchemas',
+                request_serializer=vibe_dot_v1_dot_control__pb2.ListJevSchemasRequest.SerializeToString,
+                response_deserializer=vibe_dot_v1_dot_control__pb2.ListJevSchemasResponse.FromString,
+                _registered_method=True)
+        self.GetJevSchema = channel.unary_unary(
+                '/vibe.v1.ModelController/GetJevSchema',
+                request_serializer=vibe_dot_v1_dot_control__pb2.GetJevSchemaRequest.SerializeToString,
+                response_deserializer=vibe_dot_v1_dot_control__pb2.GetJevSchemaResponse.FromString,
+                _registered_method=True)
+        self.PutJevSchema = channel.unary_unary(
+                '/vibe.v1.ModelController/PutJevSchema',
+                request_serializer=vibe_dot_v1_dot_control__pb2.PutJevSchemaRequest.SerializeToString,
+                response_deserializer=vibe_dot_v1_dot_control__pb2.PutJevSchemaResponse.FromString,
+                _registered_method=True)
+        self.DeleteJevSchema = channel.unary_unary(
+                '/vibe.v1.ModelController/DeleteJevSchema',
+                request_serializer=vibe_dot_v1_dot_control__pb2.DeleteJevSchemaRequest.SerializeToString,
+                response_deserializer=vibe_dot_v1_dot_control__pb2.DeleteJevSchemaResponse.FromString,
+                _registered_method=True)
+        self.ValidateJevSchema = channel.unary_unary(
+                '/vibe.v1.ModelController/ValidateJevSchema',
+                request_serializer=vibe_dot_v1_dot_control__pb2.ValidateJevSchemaRequest.SerializeToString,
+                response_deserializer=vibe_dot_v1_dot_control__pb2.ValidateJevSchemaResponse.FromString,
+                _registered_method=True)
 
 
 class ModelControllerServicer:
@@ -235,6 +265,43 @@ class ModelControllerServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetActiveJev(self, request, context):
+        """Jev (improvements-2, doc 02): schema-constrained decision mode.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListJevSchemas(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetJevSchema(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PutJevSchema(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteJevSchema(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ValidateJevSchema(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ModelControllerServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -322,6 +389,36 @@ def add_ModelControllerServicer_to_server(servicer, server):
                     servicer.WriteRegistration,
                     request_deserializer=vibe_dot_v1_dot_control__pb2.WriteRegistrationRequest.FromString,
                     response_serializer=vibe_dot_v1_dot_control__pb2.WriteRegistrationResponse.SerializeToString,
+            ),
+            'GetActiveJev': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetActiveJev,
+                    request_deserializer=vibe_dot_v1_dot_control__pb2.GetActiveJevRequest.FromString,
+                    response_serializer=vibe_dot_v1_dot_control__pb2.ActiveJev.SerializeToString,
+            ),
+            'ListJevSchemas': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListJevSchemas,
+                    request_deserializer=vibe_dot_v1_dot_control__pb2.ListJevSchemasRequest.FromString,
+                    response_serializer=vibe_dot_v1_dot_control__pb2.ListJevSchemasResponse.SerializeToString,
+            ),
+            'GetJevSchema': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetJevSchema,
+                    request_deserializer=vibe_dot_v1_dot_control__pb2.GetJevSchemaRequest.FromString,
+                    response_serializer=vibe_dot_v1_dot_control__pb2.GetJevSchemaResponse.SerializeToString,
+            ),
+            'PutJevSchema': grpc.unary_unary_rpc_method_handler(
+                    servicer.PutJevSchema,
+                    request_deserializer=vibe_dot_v1_dot_control__pb2.PutJevSchemaRequest.FromString,
+                    response_serializer=vibe_dot_v1_dot_control__pb2.PutJevSchemaResponse.SerializeToString,
+            ),
+            'DeleteJevSchema': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteJevSchema,
+                    request_deserializer=vibe_dot_v1_dot_control__pb2.DeleteJevSchemaRequest.FromString,
+                    response_serializer=vibe_dot_v1_dot_control__pb2.DeleteJevSchemaResponse.SerializeToString,
+            ),
+            'ValidateJevSchema': grpc.unary_unary_rpc_method_handler(
+                    servicer.ValidateJevSchema,
+                    request_deserializer=vibe_dot_v1_dot_control__pb2.ValidateJevSchemaRequest.FromString,
+                    response_serializer=vibe_dot_v1_dot_control__pb2.ValidateJevSchemaResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -786,6 +883,168 @@ class ModelController:
             '/vibe.v1.ModelController/WriteRegistration',
             vibe_dot_v1_dot_control__pb2.WriteRegistrationRequest.SerializeToString,
             vibe_dot_v1_dot_control__pb2.WriteRegistrationResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetActiveJev(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vibe.v1.ModelController/GetActiveJev',
+            vibe_dot_v1_dot_control__pb2.GetActiveJevRequest.SerializeToString,
+            vibe_dot_v1_dot_control__pb2.ActiveJev.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListJevSchemas(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vibe.v1.ModelController/ListJevSchemas',
+            vibe_dot_v1_dot_control__pb2.ListJevSchemasRequest.SerializeToString,
+            vibe_dot_v1_dot_control__pb2.ListJevSchemasResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetJevSchema(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vibe.v1.ModelController/GetJevSchema',
+            vibe_dot_v1_dot_control__pb2.GetJevSchemaRequest.SerializeToString,
+            vibe_dot_v1_dot_control__pb2.GetJevSchemaResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PutJevSchema(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vibe.v1.ModelController/PutJevSchema',
+            vibe_dot_v1_dot_control__pb2.PutJevSchemaRequest.SerializeToString,
+            vibe_dot_v1_dot_control__pb2.PutJevSchemaResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteJevSchema(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vibe.v1.ModelController/DeleteJevSchema',
+            vibe_dot_v1_dot_control__pb2.DeleteJevSchemaRequest.SerializeToString,
+            vibe_dot_v1_dot_control__pb2.DeleteJevSchemaResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ValidateJevSchema(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vibe.v1.ModelController/ValidateJevSchema',
+            vibe_dot_v1_dot_control__pb2.ValidateJevSchemaRequest.SerializeToString,
+            vibe_dot_v1_dot_control__pb2.ValidateJevSchemaResponse.FromString,
             options,
             channel_credentials,
             insecure,

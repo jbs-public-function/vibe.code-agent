@@ -37,6 +37,7 @@
     <span class="ts">{{ event.ts_unix_ms|ts }}</span>
     <span class="level">{{ event.level }}</span>
     <span class="badge badge-{{ event.state|statename|lower }}">{{ event.state|statename }}</span>
+    {% if event.error_code %}<span class="badge badge-error">{{ event.error_code }}</span>{% endif %}
     {% if event.progress %}<span class="dim">{{ "%.0f%%"|format(event.progress * 100) }}</span>{% endif %}
     {{ event.message }}
   </li>

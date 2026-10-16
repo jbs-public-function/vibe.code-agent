@@ -9,6 +9,9 @@
     <h2>Active model</h2>
     <dl>
       <dt>Alias</dt><dd><code>{{ active_alias or "none" }}</code></dd>
+      {% if jev %}
+      <dt>Jev</dt><dd><span class="badge badge-ready">Jev: {{ jev.schema_name }} ({{ jev.sha256[:12] }})</span>{% if jev.stale %} <span class="badge badge-stale">stale</span>{% endif %}</dd>
+      {% endif %}
       <dt>State</dt><dd><span class="badge badge-{{ state|lower }}">{{ state }}</span></dd>
       <dt>Port</dt><dd>{{ host_port or "—" }}</dd>
       <dt>Container</dt><dd><code>{{ container_id }}</code></dd>

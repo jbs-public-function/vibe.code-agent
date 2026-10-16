@@ -15,12 +15,13 @@ CLI expects:
 from __future__ import annotations
 
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Sequence
-from typing import NoReturn, Self
+from typing import Any, NoReturn, Self
 
 import grpc
 
 from vibe.config import Settings
 from vibe.gen.vibe.v1 import control_pb2, control_pb2_grpc
+from vibe.jev import JevError
 from vibe.jobs import JobInProgress
 
 
@@ -40,6 +41,20 @@ class NoModelLoaded(RuntimeError):
 
 class UpstreamError(RuntimeError):
     """`Chat`: the model server answered with an error status (IMP-02.25)."""
+
+
+class JevSchemaNotFound(JevError):
+    """A Jev schema RPC named a schema the store does not have (JEV-02.8)."""
+
+    def __init__(self, message: str = "no such Jev schema") -> None:
+        super().__init__("jev_schema_not_found", message)
+
+
+class JevReadOnly(JevError):
+    """`DeleteJevSchema` on a built-in-only name (FAILED_PRECONDITION)."""
+
+    def __init__(self, message: str = "built-in schemas are read-only") -> None:
+        super().__init__("readonly", message)
 
 
 class ControllerClient:
@@ -80,6 +95,7 @@ class ControllerClient:
         alias: str | None = None,
         failed_precondition: type[Exception] = JobInProgress,
         unavailable_with: str | None = None,
+        not_found: type[Exception] = KeyError,
     ) -> NoReturn:
         """Convert an `AioRpcError` into the Python exception the CLI expects.
 
@@ -88,7 +104,7 @@ class ControllerClient:
         "no model loaded") and `unavailable_with="model server returned"`
         (an UNAVAILABLE whose details start with that prefix means the
         vLLM upstream answered with an error, not that the controller is
-        down).
+        down). Jev RPCs pass `not_found=JevSchemaNotFound` (JEV-02.8).
         """
         code = exc.code()
         details = exc.details() or ""
@@ -103,7 +119,9 @@ class ControllerClient:
                 message += f" ({details})"
             raise ControllerUnavailable(message) from exc
         if code is grpc.StatusCode.NOT_FOUND:
-            raise KeyError(alias if alias is not None else details) from exc
+            if not_found is KeyError:
+                raise KeyError(alias if alias is not None else details) from exc
+            raise not_found(details) from exc
         if code is grpc.StatusCode.FAILED_PRECONDITION:
             if details:
                 raise failed_precondition(details) from exc
@@ -111,13 +129,13 @@ class ControllerClient:
         raise RuntimeError(details or str(exc)) from exc
 
     async def _unary[T](
-        self, call: Awaitable[T], *, alias: str | None = None
+        self, call: Awaitable[T], *, alias: str | None = None, **translate
     ) -> T:
         """Await a unary RPC, translating `AioRpcError`."""
         try:
             return await call
         except grpc.aio.AioRpcError as exc:
-            self._raise_translated(exc, alias=alias)
+            self._raise_translated(exc, alias=alias, **translate)
 
     async def _iter_stream[T](
         self, stream: AsyncIterable[T], *, alias: str | None = None, **translate
@@ -156,17 +174,22 @@ class ControllerClient:
         force: bool = False,
         keep_failed: bool = False,
         timeout_s: int | None = None,
+        jev_mode: Any = control_pb2.JEV_MODE_UNSPECIFIED,
+        jev: control_pb2.JevSpec | None = None,
     ) -> AsyncIterator[control_pb2.JobEvent]:
         """Load a model, streaming `JobEvent`s until a terminal state.
 
-        Raises `KeyError(alias)` for an unknown alias and `JobInProgress` when
-        another job is already running (FR-02.3).
+        `jev_mode`/`jev` (JEV-02.3) default to UNSPECIFIED — today's
+        behaviour exactly. Raises `KeyError(alias)` for an unknown alias and
+        `JobInProgress` when another job is already running (FR-02.3).
         """
         request = control_pb2.LoadModelRequest(
             alias=alias,
             force=force,
             keep_failed=keep_failed,
             timeout_s=timeout_s or 0,  # 0 = use VIBE_LOAD_TIMEOUT
+            jev_mode=jev_mode,
+            jev=jev,
         )
         # IMP-02.26: creating the stub stream never raises — errors surface
         # on iteration, where `_iter_stream` translates them.
@@ -323,3 +346,56 @@ class ControllerClient:
                 control_pb2.WriteRegistrationRequest(spec=spec)
             )
         )
+
+    # -- Jev (improvements-2, doc 02) ----------------------------------------
+
+    async def get_active_jev(self) -> control_pb2.ActiveJev:
+        """The attached Jev schema + provenance; empty message when off."""
+        return await self._unary(
+            self._stub.GetActiveJev(control_pb2.GetActiveJevRequest())
+        )
+
+    async def list_jev_schemas(self) -> list[control_pb2.JevSchemaEntry]:
+        """Every visible Jev schema (built-in/user/override) with status."""
+        response = await self._unary(
+            self._stub.ListJevSchemas(control_pb2.ListJevSchemasRequest())
+        )
+        return list(response.schemas)
+
+    async def get_jev_schema(self, name: str) -> control_pb2.GetJevSchemaResponse:
+        """One schema's body; `JevSchemaNotFound` for unknown names."""
+        return await self._unary(
+            self._stub.GetJevSchema(control_pb2.GetJevSchemaRequest(name=name)),
+            not_found=JevSchemaNotFound,
+        )
+
+    async def put_jev_schema(
+        self, name: str, schema_json: str
+    ) -> control_pb2.PutJevSchemaResponse:
+        """Validate + store one schema; validation failures are data."""
+        return await self._unary(
+            self._stub.PutJevSchema(
+                control_pb2.PutJevSchemaRequest(name=name, schema_json=schema_json)
+            )
+        )
+
+    async def delete_jev_schema(
+        self, name: str
+    ) -> control_pb2.DeleteJevSchemaResponse:
+        """Delete a user schema; built-ins raise `JevReadOnly`."""
+        return await self._unary(
+            self._stub.DeleteJevSchema(
+                control_pb2.DeleteJevSchemaRequest(name=name)
+            ),
+            not_found=JevSchemaNotFound,
+            failed_precondition=JevReadOnly,
+        )
+
+    async def validate_jev_schema(self, schema_json: str) -> control_pb2.JevValidation:
+        """Dry-run validation (the controller's authoritative answer)."""
+        response = await self._unary(
+            self._stub.ValidateJevSchema(
+                control_pb2.ValidateJevSchemaRequest(schema_json=schema_json)
+            )
+        )
+        return response.validation

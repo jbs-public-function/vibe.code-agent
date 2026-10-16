@@ -67,22 +67,31 @@ def _forwarded(headers: Mapping[str, str]) -> list[tuple[str, str]]:
 
 
 async def stream_proxy(
-    request: Request, upstream_base: str, body: bytes, http: httpx.AsyncClient
+    request: Request,
+    upstream_base: str,
+    body: bytes,
+    http: httpx.AsyncClient,
+    extra_headers: Mapping[str, str] | None = None,
 ) -> StreamingResponse:
     """Forward `request` to `upstream_base` and relay the streamed response.
 
-    Raises `UpstreamError` when the upstream cannot be reached (FR-03.9).
-    Non-2xx HTTP responses are *not* errors — they are relayed verbatim.
+    `extra_headers` (JEV-03.5) are appended to the relayed response headers;
+    `None` leaves them untouched. Raises `UpstreamError` when the upstream
+    cannot be reached (FR-03.9). Non-2xx HTTP responses are *not* errors —
+    they are relayed verbatim.
     """
     target = upstream_base + request.url.path
     if request.url.query:
         target += f"?{request.url.query}"
     # IMP-03.12: drop the client's Host (httpx sets its own for the upstream
     # target) and preserve it as X-Forwarded-Host for upstreams that care.
+    # JEV-03.4: drop Content-Length too — the body may have been re-serialised
+    # (Jev injection), so the client's value is stale; httpx recomputes it
+    # from `content=` (identical in plain mode, so JEV-X.8 still holds).
     forwarded = [
         (name, value)
         for name, value in _forwarded(request.headers)
-        if name.lower() != "host"
+        if name.lower() not in ("host", "content-length")
     ]
     client_host = request.headers.get("host")
     if client_host:
@@ -108,6 +117,14 @@ async def stream_proxy(
         (name.encode("latin-1"), value.encode("latin-1"))
         for name, value in _forwarded_pairs(response.headers.multi_items())
     ]
+    if extra_headers:
+        # JEV-03.5: gateway-added headers (X-Vibe-Jev / X-Vibe-Jev-Overrode)
+        # ride on the relayed response; `MutableHeaders(raw=...)` preserves
+        # duplicates, which is fine for these single-valued names.
+        raw_headers.extend(
+            (name.encode("latin-1"), value.encode("latin-1"))
+            for name, value in extra_headers.items()
+        )
 
     async def relay() -> AsyncIterator[bytes]:
         try:

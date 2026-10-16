@@ -58,6 +58,11 @@ async def models_page(request: Request) -> Response:
             "controller_down": controller_down,
             "infos": infos if infos is not None else [],
             "active_alias": status.active_alias if status is not None else "",
+            "active_jev": (
+                status.jev.schema_name
+                if status is not None and status.HasField("jev")
+                else ""
+            ),
             "downloadable": downloadable,
         },
         error=infos_error or status_error,
@@ -72,7 +77,9 @@ async def _start_job(
     agen = client.unload() if unload else client.load(alias, force=force)
     kind = "UNLOAD" if unload else "LOAD"
     try:
-        job_id = await start_background_job(request, agen, kind, alias if not unload else "")
+        job_id, _first = await start_background_job(
+            request, agen, kind, alias if not unload else ""
+        )
     except JobInProgress:
         status = await grpc(client.status())
         existing = ""

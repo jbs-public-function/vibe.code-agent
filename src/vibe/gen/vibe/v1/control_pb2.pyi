@@ -22,6 +22,12 @@ class JobKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     LOAD: _ClassVar[JobKind]
     UNLOAD: _ClassVar[JobKind]
     DOWNLOAD: _ClassVar[JobKind]
+
+class JevMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    JEV_MODE_UNSPECIFIED: _ClassVar[JevMode]
+    JEV_ON: _ClassVar[JevMode]
+    JEV_OFF: _ClassVar[JevMode]
 MODEL_STATE_UNSPECIFIED: ModelState
 AVAILABLE: ModelState
 LOADING: ModelState
@@ -32,6 +38,9 @@ JOB_KIND_UNSPECIFIED: JobKind
 LOAD: JobKind
 UNLOAD: JobKind
 DOWNLOAD: JobKind
+JEV_MODE_UNSPECIFIED: JevMode
+JEV_ON: JevMode
+JEV_OFF: JevMode
 
 class ModelInfo(_message.Message):
     __slots__ = ("alias", "display_name", "hf_repo", "quantization", "max_model_len", "gpu_memory_utilization", "host_port", "tags", "use_case", "state", "cached_locally", "container_name", "extra_args", "yaml_preview")
@@ -80,7 +89,7 @@ class GetStatusRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class Status(_message.Message):
-    __slots__ = ("active_alias", "state", "container_id", "host_port", "started_at_unix", "current_job", "last_error")
+    __slots__ = ("active_alias", "state", "container_id", "host_port", "started_at_unix", "current_job", "last_error", "jev")
     ACTIVE_ALIAS_FIELD_NUMBER: _ClassVar[int]
     STATE_FIELD_NUMBER: _ClassVar[int]
     CONTAINER_ID_FIELD_NUMBER: _ClassVar[int]
@@ -88,6 +97,7 @@ class Status(_message.Message):
     STARTED_AT_UNIX_FIELD_NUMBER: _ClassVar[int]
     CURRENT_JOB_FIELD_NUMBER: _ClassVar[int]
     LAST_ERROR_FIELD_NUMBER: _ClassVar[int]
+    JEV_FIELD_NUMBER: _ClassVar[int]
     active_alias: str
     state: ModelState
     container_id: str
@@ -95,7 +105,8 @@ class Status(_message.Message):
     started_at_unix: int
     current_job: Job
     last_error: str
-    def __init__(self, active_alias: _Optional[str] = ..., state: _Optional[_Union[ModelState, str]] = ..., container_id: _Optional[str] = ..., host_port: _Optional[int] = ..., started_at_unix: _Optional[int] = ..., current_job: _Optional[_Union[Job, _Mapping]] = ..., last_error: _Optional[str] = ...) -> None: ...
+    jev: JevInfo
+    def __init__(self, active_alias: _Optional[str] = ..., state: _Optional[_Union[ModelState, str]] = ..., container_id: _Optional[str] = ..., host_port: _Optional[int] = ..., started_at_unix: _Optional[int] = ..., current_job: _Optional[_Union[Job, _Mapping]] = ..., last_error: _Optional[str] = ..., jev: _Optional[_Union[JevInfo, _Mapping]] = ...) -> None: ...
 
 class Job(_message.Message):
     __slots__ = ("id", "kind", "alias", "started_at_unix", "done", "ok", "terminal", "last_error", "started_at_unix_ms", "finished_at_unix_ms")
@@ -128,7 +139,7 @@ class GetJobRequest(_message.Message):
     def __init__(self, job_id: _Optional[str] = ...) -> None: ...
 
 class JobEvent(_message.Message):
-    __slots__ = ("job_id", "ts_unix_ms", "level", "message", "state", "progress", "terminal", "kind", "alias")
+    __slots__ = ("job_id", "ts_unix_ms", "level", "message", "state", "progress", "terminal", "kind", "alias", "error_code")
     JOB_ID_FIELD_NUMBER: _ClassVar[int]
     TS_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
     LEVEL_FIELD_NUMBER: _ClassVar[int]
@@ -138,6 +149,7 @@ class JobEvent(_message.Message):
     TERMINAL_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     ALIAS_FIELD_NUMBER: _ClassVar[int]
+    ERROR_CODE_FIELD_NUMBER: _ClassVar[int]
     job_id: str
     ts_unix_ms: int
     level: str
@@ -147,19 +159,24 @@ class JobEvent(_message.Message):
     terminal: bool
     kind: JobKind
     alias: str
-    def __init__(self, job_id: _Optional[str] = ..., ts_unix_ms: _Optional[int] = ..., level: _Optional[str] = ..., message: _Optional[str] = ..., state: _Optional[_Union[ModelState, str]] = ..., progress: _Optional[float] = ..., terminal: _Optional[bool] = ..., kind: _Optional[_Union[JobKind, str]] = ..., alias: _Optional[str] = ...) -> None: ...
+    error_code: str
+    def __init__(self, job_id: _Optional[str] = ..., ts_unix_ms: _Optional[int] = ..., level: _Optional[str] = ..., message: _Optional[str] = ..., state: _Optional[_Union[ModelState, str]] = ..., progress: _Optional[float] = ..., terminal: _Optional[bool] = ..., kind: _Optional[_Union[JobKind, str]] = ..., alias: _Optional[str] = ..., error_code: _Optional[str] = ...) -> None: ...
 
 class LoadModelRequest(_message.Message):
-    __slots__ = ("alias", "force", "keep_failed", "timeout_s")
+    __slots__ = ("alias", "force", "keep_failed", "timeout_s", "jev_mode", "jev")
     ALIAS_FIELD_NUMBER: _ClassVar[int]
     FORCE_FIELD_NUMBER: _ClassVar[int]
     KEEP_FAILED_FIELD_NUMBER: _ClassVar[int]
     TIMEOUT_S_FIELD_NUMBER: _ClassVar[int]
+    JEV_MODE_FIELD_NUMBER: _ClassVar[int]
+    JEV_FIELD_NUMBER: _ClassVar[int]
     alias: str
     force: bool
     keep_failed: bool
     timeout_s: int
-    def __init__(self, alias: _Optional[str] = ..., force: _Optional[bool] = ..., keep_failed: _Optional[bool] = ..., timeout_s: _Optional[int] = ...) -> None: ...
+    jev_mode: JevMode
+    jev: JevSpec
+    def __init__(self, alias: _Optional[str] = ..., force: _Optional[bool] = ..., keep_failed: _Optional[bool] = ..., timeout_s: _Optional[int] = ..., jev_mode: _Optional[_Union[JevMode, str]] = ..., jev: _Optional[_Union[JevSpec, _Mapping]] = ...) -> None: ...
 
 class UnloadModelRequest(_message.Message):
     __slots__ = ()
@@ -436,3 +453,151 @@ class RemoveCachedResponse(_message.Message):
     removed: bool
     error: str
     def __init__(self, removed: _Optional[bool] = ..., error: _Optional[str] = ...) -> None: ...
+
+class JevSpec(_message.Message):
+    __slots__ = ("schema_name", "schema_json", "save_as")
+    SCHEMA_NAME_FIELD_NUMBER: _ClassVar[int]
+    SCHEMA_JSON_FIELD_NUMBER: _ClassVar[int]
+    SAVE_AS_FIELD_NUMBER: _ClassVar[int]
+    schema_name: str
+    schema_json: str
+    save_as: str
+    def __init__(self, schema_name: _Optional[str] = ..., schema_json: _Optional[str] = ..., save_as: _Optional[str] = ...) -> None: ...
+
+class JevInfo(_message.Message):
+    __slots__ = ("schema_name", "sha256", "source", "applied_at_unix_ms", "stale", "title")
+    SCHEMA_NAME_FIELD_NUMBER: _ClassVar[int]
+    SHA256_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    APPLIED_AT_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    STALE_FIELD_NUMBER: _ClassVar[int]
+    TITLE_FIELD_NUMBER: _ClassVar[int]
+    schema_name: str
+    sha256: str
+    source: str
+    applied_at_unix_ms: int
+    stale: bool
+    title: str
+    def __init__(self, schema_name: _Optional[str] = ..., sha256: _Optional[str] = ..., source: _Optional[str] = ..., applied_at_unix_ms: _Optional[int] = ..., stale: _Optional[bool] = ..., title: _Optional[str] = ...) -> None: ...
+
+class GetActiveJevRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class ActiveJev(_message.Message):
+    __slots__ = ("info", "schema_json")
+    INFO_FIELD_NUMBER: _ClassVar[int]
+    SCHEMA_JSON_FIELD_NUMBER: _ClassVar[int]
+    info: JevInfo
+    schema_json: str
+    def __init__(self, info: _Optional[_Union[JevInfo, _Mapping]] = ..., schema_json: _Optional[str] = ...) -> None: ...
+
+class ListJevSchemasRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class JevSchemaEntry(_message.Message):
+    __slots__ = ("name", "source", "sha256", "size_bytes", "mtime_unix_ms", "title", "active")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    SHA256_FIELD_NUMBER: _ClassVar[int]
+    SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    MTIME_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    TITLE_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    source: str
+    sha256: str
+    size_bytes: int
+    mtime_unix_ms: int
+    title: str
+    active: bool
+    def __init__(self, name: _Optional[str] = ..., source: _Optional[str] = ..., sha256: _Optional[str] = ..., size_bytes: _Optional[int] = ..., mtime_unix_ms: _Optional[int] = ..., title: _Optional[str] = ..., active: _Optional[bool] = ...) -> None: ...
+
+class ListJevSchemasResponse(_message.Message):
+    __slots__ = ("schemas",)
+    SCHEMAS_FIELD_NUMBER: _ClassVar[int]
+    schemas: _containers.RepeatedCompositeFieldContainer[JevSchemaEntry]
+    def __init__(self, schemas: _Optional[_Iterable[_Union[JevSchemaEntry, _Mapping]]] = ...) -> None: ...
+
+class GetJevSchemaRequest(_message.Message):
+    __slots__ = ("name",)
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    def __init__(self, name: _Optional[str] = ...) -> None: ...
+
+class GetJevSchemaResponse(_message.Message):
+    __slots__ = ("name", "source", "sha256", "size_bytes", "mtime_unix_ms", "title", "schema_json")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    SHA256_FIELD_NUMBER: _ClassVar[int]
+    SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    MTIME_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    TITLE_FIELD_NUMBER: _ClassVar[int]
+    SCHEMA_JSON_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    source: str
+    sha256: str
+    size_bytes: int
+    mtime_unix_ms: int
+    title: str
+    schema_json: str
+    def __init__(self, name: _Optional[str] = ..., source: _Optional[str] = ..., sha256: _Optional[str] = ..., size_bytes: _Optional[int] = ..., mtime_unix_ms: _Optional[int] = ..., title: _Optional[str] = ..., schema_json: _Optional[str] = ...) -> None: ...
+
+class PutJevSchemaRequest(_message.Message):
+    __slots__ = ("name", "schema_json")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    SCHEMA_JSON_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    schema_json: str
+    def __init__(self, name: _Optional[str] = ..., schema_json: _Optional[str] = ...) -> None: ...
+
+class JevValidation(_message.Message):
+    __slots__ = ("ok", "errors", "warnings", "sha256", "size_bytes")
+    OK_FIELD_NUMBER: _ClassVar[int]
+    ERRORS_FIELD_NUMBER: _ClassVar[int]
+    WARNINGS_FIELD_NUMBER: _ClassVar[int]
+    SHA256_FIELD_NUMBER: _ClassVar[int]
+    SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    ok: bool
+    errors: _containers.RepeatedScalarFieldContainer[str]
+    warnings: _containers.RepeatedScalarFieldContainer[str]
+    sha256: str
+    size_bytes: int
+    def __init__(self, ok: _Optional[bool] = ..., errors: _Optional[_Iterable[str]] = ..., warnings: _Optional[_Iterable[str]] = ..., sha256: _Optional[str] = ..., size_bytes: _Optional[int] = ...) -> None: ...
+
+class PutJevSchemaResponse(_message.Message):
+    __slots__ = ("validation", "error")
+    VALIDATION_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    validation: JevValidation
+    error: str
+    def __init__(self, validation: _Optional[_Union[JevValidation, _Mapping]] = ..., error: _Optional[str] = ...) -> None: ...
+
+class DeleteJevSchemaRequest(_message.Message):
+    __slots__ = ("name",)
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    def __init__(self, name: _Optional[str] = ...) -> None: ...
+
+class DeleteJevSchemaResponse(_message.Message):
+    __slots__ = ("ok", "error", "reverted_to")
+    OK_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    REVERTED_TO_FIELD_NUMBER: _ClassVar[int]
+    ok: bool
+    error: str
+    reverted_to: str
+    def __init__(self, ok: _Optional[bool] = ..., error: _Optional[str] = ..., reverted_to: _Optional[str] = ...) -> None: ...
+
+class ValidateJevSchemaRequest(_message.Message):
+    __slots__ = ("schema_json",)
+    SCHEMA_JSON_FIELD_NUMBER: _ClassVar[int]
+    schema_json: str
+    def __init__(self, schema_json: _Optional[str] = ...) -> None: ...
+
+class ValidateJevSchemaResponse(_message.Message):
+    __slots__ = ("validation",)
+    VALIDATION_FIELD_NUMBER: _ClassVar[int]
+    validation: JevValidation
+    def __init__(self, validation: _Optional[_Union[JevValidation, _Mapping]] = ...) -> None: ...

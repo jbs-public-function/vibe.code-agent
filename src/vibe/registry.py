@@ -37,6 +37,9 @@ if TYPE_CHECKING:
 ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 PORT_MIN, PORT_MAX = 1, 65535
 
+# Jev schema names share the store's name rules (JEV-02.9).
+JEVE_SCHEMA_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
 # `vibe register` defaults allocate host ports in this range (FR-04.5).
 REGISTER_PORT_MIN, REGISTER_PORT_MAX = 8010, 8099
 
@@ -82,6 +85,10 @@ class ModelSpec(BaseModel):
     extra_args: list[str] = Field(default_factory=list)
     use_case: str = ""
     tags: list[str] = Field(default_factory=list)
+    # Jev (improvements-2, JEV-02.9/JEV-02.10): optional per-model default
+    # schema name and a capability flag (`false` opts the model out).
+    jev_schema: str | None = None
+    jev: bool | None = None
 
     @field_validator("alias")
     @classmethod
@@ -90,6 +97,16 @@ class ModelSpec(BaseModel):
             raise ValueError(
                 f"alias '{v}' must match {ALIAS_RE.pattern} "
                 "(lowercase letters, digits, '.', '-'; must start with letter/digit)"
+            )
+        return v
+
+    @field_validator("jev_schema")
+    @classmethod
+    def _check_jev_schema(cls, v: str | None) -> str | None:
+        if v is not None and not JEVE_SCHEMA_NAME_RE.match(v):
+            raise ValueError(
+                f"jev_schema '{v}' must match {JEVE_SCHEMA_NAME_RE.pattern} "
+                "(lowercase letters/digits, '.', '_', '-'; max 64 chars)"
             )
         return v
 

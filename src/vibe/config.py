@@ -19,6 +19,10 @@ CONTROLLER_PORT = 50051
 GATEWAY_PORT = 8080
 ADMIN_PORT = 8081
 
+# Default Jev schema store: the repo's `jev/` directory (JEV-01.11). The
+# controller persists its active-Jev state file (`.active.json`) there too.
+DEFAULT_JEV_DIR = str(Path(__file__).resolve().parents[2] / "jev")
+
 
 class Settings(BaseSettings):
     """vibe configuration.
@@ -38,6 +42,7 @@ class Settings(BaseSettings):
     vibe_load_timeout: int = 600
     vibe_log_level: str = "info"
     vllm_image_tag: str = ""
+    vibe_jev_dir: str = DEFAULT_JEV_DIR
 
     @field_validator("vllm_image_tag")
     @classmethod
@@ -70,6 +75,18 @@ class Settings(BaseSettings):
     @property
     def controller_target(self) -> str:
         return f"{self.vibe_bind}:{CONTROLLER_PORT}"
+
+    @property
+    def jev_dir(self) -> Path:
+        """User Jev schema store (env `VIBE_JEV_DIR`, default `<repo>/jev`).
+
+        Relative values (e.g. `.env.example`'s ``VIBE_JEV_DIR=jev``) resolve
+        against the repo root next to `models.yaml`.
+        """
+        path = Path(self.vibe_jev_dir).expanduser()
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parents[2] / path
+        return path
 
 
 class ConfigError(Exception):

@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}Jev schema{% endblock title %}
+{% block content %}
+{% set can_post = name_editable or name|length > 0 %}
+<h1>{% if name_editable %}New Jev schema{% else %}Jev schema <code>{{ name }}</code>{% endif %}</h1>
+
+{% if conflict %}
+<div class="flash" role="alert">This schema changed since you opened it — the current stored text is shown below. Review it before saving again.</div>
+{% endif %}
+{% if errors %}
+<div class="flash" role="alert">
+  {% for error in errors %}<p>{{ error }}</p>{% endfor %}
+</div>
+{% endif %}
+{% for warning in warnings %}<p class="warn" role="status">warning: {{ warning }}</p>{% endfor %}
+{% if notice %}<div class="flash" role="status">{{ notice }}</div>{% endif %}
+
+{% if builtin %}
+<div class="flash" role="status">Built-in schema — read-only. <a href="{{ path_for('jev_new') }}?name={{ name }}">Create editable copy</a> to change it (saving writes a user override).</div>
+{% endif %}
+
+<section class="card">
+  {% if can_post %}
+  <form method="post" action="{% if name_editable %}{{ path_for('jev_new_post') }}{% else %}{{ path_for('jev_edit_post', name=name) }}{% endif %}">
+  {% endif %}
+    {% if name_editable %}
+    <label for="name">Name</label>
+    <input name="name" id="name" value="{{ name }}" required pattern="[a-z0-9][a-z0-9._-]{0,63}" spellcheck="false">
+    {% endif %}
+    <label for="schema_json">Schema (JSON)</label>
+    <textarea name="schema_json" id="schema_json" rows="28" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" class="code" {% if builtin %}readonly{% endif %}>{{ schema_json }}</textarea>
+    {% if can_post %}
+    <input type="hidden" name="base_sha" value="{{ base_sha }}">
+    {% if not builtin %}
+    <div class="inline">
+      <label for="alias">Model</label>
+      <select name="alias" id="alias" {% if controller_down %}disabled{% endif %}>
+        {% for info in infos %}
+        <option value="{{ info.alias }}">{{ info.alias }}</option>
+        {% endfor %}
+      </select>
+      <label><input type="checkbox" name="force" value="on"> Force reload</label>
+    </div>
+    <div class="inline">
+      <button type="submit" name="action" value="validate">Validate</button>
+      <button type="submit" name="action" value="save">Save</button>
+      <button type="submit" name="action" value="save_launch">Save &amp; launch</button>
+      <button type="submit" name="action" value="launch_unsaved">Launch without saving</button>
+    </div>
+    {% if reasoning_models %}
+    <p class="warn">Note: {{ reasoning_models|join(", ") }} tagged 'reasoning' — structured output suppresses thinking tokens; quality may drop.</p>
+    {% endif %}
+    <p class="dim">Save stores the schema; live behaviour changes only after a launch. Save &amp; launch stores first, then attaches it to the model.</p>
+    {% endif %}
+    {% endif %}
+  {% if can_post %}
+  </form>
+  {% endif %}
+</section>
+
+{% if not builtin %}
+<section class="card">
+  <h2>Quick builder</h2>
+  <form method="post" action="{{ path_for('jev_build') }}">
+    <input type="hidden" name="name" value="{{ name }}">
+    <input type="hidden" name="name_editable" value="{% if name_editable %}on{% endif %}">
+    <input type="hidden" name="base_sha" value="{{ base_sha }}">
+    <input type="hidden" name="schema_json" value="{{ schema_json }}">
+    <p>
+      <label><input type="checkbox" name="decision_choice" value="on" checked> Choice</label>
+      <label><input type="checkbox" name="decision_boolean" value="on" checked> Boolean</label>
+      <label><input type="checkbox" name="decision_score" value="on" checked> Score</label>
+    </p>
+    <label for="choice_options">Choice options (one per line)</label>
+    <textarea name="choice_options" id="choice_options" rows="3">YES
+NO</textarea>
+    <div class="inline">
+      <label for="score_min">Score min</label>
+      <input name="score_min" id="score_min" value="0" size="4">
+      <label for="score_max">Score max</label>
+      <input name="score_max" id="score_max" value="1" size="4">
+    </div>
+    <p>
+      <label><input type="checkbox" name="include_confidence" value="on" checked> Include confidence</label>
+      <label><input type="checkbox" name="additional_properties" value="on" checked> additionalProperties: false</label>
+    </p>
+    <div class="inline">
+      <button type="submit">Generate schema</button>
+    </div>
+  </form>
+  <p class="dim">Generates a discriminated oneOf decision schema into the editor above — nothing is saved.</p>
+</section>
+{% endif %}
+{% endblock content %}

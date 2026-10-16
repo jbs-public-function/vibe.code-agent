@@ -40,7 +40,8 @@ help:
 	@echo "  make chat        - Stream a test chat through the gateway (8080)"
 	@echo "  make tls         - Optional TLS front; requires Docker"
 	@echo "  make tls-stop    - Stop the optional TLS front"
-	@echo "  make proto       - Regenerate committed gRPC code from proto/vibe/v1/control.proto"
+	@echo "  make proto       - Regenerate committed gRPC code from proto/vibe/v1/control.proto
+	  make jev         - Load a model in Jev mode: make jev ALIAS=… [SCHEMA=file.json] (P2, JEV-04.10)"
 	@echo "  make typecheck   - Run pyright over src/ and tests/"
 	@echo "  make check       - Full pre-commit gate: lock, tests, pyright, torch-free sync"
 	@echo "  make lab         - Open a shell in the laboratory container (torch + CUDA)"
@@ -63,6 +64,13 @@ chat:      ; $(PY) scripts/test_chat.py
 tls:       ; docker run -d --name vibe-caddy --network host -v vibe-caddy-data:/data -v $$(pwd)/deploy/Caddyfile:/etc/caddy/Caddyfile caddy:2-alpine
 tls-stop:  ; docker rm -f vibe-caddy
 kill-ghosts: stop
+
+# Jev (improvements-2, JEV-04.10): load with the default schema, or a custom
+# one via SCHEMA (maps to --include-json).
+#   make jev ALIAS=qwen2.5-coder-7b
+#   make jev ALIAS=qwen2.5-coder-7b SCHEMA=./jev/mine.json
+.PHONY: jev
+jev:      ; $(UV) load $(ALIAS) --jev $(if $(SCHEMA),--include-json $(SCHEMA))
 
 # Laboratory (FR-05.2/05.3): build the pinned pytorch image, drop into a shell
 # or run one lab script. IMP-05.2: --network host lets the lab reach the

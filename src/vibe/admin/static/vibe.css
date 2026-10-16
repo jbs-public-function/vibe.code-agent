@@ -91,6 +91,13 @@ button:hover { filter: brightness(1.08); }
 
 .inline { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.6rem 0; }
 
+/* Jev schema pages (JEV-05.3): monospace editor textarea + source badges. */
+textarea.code { font: 0.85rem/1.5 ui-monospace, monospace; }
+.badge-builtin { background: var(--line); color: var(--muted); }
+.badge-user { background: var(--ok-bg); color: var(--ok); }
+.badge-override { background: var(--warn-bg); color: var(--warn); }
+.badge-stale { background: var(--warn-bg); color: var(--warn); }
+
 .dim { color: var(--muted); }
 .warn { color: var(--warn); }
 .error { color: var(--err); }

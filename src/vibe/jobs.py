@@ -19,6 +19,14 @@ from vibe.docker_ctl import (
     ReadinessTimeout,
 )
 from vibe.gpu import GpuStats, get_gpu_stats
+from vibe.jev import JevError, SchemaStore
+from vibe.jev.control import (
+    JevLoadSpec,
+    JevState,
+    ResolvedJev,
+    probe_jev,
+    resolve_jev,
+)
 from vibe.registry import ModelSpec, Registry
 
 # Marks the end of the (blocking) docker logs iterator in `JobRunner.logs`.
@@ -55,6 +63,7 @@ class JobEvent:
     message: str
     state: JobState | None = None
     progress: float | None = None  # reserved for download jobs (Phase 4)
+    error_code: str | None = None  # set on terminal error events (Jev taxonomy)
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe representation; timestamps as ISO 8601 strings."""
@@ -64,6 +73,7 @@ class JobEvent:
             "message": self.message,
             "state": self.state.value if self.state is not None else None,
             "progress": self.progress,
+            "error_code": self.error_code,
         }
 
 
@@ -88,11 +98,19 @@ class JobRunner:
         registry: Registry,
         docker: DockerCtl | None = None,
         get_gpu_stats: Callable[[], GpuStats] = get_gpu_stats,
+        jev_store: SchemaStore | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
         self.docker = docker if docker is not None else DockerCtl(settings)
         self.get_gpu_stats = get_gpu_stats
+        # Jev (improvements-2): the runner owns the schema store and the
+        # active-attachment state (JEV-02.11); tests may inject a tmp store.
+        self.jev_store = jev_store if jev_store is not None else SchemaStore(
+            settings.jev_dir
+        )
+        self.jev_state = JevState(self.jev_store.active_path)
+        self.jev_state.load()
         self._job: Job | None = None
 
     # -- in-flight job -----------------------------------------------------
@@ -120,16 +138,33 @@ class JobRunner:
 
     # -- jobs --------------------------------------------------------------
 
+    async def _managed_running(self, alias: str) -> bool:
+        """Whether a running managed container serves `alias` (JEV-02.12)."""
+        managed = await asyncio.to_thread(self.docker.find_managed)
+        for existing in managed:
+            if existing.labels.get(ALIAS_LABEL) != alias:
+                continue
+            info = await asyncio.to_thread(self.docker.container_info, existing)
+            if "running" in str(info.get("status", "")).lower():
+                return True
+        return False
+
     async def load(
         self,
         alias: str,
         force: bool = False,
         keep_failed: bool = False,
         timeout_s: int | None = None,
+        jev_mode: str = "unspecified",
+        jev: JevLoadSpec | None = None,
     ) -> AsyncIterator[JobEvent]:
-        """Stream a load job: purge, start, wait for readiness (FR-00.5).
+        """Stream a load job: purge, start, wait for readiness (FR-00.5),
+        then optionally attach a Jev schema (JEV-02.12).
 
-        Raises KeyError for an unknown alias (the CLI maps it to exit code 3).
+        `jev_mode` ∈ {"unspecified", "on", "off"} (proto `JevMode` mapped
+        by the servicer). Attach/detach on an already-READY alias never
+        touches Docker (JEV-X.2). Raises KeyError for an unknown alias
+        (the CLI maps it to exit code 3).
         """
         spec: ModelSpec = self.registry.get(alias)
         job = self._acquire("load", alias)
@@ -137,6 +172,56 @@ class JobRunner:
         container: Any = None  # docker_ctl exports no container type (XR-5)
         outcome = JobState.ERROR
         try:
+            jev_mode = jev_mode or "unspecified"
+
+            # -- resolve the Jev schema up front (pure, no Docker, J4) -----
+            resolved: ResolvedJev | None = None
+            if jev_mode == "on":
+                if spec.jev is False:
+                    state = (
+                        JobState.READY
+                        if await self._managed_running(alias)
+                        else JobState.ERROR
+                    )
+                    yield JobEvent(
+                        _now(),
+                        "error",
+                        f"jev: '{alias}' has `jev: false` in models.yaml",
+                        state=state,
+                        error_code="jev_unsupported_model",
+                    )
+                    outcome = state
+                    return
+                try:
+                    resolved = resolve_jev(
+                        jev or JevLoadSpec(), spec, self.jev_store
+                    )
+                except JevError as exc:
+                    # JEV-02.17: a Jev-only failure leaves the model
+                    # untouched — the terminal state mirrors the model.
+                    state = (
+                        JobState.READY
+                        if await self._managed_running(alias)
+                        else JobState.ERROR
+                    )
+                    yield JobEvent(
+                        _now(),
+                        "error",
+                        f"jev: {exc}",
+                        state=state,
+                        error_code=exc.code,
+                    )
+                    outcome = state
+                    return
+                if "reasoning" in spec.tags:
+                    yield JobEvent(
+                        _now(),
+                        "warn",
+                        "jev: this model is tagged 'reasoning' — structured "
+                        "output suppresses <think>; quality may drop",
+                    )
+
+            # -- fast paths for an already-READY alias ---------------------
             if not force:
                 managed = await asyncio.to_thread(self.docker.find_managed)
                 for existing in managed:
@@ -148,15 +233,115 @@ class JobRunner:
                     # docker status strings: "running" | "exited" | "created" | ...
                     if "running" not in str(info.get("status", "")).lower():
                         continue
+
+                    if jev_mode == "on":
+                        # (b) attach/replace without a container restart.
+                        assert resolved is not None
+                        current = self.jev_state.current()
+                        if (
+                            current is not None
+                            and current.alias == alias
+                            and current.sha256 == resolved.sha256
+                        ):
+                            yield JobEvent(
+                                _now(),
+                                "info",
+                                f"jev: schema '{resolved.name}' already attached "
+                                f"(sha {resolved.sha256[:12]})",
+                                state=JobState.READY,
+                            )
+                            outcome = JobState.READY
+                            return
+                        yield JobEvent(
+                            _now(), "info", f"jev: probing '{resolved.name}'…"
+                        )
+                        try:
+                            await probe_jev(spec.host_port, alias, resolved.schema)
+                        except JevError as exc:
+                            yield JobEvent(
+                                _now(),
+                                "error",
+                                f"jev: {exc}",
+                                state=JobState.READY,
+                                error_code=exc.code,
+                            )
+                            outcome = JobState.READY
+                            return
+                        self.jev_state.set(
+                            alias, resolved.name, resolved.source, resolved.schema
+                        )
+                        yield JobEvent(
+                            _now(),
+                            "info",
+                            f"jev: attached '{resolved.name}' "
+                            f"({resolved.source}, sha {resolved.sha256[:12]})",
+                            state=JobState.READY,
+                        )
+                        if resolved.save_as:
+                            assert jev is not None
+                            saved = self.jev_store.put(
+                                resolved.save_as, jev.schema_json
+                            )
+                            if saved.ok:
+                                yield JobEvent(
+                                    _now(),
+                                    "info",
+                                    f"jev: saved inline schema as '{resolved.save_as}'",
+                                )
+                        outcome = JobState.READY
+                        return
+
+                    if jev_mode == "off":
+                        # (c) detach without a container restart.
+                        current = self.jev_state.current()
+                        if current is not None and current.alias == alias:
+                            self.jev_state.clear()
+                            yield JobEvent(
+                                _now(),
+                                "info",
+                                f"jev: detached '{current.name}'",
+                            )
+                        else:
+                            # jev_not_active is idempotent: an info event.
+                            yield JobEvent(
+                                _now(),
+                                "info",
+                                "jev: not active — nothing to detach",
+                            )
+                        yield JobEvent(
+                            _now(),
+                            "info",
+                            f"{alias} is already READY — Jev off",
+                            state=JobState.READY,
+                        )
+                        outcome = JobState.READY
+                        return
+
+                    # (e) JEV_UNSPECIFIED: unchanged behaviour plus a hint
+                    # when a Jev schema is active (JEV-02.12).
+                    message = f"{alias} is already READY — use --force to reload"
+                    current = self.jev_state.current()
+                    if current is not None and current.alias == alias:
+                        message += (
+                            f"\nJev '{current.name}' active — `--no-jev` or "
+                            "`vibe jev off` to detach"
+                        )
                     yield JobEvent(
                         _now(),
                         "info",
-                        f"{alias} is already READY — use --force to reload",
+                        message,
                         state=JobState.READY,
                     )
                     outcome = JobState.READY
                     return
 
+            # (d) JEV_OFF in every other case: a plain load.
+            if jev_mode == "off":
+                yield JobEvent(
+                    _now(), "info", "jev: off — loading without a schema"
+                )
+
+            # -- fresh load (a): purge, start, ready, then attach ----------
             yield JobEvent(
                 _now(),
                 "info",
@@ -164,6 +349,9 @@ class JobRunner:
                 state=JobState.UNLOADING,
             )
             purged = await asyncio.to_thread(self.docker.purge_all)
+            # JEV-02.13: any fresh load starts from a clean Jev slate — even
+            # when purge found nothing (stale state from a previous run).
+            self.jev_state.clear()
             if purged:
                 yield JobEvent(
                     _now(),
@@ -187,12 +375,60 @@ class JobRunner:
                 f" (up to {timeout_s}s)",
             )
             await self.docker.wait_ready(spec, timeout_s)
-            yield JobEvent(
-                _now(),
-                "info",
-                f"{spec.alias} READY at http://127.0.0.1:{spec.host_port}/v1",
-                state=JobState.READY,
+            ready_message = (
+                f"{spec.alias} READY at http://127.0.0.1:{spec.host_port}/v1"
             )
+            outcome = JobState.READY
+
+            if jev_mode == "on" and resolved is not None:
+                # Defer the terminal event until attach completes, so the
+                # client sees probe failures (JEV-02.17).
+                yield JobEvent(_now(), "info", ready_message)
+                yield JobEvent(
+                    _now(), "info", f"jev: probing '{resolved.name}'…"
+                )
+                try:
+                    await probe_jev(spec.host_port, alias, resolved.schema)
+                except JevError as exc:
+                    # JEV-02.17: the model is healthy; Jev is not. Terminal
+                    # state READY with error_code — clients key off the code.
+                    yield JobEvent(
+                        _now(),
+                        "error",
+                        f"jev: {exc}",
+                        state=JobState.READY,
+                        error_code=exc.code,
+                    )
+                    outcome = JobState.READY
+                    return
+                self.jev_state.set(
+                    alias, resolved.name, resolved.source, resolved.schema
+                )
+                yield JobEvent(
+                    _now(),
+                    "info",
+                    f"jev: attached '{resolved.name}' "
+                    f"({resolved.source}, sha {resolved.sha256[:12]})",
+                )
+                if resolved.save_as:
+                    assert jev is not None
+                    saved = self.jev_store.put(resolved.save_as, jev.schema_json)
+                    if saved.ok:
+                        yield JobEvent(
+                            _now(),
+                            "info",
+                            f"jev: saved inline schema as '{resolved.save_as}'",
+                        )
+                yield JobEvent(
+                    _now(),
+                    "info",
+                    f"{spec.alias} READY with Jev '{resolved.name}'",
+                    state=JobState.READY,
+                )
+                outcome = JobState.READY
+                return
+
+            yield JobEvent(_now(), "info", ready_message, state=JobState.READY)
             outcome = JobState.READY
         except (ContainerExited, ReadinessTimeout) as exc:
             message = str(exc)
@@ -233,6 +469,7 @@ class JobRunner:
                 state=JobState.UNLOADING,
             )
             purged = await asyncio.to_thread(self.docker.purge_all)
+            self.jev_state.clear()  # JEV-02.13: unload clears attached Jev state
             if purged:
                 yield JobEvent(
                     _now(),

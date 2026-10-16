@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "YesNoUnsure",
+  "description": "Jev preset: a YES/NO/UNSURE choice with a confidence. Allows an abstention.",
+  "type": "object",
+  "properties": {
+    "decision_type": { "const": "choice" },
+    "result": { "type": "string", "enum": ["YES", "NO", "UNSURE"], "description": "The chosen action." },
+    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+  },
+  "required": ["decision_type", "result", "confidence"],
+  "additionalProperties": false
+}

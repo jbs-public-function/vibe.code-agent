@@ -85,6 +85,7 @@ async def dashboard(request: Request) -> Response:
         "host_port": status.host_port,
         "uptime_s": uptime_s,
         "current_job": status.current_job,
+        "jev": status.jev if status.HasField("jev") else None,
         "last_error": status.last_error,
         "gpu": gpu,
         "util_pct": gpu.utilization_pct,

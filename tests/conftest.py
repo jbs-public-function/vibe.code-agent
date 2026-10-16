@@ -7,6 +7,7 @@ through the in-memory `FakeDocker` below.
 from __future__ import annotations
 
 import types
+from pathlib import Path
 
 import pytest
 
@@ -71,14 +72,17 @@ def valid_registry_dict() -> dict:
 
 
 @pytest.fixture
-def settings() -> Settings:
-    """Settings with a pinned image tag.
+def settings(tmp_path: Path) -> Settings:
+    """Settings with a pinned image tag and a hermetic Jev dir.
 
     Init kwargs take priority over environment variables and `.env`
     (pydantic-settings), so passing `vllm_image_tag` here is robust even if a
-    developer's `.env` grows a `VLLM_IMAGE_TAG` later.
+    developer's `.env` grows a `VLLM_IMAGE_TAG` later. `vibe_jev_dir` points
+    at a per-test tmp dir so the Jev store never touches the real repo `jev/`.
     """
-    return Settings(vllm_image_tag="v0.11.2")
+    return Settings(
+        vllm_image_tag="v0.11.2", vibe_jev_dir=str(tmp_path / "jev")
+    )
 
 
 @pytest.fixture

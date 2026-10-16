@@ -133,6 +133,7 @@ Every key is optional; defaults are in parentheses. See [`.env.example`](.env.ex
 | `VIBE_SWAP_ON_REQUEST` | `false` | Gateway loads a non-active model on request instead of returning 503. |
 | `VIBE_SWAP_TIMEOUT` | `180` | How long (s) the gateway waits for a swap-on-request. |
 | `VIBE_LOAD_TIMEOUT` | `600` | Load readiness timeout (s). |
+| `VIBE_JEV_DIR` | `<repo>/jev` | User Jev schema store; the controller keeps `.active.json` state here too. |
 | `VIBE_LOG_LEVEL` | `info` | Level for the shared structured logger. |
 | `VIBE_LOG_JSON` | _(unset)_ | `1` for JSON log lines instead of key=value. |
 | `VLLM_IMAGE_TAG` | _(required)_ | Pinned vLLM image tag — never `latest` (XR-6). |
@@ -146,6 +147,39 @@ make qwen
 make status
 ```
 
+### 3b. Jev — schema-constrained decisions
+
+**Jev** is a mode of the loaded model: every chat completion is forced to emit JSON conforming
+to a JSON Schema (vLLM structured outputs, `response_format: json_schema`). It is an overlay on the
+active model — attaching/detaching takes seconds and never restarts the container.
+
+```bash
+# Load with the built-in default schema (YES/NO choice, boolean, or 0..1 score)
+vibe load qwen2.5-coder-7b --jev
+
+# Load with a custom schema file (the -json suffix keeps it distinct from `vibe download --include`)
+vibe load qwen2.5-coder-7b --include-json ./jev/mine.json
+
+# …or with a stored schema (managed in the admin UI at /jev, or via the CLI)
+vibe load qwen2.5-coder-7b --schema yes-no
+
+# Same as above, via make:  make jev ALIAS=qwen2.5-coder-7b [SCHEMA=./jev/mine.json]
+
+# Schema management and status
+vibe jev schema list          # built-ins: default, yes-no, yes-no-unsure
+vibe jev schema validate ./jev/mine.json   # works without a running controller
+vibe jev schema put mine ./jev/mine.json
+vibe jev status               # active schema, source, sha, stale
+vibe jev off                  # detach (idempotent)
+```
+
+Schemas live in `${VIBE_JEV_DIR:-./jev}/<name>.json`; a user file named `default` shadows the
+built-in `default`. The gateway injects the schema per request for the active alias and rejects
+incompatible requests (`tools`/`tool_choice`, `/v1/completions`) with `400 jev_incompatible_request`.
+
+Limitations: chat completions only (no tools, no `/v1/completions` in Jev mode); reasoning models
+suppress `<think>` under structured output; editing a schema the admin UI offers an opt-in swap.
+
 ### 4. Troubleshooting
 
 | Symptom | Fix |
@@ -153,6 +187,7 @@ make status
 | `vibe status` says "controller unreachable" | Start it: `make serve` (or `vibe serve`). |
 | Chat returns `503 model_not_loaded` | `vibe load <alias>` first, or set `VIBE_SWAP_ON_REQUEST=true`. |
 | A load fails instantly / ports collide | `make kill-ghosts` purges stale managed and legacy containers, then retry. |
+| Chat returns `400 jev_incompatible_request` | Jev is active for this model: chat completions reject `tools`/`tool_choice` — send plain chat, or detach with `vibe jev off`. |
 | Admin UI links break behind `make tls` | Ensure Caddy forwards `X-Forwarded-Proto/Host` (default `reverse_proxy` does) and trust the CA with `caddy trust`. |
 | `uv sync` removes `pyright` | It is a dev dependency now — run `uv sync` once from a clean clone; `make check` is the gate. |
 

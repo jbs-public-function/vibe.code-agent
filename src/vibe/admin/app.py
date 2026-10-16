@@ -22,7 +22,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from vibe.admin.routes import chat, dashboard, developer, jobs, logs, models
+from vibe.admin.routes import chat, dashboard, developer, jev, jobs, logs, models
 from vibe.admin.routes import fmt_thousands, fmt_ts, fmt_uptime, job_kind_name
 from vibe.admin.security import CSP, SecurityMiddleware
 from vibe.admin.sessions import SessionStore
@@ -137,6 +137,7 @@ def build_app(settings: Settings, client: ControllerClient) -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(dashboard.router)
     app.include_router(models.router)
+    app.include_router(jev.router)
     app.include_router(jobs.router)
     app.include_router(chat.router)
     app.include_router(logs.router)

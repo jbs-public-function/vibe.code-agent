@@ -33,10 +33,13 @@ from pydantic import ValidationError
 from vibe.config import Settings
 from vibe.controller.cache import CacheScanner
 from vibe.controller.downloads import DownloadManager
+from vibe.controller.jev import JevState  # re-export shim (vibe.jev.control)
 from vibe.controller.logbuffer import RingBuffer
 from vibe.docker_ctl import DockerCtl, DockerError
 from vibe.gen.vibe.v1 import control_pb2, control_pb2_grpc
 from vibe.gpu import GpuStats
+from vibe.jev import JevError, SchemaStore, StoreError, ValidationResult, validate_schema_text
+from vibe.jev.control import JevLoadSpec
 from vibe.jobs import Job, JobEvent, JobInProgress, JobRunner, JobState
 from vibe.registry import ModelSpec, Registry
 
@@ -77,6 +80,17 @@ _STATE_TO_PROTO: dict[JobState, control_pb2.ModelState] = {
     JobState.UNLOADING: control_pb2.UNLOADING,
     JobState.ERROR: control_pb2.ERROR,
 }
+
+# Proto `JevMode` → the runner's mode string (JEV-02.3). UNSPECIFIED keeps
+# today's behaviour exactly.
+_JEV_MODE_TO_STR = {
+    control_pb2.JEV_MODE_UNSPECIFIED: "unspecified",
+    control_pb2.JEV_ON: "on",
+    control_pb2.JEV_OFF: "off",
+}
+
+# Jev sources that can go stale when the store is edited (JEV-02.18).
+_STALE_SOURCES = frozenset({"store", "model-default", "default"})
 
 
 @dataclass
@@ -139,6 +153,7 @@ def to_proto(
         terminal=event.state in _TERMINAL_STATES,
         kind=kind,
         alias=alias,
+        error_code=event.error_code or "",
     )
 
 
@@ -320,10 +335,12 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
 
     async def GetStatus(self, request, context):
         """Active model, container, in-flight job and last error (FR-02.2)."""
+        docker_ok = True
         try:
             status = await self.runner.status()
         except DockerError:
             status = {}  # Docker unreachable — degrade to an empty snapshot
+            docker_ok = False
 
         container_name = status.get("container")
         container_id = ""
@@ -361,6 +378,10 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
         if job is not None:
             current_job = self._inflight_job_proto(job)
 
+        # JEV-02.11 design note: lazily clear Jev state when Docker answered
+        # and no running container serves the attached alias.
+        self._lazy_clear_jev(status.get("active_alias"), docker_ok)
+
         return control_pb2.Status(
             active_alias=status.get("active_alias") or "",
             state=_effective_state(status.get("state"), job),
@@ -369,6 +390,63 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
             started_at_unix=started_at_unix,
             current_job=current_job,
             last_error=self.last_error,
+            jev=self._jev_info_proto(),
+        )
+
+    # -- Jev status helpers (JEV-02.4/JEV-02.18) ---------------------------
+
+    def _jev_state(self) -> JevState | None:
+        """The runner's Jev state holder; `None` for test fakes without one."""
+        return getattr(self.runner, "jev_state", None)
+
+    def _jev_store(self) -> SchemaStore | None:
+        """The runner's schema store; `None` for test fakes without one."""
+        return getattr(self.runner, "jev_store", None)
+
+    def _lazy_clear_jev(self, running_alias: Any, docker_ok: bool) -> None:
+        """Drop stale Jev state when the container for its alias is gone.
+
+        Only when Docker actually answered: an unreachable daemon must never
+        be mistaken for "nothing is running".
+        """
+        if not docker_ok:
+            return
+        state = self._jev_state()
+        if state is None:
+            return
+        active = state.current()
+        if active is None:
+            return
+        if running_alias and running_alias == active.alias:
+            return  # the container still serves the attached alias
+        state.clear()
+
+    def _jev_info_proto(self) -> control_pb2.JevInfo | None:
+        """`Status.jev` — unset (None) means Jev is inactive."""
+        state = self._jev_state()
+        if state is None:
+            return None
+        active = state.current()
+        if active is None:
+            return None
+        stale = False
+        if active.source in _STALE_SOURCES:
+            store = self._jev_store()
+            if store is not None:
+                try:
+                    stored = store.get(active.name)
+                except JevError:
+                    stored = None
+                if stored is not None and stored.sha256 != active.sha256:
+                    stale = True
+        title = active.schema.get("title")
+        return control_pb2.JevInfo(
+            schema_name=active.name,
+            sha256=active.sha256,
+            source=active.source,
+            applied_at_unix_ms=active.applied_at_unix_ms,
+            stale=stale,
+            title=title if isinstance(title, str) else "",
         )
 
     def _inflight_job_proto(self, job: Job) -> control_pb2.Job:
@@ -427,7 +505,11 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
     # -- job streams -------------------------------------------------------
 
     async def LoadModel(self, request, context):
-        """Stream a load job until a terminal event (FR-02.3)."""
+        """Stream a load job until a terminal event (FR-02.3).
+
+        `jev_mode`/`jev` are passed through to the runner (JEV-02.3);
+        UNSPECIFIED keeps today's behaviour exactly.
+        """
         alias = request.alias
         try:
             self.registry.get(alias)
@@ -437,12 +519,21 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
             )
             return
 
+        jev_mode = _JEV_MODE_TO_STR.get(request.jev_mode, "unspecified")
+        jev = JevLoadSpec(
+            schema_name=request.jev.schema_name,
+            schema_json=request.jev.schema_json,
+            save_as=request.jev.save_as,
+        )
+
         def start() -> AsyncIterator[JobEvent]:
             return self.runner.load(
                 alias,
                 force=request.force,
                 keep_failed=request.keep_failed,
                 timeout_s=request.timeout_s or None,
+                jev_mode=jev_mode,
+                jev=jev,
             )
 
         async for event in self._stream_job(alias, context, start):
@@ -1080,4 +1171,133 @@ class ModelControllerServicer(control_pb2_grpc.ModelControllerServicer):
             errors.extend(await asyncio.to_thread(self.registry.reload))
         return control_pb2.WriteRegistrationResponse(
             ok=not errors, errors=list(errors)
+        )
+
+    # -- Jev (improvements-2, doc 02) ----------------------------------------
+
+    async def GetActiveJev(self, request, context):
+        """The attached schema body + provenance (JEV-02.5); empty when off."""
+        state = self._jev_state()
+        if state is None:
+            return control_pb2.ActiveJev()
+        active = state.current()
+        if active is None:
+            return control_pb2.ActiveJev()
+        info = self._jev_info_proto()
+        if info is None:
+            return control_pb2.ActiveJev()
+        return control_pb2.ActiveJev(
+            info=info,
+            schema_json=json.dumps(active.schema, ensure_ascii=False),
+        )
+
+    async def ListJevSchemas(self, request, context):
+        """Every visible schema (built-in/user/override) with its status."""
+        store = self._jev_store()
+        if store is None:
+            await context.abort(
+                grpc.StatusCode.INTERNAL, "schema store unavailable"
+            )
+            return
+        state = self._jev_state()
+        active = state.current() if state is not None else None
+        entries = await asyncio.to_thread(store.list)
+        response = control_pb2.ListJevSchemasResponse()
+        for entry in entries:
+            item = response.schemas.add()
+            item.name = entry.name
+            item.source = entry.source
+            item.sha256 = entry.sha256
+            item.size_bytes = entry.size
+            item.mtime_unix_ms = int(entry.mtime * 1000) if entry.mtime else 0
+            item.title = entry.title
+            item.active = bool(
+                active
+                and active.name == entry.name
+                and active.sha256 == entry.sha256
+            )
+        return response
+
+    async def GetJevSchema(self, request, context):
+        """One schema's body; `NOT_FOUND` for unknown names (JEV-02.8)."""
+        store = self._jev_store()
+        if store is None:
+            await context.abort(
+                grpc.StatusCode.INTERNAL, "schema store unavailable"
+            )
+            return
+        try:
+            stored = await asyncio.to_thread(store.get, request.name)
+        except StoreError as exc:
+            await context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+            return
+        title = stored.schema.get("title")
+        return control_pb2.GetJevSchemaResponse(
+            name=stored.name,
+            source=stored.source,
+            sha256=stored.sha256,
+            size_bytes=stored.size,
+            mtime_unix_ms=int(stored.mtime * 1000) if stored.mtime else 0,
+            title=title if isinstance(title, str) else "",
+            schema_json=json.dumps(stored.schema, ensure_ascii=False),
+        )
+
+    async def PutJevSchema(self, request, context):
+        """Validate + store a schema; validation failures are data (JEV-02.7)."""
+        store = self._jev_store()
+        if store is None:
+            await context.abort(
+                grpc.StatusCode.INTERNAL, "schema store unavailable"
+            )
+            return
+        try:
+            result = await asyncio.to_thread(store.put, request.name, request.schema_json)
+        except StoreError as exc:
+            return control_pb2.PutJevSchemaResponse(error=str(exc))
+        return control_pb2.PutJevSchemaResponse(
+            validation=self._validation_proto(result)
+        )
+
+    async def DeleteJevSchema(self, request, context):
+        """Delete a user schema; built-ins are `FAILED_PRECONDITION` (JEV-02.8)."""
+        store = self._jev_store()
+        if store is None:
+            await context.abort(
+                grpc.StatusCode.INTERNAL, "schema store unavailable"
+            )
+            return
+        try:
+            removed_source = await asyncio.to_thread(store.delete, request.name)
+        except StoreError as exc:
+            if exc.code == "not_found":
+                await context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+                return
+            if exc.code == "readonly":
+                await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+                return
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            return
+        return control_pb2.DeleteJevSchemaResponse(
+            ok=True,
+            reverted_to="builtin" if removed_source == "override" else "",
+        )
+
+    async def ValidateJevSchema(self, request, context):
+        """Dry-run validation for the CLI/admin (JEV-02.7)."""
+        result = validate_schema_text(request.schema_json)
+        return control_pb2.ValidateJevSchemaResponse(
+            validation=self._validation_proto(result)
+        )
+
+    @staticmethod
+    def _validation_proto(
+        result: ValidationResult,
+    ) -> control_pb2.JevValidation:
+        """Map a `ValidationResult` to the proto `JevValidation`."""
+        return control_pb2.JevValidation(
+            ok=result.ok,
+            errors=list(result.errors),
+            warnings=list(result.warnings),
+            sha256=result.sha256,
+            size_bytes=result.size_bytes,
         )

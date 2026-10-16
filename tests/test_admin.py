@@ -219,6 +219,8 @@ class FakeControllerClient(ControllerClient):
         force: bool = False,
         keep_failed: bool = False,
         timeout_s: int | None = None,
+        jev_mode: int = 0,
+        jev: control_pb2.JevSpec | None = None,
     ) -> AsyncIterator[control_pb2.JobEvent]:
         self.load_calls.append((alias, force))
         if self.load_error is not None:

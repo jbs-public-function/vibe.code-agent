@@ -36,6 +36,7 @@ class FakeClient:
         self.load_events: list[control_pb2.JobEvent] = []
         self.load_error: Exception | None = None
         self.load_calls: list[tuple[str, bool, bool, int | None]] = []
+        self.load_jev: list[tuple[int, control_pb2.JevSpec | None]] = []
         self.unload_events: list[control_pb2.JobEvent] = []
         self.unload_error: Exception | None = None
         self.log_lines: list[control_pb2.LogLine] = []
@@ -94,9 +95,12 @@ class FakeClient:
         force: bool = False,
         keep_failed: bool = False,
         timeout_s: int | None = None,
+        jev_mode: int = 0,
+        jev: control_pb2.JevSpec | None = None,
     ) -> AsyncIterator[control_pb2.JobEvent]:
         self.calls.append("load")
         self.load_calls.append((alias, force, keep_failed, timeout_s))
+        self.load_jev.append((jev_mode, jev))
         if self.load_error is not None:
             raise self.load_error
         for event in self.load_events:

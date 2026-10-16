@@ -2,6 +2,12 @@
 
 > Phase 2 · Depends on: 02-grpc-server · Status: Implemented
 
+> **Jev mode** (improvements-2, doc 03): when the controller has a Jev schema attached to the active
+> model, the gateway injects `response_format: {type: json_schema, ...}` into `POST /v1/chat/completions`,
+> rejects `tools`/`tool_choice` requests with `400 jev_incompatible_request`, and marks the active entry
+> in `/v1/models` with `vibe_jev`. See
+> [`.zed/docs/fable-5/improvements-2/03-gateway-enforcement.md`](../../fable-5/improvements-2/03-gateway-enforcement.md).
+
 ## Summary
 
 A fixed-address OpenAI-compatible HTTP endpoint (`http://localhost:8080/v1`) that reverse-proxies to whichever

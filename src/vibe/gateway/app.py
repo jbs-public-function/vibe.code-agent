@@ -14,6 +14,11 @@ The gateway holds no model state of its own: routing comes from a
 `ListModels`/`GetStatus` snapshot cached for at most `SNAPSHOT_TTL` seconds
 and invalidated on upstream 502s (NFR-03.2, FR-03.9).
 
+Jev mode (improvements-2, doc 03): when `Status.jev` is set for the active
+alias, chat-completions requests to it have `response_format` injected from
+the `GetActiveJev` schema (cached by sha) and incompatible requests are
+rejected with 400 `jev_incompatible_request` before the upstream is touched.
+
 IMP-03.8 (ADR-10): every decision point emits a structured log line via
 `logging.getLogger("vibe.gateway")` with `extra={alias, upstream, status,
 elapsed_ms, reason}` — decision outcome, 502 + invalidation, controller-down
@@ -25,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -39,6 +44,7 @@ from vibe import logging as vlog
 from vibe.client import ControllerClient
 from vibe.config import Settings
 from vibe.gen.vibe.v1 import control_pb2
+from vibe.gateway.jev import apply_jev, check_compatible
 from vibe.gateway.models import build_models_payload, state_name
 from vibe.gateway.proxy import UpstreamError, stream_proxy
 from vibe.gateway.router import Proxy, Retry, Swap, decide
@@ -91,6 +97,29 @@ def _too_large() -> JSONResponse:
     )
 
 
+def _jev_unavailable(schema_name: str) -> JSONResponse:
+    """503 `jev_unavailable` — fail closed (JEV-03.2).
+
+    Proxying without the schema would return free text to a caller that will
+    `json.loads` it; a 503 with `Retry-After` follows the gateway's existing
+    retry conventions. The `jev_unavailable` log line is emitted where the
+    fetch failed (see `_SnapshotCache.get_active_jev_body`).
+    """
+    return _error_response(
+        503,
+        {
+            "message": (
+                f"Jev is active ({schema_name}) but its schema could not be "
+                "fetched; refusing to proxy unconstrained. Retry shortly, or "
+                "detach with `vibe jev off`."
+            ),
+            "type": "jev_unavailable",
+            "code": "jev_unavailable",
+        },
+        retry_after=5,
+    )
+
+
 @dataclass
 class _Snapshot:
     """A routing snapshot: controller status + registry, with its fetch time."""
@@ -114,6 +143,8 @@ class _SnapshotCache:
         self._lock = asyncio.Lock()
         self._snapshot: _Snapshot | None = None
         self._controller_ok: bool | None = None  # None = never talked to it
+        # JEV-03.2: the active Jev schema body, cached by content sha.
+        self._jev_body: tuple[str, dict[str, object]] | None = None
 
     def invalidate(self) -> None:
         """Drop the snapshot so the next request re-asks the controller."""
@@ -149,6 +180,55 @@ class _SnapshotCache:
             self._snapshot = snapshot
             return snapshot
 
+    async def get_active_jev_body(
+        self, info: control_pb2.JevInfo
+    ) -> dict[str, object] | None:
+        """The active Jev schema body for `info.sha256`, cached by sha (JEV-03.2).
+
+        `GetActiveJev` is fetched once per sha change, under the snapshot
+        lock. Returns `None` — fail closed — when the RPC fails, the response
+        carries no info, its sha differs from `Status.jev.sha256`, or the
+        body is not a JSON object. The body cache is content-addressed, so it
+        survives snapshot invalidation and detach/attach cycles unchanged.
+        """
+        sha = info.sha256
+        if self._jev_body is not None and self._jev_body[0] == sha:
+            return self._jev_body[1]
+        async with self._lock:
+            if self._jev_body is not None and self._jev_body[0] == sha:
+                return self._jev_body[1]
+            try:
+                active = await self._client.get_active_jev()
+            except Exception as exc:
+                # ControllerUnavailable or any gRPC error (JEV-03.8).
+                logger.info(
+                    "jev unavailable",
+                    extra={"reason": f"{type(exc).__name__}: {exc}"},
+                )
+                return None
+            if not active.HasField("info") or active.info.sha256 != sha:
+                logger.info(
+                    "jev unavailable",
+                    extra={"reason": "active schema sha mismatch"},
+                )
+                return None
+            try:
+                schema = json.loads(active.schema_json)
+            except json.JSONDecodeError:
+                logger.info(
+                    "jev unavailable",
+                    extra={"reason": "active schema body is not JSON"},
+                )
+                return None
+            if not isinstance(schema, dict):
+                logger.info(
+                    "jev unavailable",
+                    extra={"reason": "active schema body is not an object"},
+                )
+                return None
+            self._jev_body = (sha, schema)
+            return schema
+
 
 def build_app(
     settings: Settings,
@@ -180,10 +260,14 @@ def build_app(
                     pass  # shutdown must not raise
 
     async def proxy_or_502(
-        request: Request, upstream: str, body: bytes, alias: str | None
+        request: Request,
+        upstream: str,
+        body: bytes,
+        alias: str | None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> Response:
         try:
-            return await stream_proxy(request, upstream, body, transport)
+            return await stream_proxy(request, upstream, body, transport, extra_headers)
         except UpstreamError as exc:
             cache.invalidate()  # FR-03.9: re-ask the controller next request
             logger.info(
@@ -227,19 +311,28 @@ def build_app(
             snapshot = None
         if snapshot is None:
             # IMP-03.10: the controller's state is unknown while it is down.
-            payload: dict[str, str | None] = {
+            payload: dict[str, object] = {
                 "gateway": "ok",
                 "controller": "down",
                 "active": None,
                 "state": None,
+                "jev": None,
             }
         else:
             status = snapshot.status
+            jev: dict[str, str] | None = None
+            if status.HasField("jev"):
+                # JEV-03.7: name + sha only; the body is never shipped here.
+                jev = {
+                    "name": status.jev.schema_name,
+                    "sha256": status.jev.sha256,
+                }
             payload = {
                 "gateway": "ok",
                 "controller": "ok",
                 "active": status.active_alias or None,
                 "state": state_name(status.state),
+                "jev": jev,
             }
         response = JSONResponse(payload)
         if request.method == "HEAD":
@@ -313,7 +406,80 @@ def build_app(
             }
         logger.info("decision", extra=log_extra)
         if isinstance(decision, Proxy):
-            return await proxy_or_502(request, decision.upstream, body, model)
+            # Jev enforcement (JEV-03.1/03.2/03.3): applies only when the
+            # request is proxied to the active alias while it has a Jev
+            # schema attached. `/v1/embeddings` passes through untouched
+            # (doc 03); a Swap implies a fresh container ⇒ plain mode.
+            extra_headers: dict[str, str] | None = None
+            jev_active = False
+            if (
+                request.url.path != "/v1/embeddings"
+                and isinstance(data, dict)
+                and snapshot.status.HasField("jev")
+            ):
+                info = snapshot.status.jev
+                schema = await cache.get_active_jev_body(info)
+                if schema is None:
+                    return _jev_unavailable(info.schema_name)
+                incompatible = check_compatible(request.url.path, data)
+                if incompatible is not None:
+                    logger.info(
+                        "jev_rejected",
+                        extra={
+                            "alias": model or "",
+                            "reason": incompatible.reason,
+                        },
+                    )
+                    return _error_response(
+                        400,
+                        {
+                            "message": (
+                                f"Jev is active ({info.schema_name}); "
+                                f"{incompatible.detail}"
+                            ),
+                            "type": incompatible.type,
+                            "code": incompatible.code,
+                        },
+                    )
+                rewrite = apply_jev(data, schema, info.schema_name)
+                if rewrite.overrode:
+                    logger.info(
+                        "jev_override",
+                        extra={"alias": model or "", "overrode": rewrite.overrode},
+                    )
+                    extra_headers = {
+                        "X-Vibe-Jev-Overrode": ", ".join(rewrite.overrode)
+                    }
+                # JEV-03.3: re-serialise the rewritten body. BODY_LIMIT was
+                # applied *before* injection (JEV-03.10); the schema (at most
+                # 64 KiB) may push a near-limit body over the limit —
+                # acceptable, upstream enforces its own.
+                body = json.dumps(rewrite.data, separators=(",", ":")).encode()
+                logger.info(
+                    "jev_applied",
+                    extra={
+                        "alias": model or "",
+                        "schema": info.schema_name,
+                        "sha": info.sha256[:12],
+                        "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    },
+                )
+                extra_headers = {
+                    **(extra_headers or {}),
+                    "X-Vibe-Jev": f"{info.schema_name}; sha={info.sha256[:12]}",
+                }
+                jev_active = True
+            response = await proxy_or_502(
+                request, decision.upstream, body, model, extra_headers
+            )
+            if jev_active and response.status_code == 400:
+                # JEV-03.9: the backend rejected the injected request at
+                # request time (the probe passed, but the backend can still
+                # say no). Relay verbatim, but invalidate the snapshot so a
+                # concurrent detach is noticed. No automatic retry without
+                # the schema — that would silently violate Jev.
+                cache.invalidate()
+            return response
         if isinstance(decision, Retry):
             return _error_response(
                 decision.status, decision.error, decision.after or None

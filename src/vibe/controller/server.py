@@ -16,6 +16,7 @@ import grpc
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
 from vibe.config import CONTROLLER_PORT, Settings
+from vibe.controller.jev import JevState
 from vibe.controller.logbuffer import RingBuffer
 from vibe.controller.servicer import ModelControllerServicer
 from vibe.docker_ctl import DockerCtl, DockerError
@@ -26,6 +27,10 @@ from vibe.logging import get_logger
 from vibe.registry import Registry
 
 SERVICE_NAME = "vibe.v1.ModelController"
+
+# JEV-02.8: explicit gRPC message-size bound — schemas are capped at 64 KiB
+# by validation, and 256 KiB leaves room for framing/overhead.
+MAX_MESSAGE_BYTES = 256 * 1024
 
 _log = get_logger("vibe.controller")
 
@@ -98,7 +103,12 @@ async def build_server(
     servicer = ModelControllerServicer(
         settings, registry, runner, docker, gpu_fn, buffer
     )
-    server = grpc.aio.server()
+    server = grpc.aio.server(
+        options=[
+            ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", MAX_MESSAGE_BYTES),
+        ]
+    )
     # `run` reaches the servicer through this attribute to close the
     # download executor on shutdown (IMP-02.14); like `bound_address` below
     # it is an implementation detail of the composition root.
@@ -133,6 +143,10 @@ async def run(server: grpc.aio.Server, install_signals: bool = True) -> None:
     _log.info("listening", extra={"address": address})
     loop = asyncio.get_running_loop()
 
+    # JEV-02.11: on start, drop Jev state whose container is no longer
+    # running (the controller restarted but Docker kept or lost containers).
+    await _reconcile_jev(server)
+
     stop_task: asyncio.Task | None = None
 
     def _request_stop() -> None:
@@ -161,6 +175,41 @@ async def run(server: grpc.aio.Server, install_signals: bool = True) -> None:
     if servicer is not None:
         servicer.downloads.close()  # IMP-02.14: executor shutdown
     _log.info("stopped")
+
+
+async def _reconcile_jev(server: grpc.aio.Server) -> None:
+    """Keep Jev state only while a managed container for its alias runs.
+
+    Best-effort: an unreachable Docker daemon leaves the state untouched
+    (GetStatus reconciles lazily once Docker answers).
+    """
+    servicer = getattr(server, "servicer", None)
+    if servicer is None:
+        return
+    state: JevState | None = getattr(servicer.runner, "jev_state", None)
+    if state is None or state.current() is None:
+        return
+    docker = getattr(servicer.runner, "docker", None)
+    if docker is None:
+        return
+    try:
+        managed = await asyncio.to_thread(docker.find_managed)
+    except DockerError:
+        return
+    running: set[str] = set()
+    for container in managed:
+        try:
+            info = await asyncio.to_thread(docker.container_info, container)
+        except DockerError:
+            continue
+        alias = info.get("alias")
+        if alias and "running" in str(info.get("status", "")).lower():
+            running.add(str(alias))
+    if state.reconcile(running):
+        _log.info(
+            "dropped stale Jev state",
+            extra={"reason": "no running container for its alias"},
+        )
 
 
 def main(settings: Settings, registry: Registry) -> int:

@@ -26,7 +26,7 @@
     <thead>
       <tr>
         <th>Display name</th><th>Alias</th><th>Repo</th><th>Quant</th>
-        <th>Max len</th><th>Port</th><th>State</th><th>Cached locally</th><th>Download</th>
+        <th>Max len</th><th>Port</th><th>State</th><th>Cached locally</th><th>Jev</th><th>Download</th>
       </tr>
     </thead>
     <tbody>
@@ -40,6 +40,7 @@
         <td>{{ info.host_port }}</td>
         <td><span class="badge badge-{{ info.state|statename|lower }}">{{ info.state|statename }}</span></td>
         <td>{{ "yes" if info.cached_locally else "no" }}</td>
+        <td>{% if info.alias == active_alias and active_jev %}<span class="badge badge-ready">Jev</span>{% endif %}</td>
         <td>
           {% if info.alias in downloadable %}
           <form method="post" action="{{ path_for('developer_downloads_post') }}">

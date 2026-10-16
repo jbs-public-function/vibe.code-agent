@@ -23,6 +23,7 @@ from vibe.controller.server import run as controller_run
 from vibe.docker_ctl import DockerUnavailableError
 from vibe.gen.vibe.v1 import control_pb2, control_pb2_grpc
 from vibe.gpu import GpuProcess, GpuStats
+from vibe.jev.control import JevLoadSpec
 from vibe.jobs import Job, JobEvent, JobInProgress, JobState
 
 FAKE_GPU_STATS = GpuStats(
@@ -120,9 +121,17 @@ class FakeJobRunner:
             started_at=datetime.now(UTC),
         )
 
-    async def load(self, alias, force=False, keep_failed=False, timeout_s=None):
+    async def load(
+        self,
+        alias,
+        force=False,
+        keep_failed=False,
+        timeout_s=None,
+        jev_mode="unspecified",
+        jev=None,
+    ):
         # Body runs on first anext, mirroring the real runner.
-        self.load_calls.append((alias, force, keep_failed, timeout_s))
+        self.load_calls.append((alias, force, keep_failed, timeout_s, jev_mode, jev))
         if self._job is not None:
             raise JobInProgress(f"job {self._job.id} is already running")
         self._job = self._make_job("load", alias)
@@ -300,9 +309,17 @@ async def test_load_happy_path(settings, registry):
         assert received[-1].ts_unix_ms == int(
             events[-1].ts.timestamp() * 1000
         )
-        # Request options were forwarded to the runner verbatim.
+        # Request options were forwarded to the runner verbatim;
+        # UNSPECIFIED means "today's behaviour exactly" (JEV-02.3).
         assert runner.load_calls == [
-            ("qwen2.5-coder-7b", True, True, 30)
+            (
+                "qwen2.5-coder-7b",
+                True,
+                True,
+                30,
+                "unspecified",
+                JevLoadSpec(schema_name="", schema_json="", save_as=""),
+            )
         ]
         # Every event also landed in the ring buffer.
         assert len(buffer) == 3

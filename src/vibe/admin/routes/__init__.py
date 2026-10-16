@@ -166,15 +166,17 @@ async def start_background_job(
     agen: AsyncIterator[control_pb2.JobEvent],
     kind: str,
     alias: str,
-) -> str:
+) -> tuple[str, control_pb2.JobEvent]:
     """Start a load/unload stream and hand it to a background task (FR-01.3).
 
-    The first event carries the job id; the remainder of the stream is drained
-    by a task held in `app.state.background_tasks` (discarded via a
-    done-callback) so the job outlives the HTTP request. `KeyError`,
-    `JobInProgress` and controller failures from the first event propagate to
-    the caller for route-specific flash handling; on a first-event deadline
-    the generator is `aclose()`d (IMP-04.15).
+    The first event carries the job id; both are returned so callers can
+    react to an error on the very first event (Jev launches flash a
+    `jev_schema_invalid` first event instead of redirecting). The remainder
+    of the stream is drained by a task held in `app.state.background_tasks`
+    (discarded via a done-callback) so the job outlives the HTTP request.
+    `KeyError`, `JobInProgress` and controller failures from the first event
+    propagate to the caller for route-specific flash handling; on a
+    first-event deadline the generator is `aclose()`d (IMP-04.15).
     """
     try:
         first = await asyncio.wait_for(anext(agen), timeout=GRPC_TIMEOUT)
@@ -196,7 +198,7 @@ async def start_background_job(
     tasks.add(task)
     task.add_done_callback(tasks.discard)
 
-    return job_id
+    return job_id, first
 
 
 def is_terminal(event: control_pb2.JobEvent) -> bool:

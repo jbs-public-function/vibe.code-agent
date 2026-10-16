@@ -128,6 +128,8 @@ class FakeControllerClient(ControllerClient):
         force: bool = False,
         keep_failed: bool = False,
         timeout_s: int | None = None,
+        jev_mode: int = 0,
+        jev: control_pb2.JevSpec | None = None,
     ) -> AsyncIterator[control_pb2.JobEvent]:
         self.load_calls.append(alias)
         if self.load_error is not None:
@@ -1001,11 +1003,13 @@ async def test_app_health_ok(
     async with asgi_client(app) as ac:
         response = await ac.get("/health")
     assert response.status_code == 200
+    # JEV-03.7: /health carries the active Jev marker (null when off).
     assert response.json() == {
         "gateway": "ok",
         "controller": "ok",
         "active": "qwen2.5-coder-7b",
         "state": "READY",
+        "jev": None,
     }
 
 
@@ -1019,11 +1023,13 @@ async def test_app_health_controller_down(
         response = await ac.get("/health")
     assert response.status_code == 200  # /health is never a 503 (FR-03.10)
     # IMP-03.10: the controller's state is unknown while it is down.
+    # JEV-03.7: the Jev marker is null in that case.
     assert response.json() == {
         "gateway": "ok",
         "controller": "down",
         "active": None,
         "state": None,
+        "jev": None,
     }
 
 

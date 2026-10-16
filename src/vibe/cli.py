@@ -8,6 +8,7 @@ import sys
 from collections.abc import Coroutine, Sequence
 from datetime import UTC, datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, NoReturn, cast
 
 import typer
@@ -16,10 +17,16 @@ from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message
 from pydantic import ValidationError
 
-from vibe.client import ControllerClient, ControllerUnavailable
+from vibe.client import (
+    ControllerClient,
+    ControllerUnavailable,
+    JevReadOnly,
+    JevSchemaNotFound,
+)
 from vibe.config import ConfigError, Settings, load_config
 from vibe.errors import EXIT_ALIAS, EXIT_CONFIG, EXIT_OK, EXIT_RUNTIME
 from vibe.gen.vibe.v1 import control_pb2
+from vibe.jev import SchemaStore, StoreError, validate_schema_text
 from vibe.jobs import JobEvent, JobInProgress
 from vibe.registry import REGISTER_PORT_MAX, REGISTER_PORT_MIN, Registry
 from vibe.serve import run_serve
@@ -173,13 +180,20 @@ def _print_event(event: JobEvent) -> None:
 
 
 def _print_proto_event(event: control_pb2.JobEvent) -> None:
-    """Print one gRPC job event like `_print_event` does for `jobs.JobEvent`."""
+    """Print one gRPC job event like `_print_event` does for `jobs.JobEvent`.
+
+    JEV-04.5: error events carry their `error_code` in brackets so a Jev-only
+    failure is visible even though the terminal state stays READY; warning
+    events render as `[WARN]` via their level.
+    """
     ts = datetime.fromtimestamp(event.ts_unix_ms / 1000, UTC).astimezone()
     if event.state:
         tag = control_pb2.ModelState.Name(event.state)
     else:
         tag = event.level.upper()
     line = f"{ts.strftime('%H:%M:%S')}  [{tag}]  {event.message}"
+    if event.error_code:
+        line += f" [{event.error_code}]"
     if event.level == "error":
         print(line, file=sys.stderr)
     else:
@@ -239,13 +253,143 @@ def _download_state(info: control_pb2.DownloadInfo) -> str:
 
 
 def _print_download_event(event: control_pb2.DownloadProgress, *, is_tty: bool) -> None:
-    """Render one download event: a `\\r`-line on a tty, per-event lines otherwise."""
+    """Render one download event: a `\r`-line on a tty, per-event lines otherwise."""
     done = f"{event.bytes_done}/{event.bytes_total} bytes ({event.progress * 100:.0f}%)"
     status = f"{event.current_file}  {done}" if event.current_file else done
     if is_tty:
         print(f"\r{status}", end="\r", flush=True)
     else:
         print(status)
+
+
+# -- Jev helpers (improvements-2 doc 04, J3) --------------------------------
+
+
+def _jev_exit_code(final_state: int | None, error_code: str) -> int:
+    """Exit code for a finished load/attach stream (README taxonomy, JEV-04.4).
+
+    Keyed off the terminal event's `error_code`, never the state:
+    `jev_schema_not_found` ⇒ 3, `jev_schema_invalid` ⇒ 2, any other code
+    (`jev_probe_failed`, `jev_unsupported_model`, …) ⇒ 1. Without a code an
+    ERROR terminal state keeps its historical exit 1; `jev_not_active` is an
+    info event and exits 0.
+    """
+    if error_code == "jev_schema_not_found":
+        return EXIT_ALIAS
+    if error_code == "jev_schema_invalid":
+        return EXIT_CONFIG
+    if error_code:
+        return EXIT_RUNTIME
+    if final_state == control_pb2.ERROR:
+        return EXIT_RUNTIME
+    return EXIT_OK
+
+
+def _check_schema_name(name: str) -> None:
+    """Client-side store-name pre-check so bad names fail before any RPC."""
+    try:
+        SchemaStore.check_name(name)
+    except StoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise typer.Exit(EXIT_CONFIG) from exc
+
+
+def _stdin_schema_text() -> str:
+    """Read schema text from stdin, refusing an interactive TTY (JEV-04.2)."""
+    isatty = getattr(sys.stdin, "isatty", None)
+    if isatty is not None and isatty():
+        print(
+            "error: refusing to read the schema from a TTY — pipe the JSON "
+            "or pass a file path",
+            file=sys.stderr,
+        )
+        raise typer.Exit(EXIT_CONFIG)
+    return sys.stdin.read()
+
+
+def _read_schema_text(path: str) -> str:
+    """Read and locally validate one schema file (or stdin) — JEV-04.2.
+
+    Every problem (unreadable file, non-UTF-8, > 64 KiB, invalid schema)
+    exits 2 *before* any RPC, printing errors and warnings so the common
+    mistake fails in milliseconds without a controller.
+    """
+    if path == "-":
+        text = _stdin_schema_text()
+    else:
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            print(
+                f"error: {path} is not valid UTF-8 (byte offset {exc.start})",
+                file=sys.stderr,
+            )
+            raise typer.Exit(EXIT_CONFIG) from exc
+        except OSError as exc:
+            print(
+                f"error: cannot read {path}: {exc.strerror or exc}",
+                file=sys.stderr,
+            )
+            raise typer.Exit(EXIT_CONFIG) from exc
+    result = validate_schema_text(text)
+    for warning in result.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    for error in result.errors:
+        print(f"error: {error}", file=sys.stderr)
+    if not result.ok:
+        raise typer.Exit(EXIT_CONFIG)
+    return text
+
+
+def _resolve_load_jev(
+    *,
+    jev: bool,
+    no_jev: bool,
+    include_json: str | None,
+    schema: str | None,
+    save_as: str | None,
+) -> tuple[int, control_pb2.JevSpec | None]:
+    """Check the `load` Jev option conflicts (JEV-04.1) and build the args.
+
+    `--include-json`/`--schema` imply `--jev`; `--no-jev` conflicts with all
+    of them; `--save-as` is only valid with `--include-json`. Every usage
+    error exits 2 before any RPC.
+    """
+    if jev and no_jev:
+        print("error: --jev and --no-jev are mutually exclusive", file=sys.stderr)
+        raise typer.Exit(EXIT_CONFIG)
+    if no_jev and (include_json is not None or schema is not None or save_as is not None):
+        print(
+            "error: --no-jev cannot be combined with --include-json, --schema "
+            "or --save-as",
+            file=sys.stderr,
+        )
+        raise typer.Exit(EXIT_CONFIG)
+    if include_json is not None and schema is not None:
+        print(
+            "error: --include-json and --schema are mutually exclusive",
+            file=sys.stderr,
+        )
+        raise typer.Exit(EXIT_CONFIG)
+    if save_as is not None and include_json is None:
+        print("error: --save-as requires --include-json", file=sys.stderr)
+        raise typer.Exit(EXIT_CONFIG)
+    if no_jev:
+        return control_pb2.JEV_OFF, None
+    if not (jev or include_json is not None or schema is not None):
+        return control_pb2.JEV_MODE_UNSPECIFIED, None
+    if schema is not None:
+        _check_schema_name(schema)
+    if save_as is not None:
+        _check_schema_name(save_as)
+    spec = control_pb2.JevSpec()
+    if include_json is not None:
+        spec.schema_json = _read_schema_text(include_json)  # exits 2, no RPC
+    if schema is not None:
+        spec.schema_name = schema
+    if save_as is not None:
+        spec.save_as = save_as
+    return control_pb2.JEV_ON, spec
 
 
 # -- commands --------------------------------------------------------------
@@ -301,24 +445,87 @@ def load(
     timeout: int | None = typer.Option(
         None, "--timeout", "-t", help="Readiness timeout in seconds."
     ),
+    jev: bool = typer.Option(
+        False,
+        "--jev",
+        help="Attach Jev; the schema is picked by precedence "
+        "(model default, else 'default').",
+        rich_help_panel="Jev",
+    ),
+    no_jev: bool = typer.Option(
+        False,
+        "--no-jev",
+        help="Detach Jev / load plainly (same-alias READY fast path).",
+        rich_help_panel="Jev",
+    ),
+    include_json: str | None = typer.Option(
+        None,
+        "--include-json",
+        help="Attach Jev with this schema file ('-' = stdin).",
+        rich_help_panel="Jev",
+    ),
+    schema: str | None = typer.Option(
+        None,
+        "--schema",
+        help="Attach Jev with a stored/built-in schema by name.",
+        rich_help_panel="Jev",
+    ),
+    save_as: str | None = typer.Option(
+        None,
+        "--save-as",
+        help="Persist the --include-json schema under this name after a "
+        "successful probe.",
+        rich_help_panel="Jev",
+    ),
 ) -> None:
     """Load a model: purge old containers, start, and wait for readiness (FR-00.5)."""
-    _run(_load(alias, force=force, keep_failed=keep_failed, timeout=timeout))
+    jev_mode, jev_spec = _resolve_load_jev(
+        jev=jev, no_jev=no_jev, include_json=include_json, schema=schema, save_as=save_as
+    )
+    _run(
+        _load(
+            alias,
+            force=force,
+            keep_failed=keep_failed,
+            timeout=timeout,
+            jev_mode=jev_mode,
+            jev=jev_spec,
+        )
+    )
 
 
 async def _load(
-    alias: str, force: bool, keep_failed: bool, timeout: int | None
+    alias: str,
+    force: bool,
+    keep_failed: bool,
+    timeout: int | None,
+    jev_mode: int = control_pb2.JEV_MODE_UNSPECIFIED,
+    jev: control_pb2.JevSpec | None = None,
 ) -> None:
     settings = _load_settings()
     client = ControllerClient(settings)
     final_state: int | None = None
+    final_error_code: str = ""
+    saw_container_start = False
+    saw_attach = False
     try:
         async for event in client.load(
-            alias, force=force, keep_failed=keep_failed, timeout_s=timeout
+            alias,
+            force=force,
+            keep_failed=keep_failed,
+            timeout_s=timeout,
+            jev_mode=jev_mode,
+            jev=jev,
         ):
             _print_proto_event(event)
             if event.state:
                 final_state = event.state
+            if event.state in (control_pb2.LOADING, control_pb2.UNLOADING):
+                saw_container_start = True
+            if event.error_code:
+                final_error_code = event.error_code
+            if event.message.startswith("jev: attached"):
+                saw_attach = True
     except KeyError:
         print(
             f"unknown alias '{alias}' — run `vibe list` to see registered models",
@@ -335,8 +542,12 @@ async def _load(
         raise typer.Exit(EXIT_RUNTIME) from exc
     finally:
         await client.close()
-    if final_state == control_pb2.ERROR:
-        raise typer.Exit(EXIT_RUNTIME)
+    exit_code = _jev_exit_code(final_state, final_error_code)
+    if exit_code != EXIT_OK:
+        raise typer.Exit(exit_code)
+    # JEV-04.3: an attach that never saw a container start took the fast path.
+    if jev_mode == control_pb2.JEV_ON and saw_attach and not saw_container_start:
+        print("attached without restart")
 
 
 @app.command()
@@ -429,7 +640,12 @@ async def _status(json_: bool) -> None:
         await client.close()
 
     if json_:
-        print(json.dumps(to_json_dict(status), indent=2))
+        data = to_json_dict(status)
+        # JEV-04.6: `MessageToDict` omits unset message fields, so surface
+        # the `jev` key explicitly — `null` when inactive, the populated
+        # JevInfo dict otherwise (int64s cast to real ints by to_json_dict).
+        data["jev"] = to_json_dict(status.jev) if status.HasField("jev") else None
+        print(json.dumps(data, indent=2))
         return
 
     state = control_pb2.ModelState.Name(status.state) if status.state else "-"
@@ -449,6 +665,12 @@ async def _status(json_: bool) -> None:
         print(f"GPU: {gpu.used_mib} / {gpu.total_mib} MiB ({gpu.utilization_pct}%)")
         for process in gpu.processes:
             print(f"  pid={process.pid}  {process.name}  {process.used_mib} MiB")
+    if status.HasField("jev"):
+        info = status.jev
+        stale = " (stale — re-attach to refresh)" if info.stale else ""
+        print(f"Jev: {info.schema_name} ({info.source}, sha {info.sha256[:12]}){stale}")
+    else:
+        print("Jev: off")
     if status.last_error:
         print(f"warning: {status.last_error}", file=sys.stderr)
 
@@ -680,6 +902,363 @@ async def _cache_du() -> None:
         f"total: {_fmt_size(cache.disk_total_bytes)} / "
         f"free: {_fmt_size(cache.disk_free_bytes)}"
     )
+
+
+jev_app = typer.Typer(
+    help="Manage Jev: schema-constrained model output (improvements-2 doc 04)."
+)
+app.add_typer(jev_app, name="jev")
+
+
+@jev_app.command("status")
+def jev_status(
+    json_: bool = typer.Option(False, "--json", help="Emit JSON instead of text."),
+) -> None:
+    """Show the active Jev schema: name, source, sha, stale, applied-at."""
+    _run(_jev_status(json_=json_))
+
+
+async def _jev_status(json_: bool) -> None:
+    settings = _load_settings()
+    client = ControllerClient(settings)
+    try:
+        active = await client.get_active_jev()
+    except ControllerUnavailable as exc:
+        _exit_unavailable(exc, client.target)
+    except Exception as exc:
+        _exit_runtime(exc)
+    finally:
+        await client.close()
+    if json_:
+        payload: dict[str, Any] = {"active": False, "info": None}
+        if active.HasField("info"):
+            payload = {"active": True, "info": to_json_dict(active.info)}
+        print(json.dumps(payload, indent=2))
+        return
+    if not active.HasField("info"):
+        print("Jev: off")
+        return
+    info = active.info
+    applied = "-"
+    if info.applied_at_unix_ms:
+        applied = (
+            datetime.fromtimestamp(info.applied_at_unix_ms / 1000, UTC)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M:%S %Z")
+        )
+    print(f"Jev: on — schema {info.schema_name!r} ({info.source})")
+    print(f"  sha256: {info.sha256 or '-'}")
+    print(f"  applied: {applied}")
+    if info.title:
+        print(f"  title: {info.title}")
+    if info.stale:
+        print("  stale: the schema was edited after activation — re-attach to refresh")
+
+
+@jev_app.command("off")
+def jev_off() -> None:
+    """Detach the active Jev schema; idempotent, never touches the container."""
+    _run(_jev_off())
+
+
+async def _jev_off() -> None:
+    settings = _load_settings()
+    client = ControllerClient(settings)
+    try:
+        try:
+            status = await client.status()
+        except ControllerUnavailable as exc:
+            _exit_unavailable(exc, client.target)
+        except Exception as exc:
+            _exit_runtime(exc)
+        alias = status.active_alias
+        if not alias or status.state != control_pb2.READY:
+            # Jev state only exists while its container is READY (purge and
+            # unload clear it), so there is nothing to detach — JEV-02.12(d).
+            print("jev: not active — nothing to detach")
+            return
+        final_state: int | None = None
+        final_error_code = ""
+        try:
+            async for event in client.load(alias, jev_mode=control_pb2.JEV_OFF):
+                _print_proto_event(event)
+                if event.state:
+                    final_state = event.state
+                if event.error_code:
+                    final_error_code = event.error_code
+        except KeyError:
+            print(
+                f"unknown alias '{alias}' — run `vibe list` to see registered models",
+                file=sys.stderr,
+            )
+            raise typer.Exit(EXIT_ALIAS) from None
+        except JobInProgress as exc:
+            print(str(exc), file=sys.stderr)
+            raise typer.Exit(EXIT_RUNTIME) from exc
+        except ControllerUnavailable as exc:
+            _exit_unavailable(exc, client.target)
+        except Exception as exc:
+            _exit_runtime(exc)
+    finally:
+        await client.close()
+    exit_code = _jev_exit_code(final_state, final_error_code)
+    if exit_code != EXIT_OK:
+        raise typer.Exit(exit_code)
+
+
+schema_app = typer.Typer(
+    help="List, inspect, edit and validate stored Jev schemas."
+)
+jev_app.add_typer(schema_app, name="schema")
+
+
+@schema_app.command("list")
+def schema_list(
+    json_: bool = typer.Option(False, "--json", help="Emit JSON instead of a table."),
+) -> None:
+    """List every visible schema (built-in, user, override) with status."""
+    _run(_schema_list(json_=json_))
+
+
+async def _schema_list(json_: bool) -> None:
+    settings = _load_settings()
+    client = ControllerClient(settings)
+    try:
+        entries = await client.list_jev_schemas()
+    except ControllerUnavailable as exc:
+        _exit_unavailable(exc, client.target)
+    except Exception as exc:
+        _exit_runtime(exc)
+    finally:
+        await client.close()
+    if json_:
+        print(json.dumps([to_json_dict(entry) for entry in entries], indent=2))
+        return
+    if not entries:
+        print("no Jev schemas")
+        return
+    headers = ("NAME", "SOURCE", "SHA12", "SIZE", "ACTIVE")
+    rows = [
+        (
+            entry.name,
+            entry.source,
+            entry.sha256[:12],
+            _fmt_size(entry.size_bytes),
+            "*" if entry.active else "",
+        )
+        for entry in entries
+    ]
+    _table(headers, rows)
+
+
+@schema_app.command("show")
+def schema_show(
+    name: str,
+    raw: bool = typer.Option(
+        False, "--raw", help="Print the exact stored bytes (no pretty-printing)."
+    ),
+) -> None:
+    """Pretty-print one stored schema (or its exact bytes with --raw)."""
+    _run(_schema_show(name, raw=raw))
+
+
+async def _schema_show(name: str, raw: bool) -> None:
+    _check_schema_name(name)
+    settings = _load_settings()
+    client = ControllerClient(settings)
+    try:
+        schema = await client.get_jev_schema(name)
+    except JevSchemaNotFound as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise typer.Exit(EXIT_ALIAS) from exc
+    except ControllerUnavailable as exc:
+        _exit_unavailable(exc, client.target)
+    except Exception as exc:
+        _exit_runtime(exc)
+    finally:
+        await client.close()
+    if raw:
+        sys.stdout.write(schema.schema_json)
+        if not schema.schema_json.endswith("\n"):
+            sys.stdout.write("\n")
+        return
+    try:
+        pretty = json.dumps(json.loads(schema.schema_json), indent=2)
+    except json.JSONDecodeError as exc:
+        print(f"error: stored schema is not valid JSON: {exc}", file=sys.stderr)
+        raise typer.Exit(EXIT_CONFIG) from exc
+    print(pretty)
+
+
+@schema_app.command("validate")
+def schema_validate(
+    file: str | None = typer.Argument(None, help="Schema file to validate ('-' = stdin)."),
+    name: str | None = typer.Option(
+        None, "--name", help="Validate a stored schema by name (needs the controller)."
+    ),
+) -> None:
+    """Validate a schema file offline, or a stored schema via the controller."""
+    _run(_schema_validate(file=file, name=name))
+
+
+async def _schema_validate(file: str | None, name: str | None) -> None:
+    if (file is None) == (name is None):
+        print(
+            "error: pass a schema FILE ('-' for stdin) or --name NAME",
+            file=sys.stderr,
+        )
+        raise typer.Exit(EXIT_CONFIG)
+    if file is not None:
+        # JEV-04.8: fully offline — the controller may be down.
+        _read_schema_text(file)  # prints warnings; exits 2 on any error
+        print("schema is valid")
+        return
+    assert name is not None
+    _check_schema_name(name)
+    settings = _load_settings()
+    client = ControllerClient(settings)
+    try:
+        schema = await client.get_jev_schema(name)
+        validation = await client.validate_jev_schema(schema.schema_json)
+    except JevSchemaNotFound as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise typer.Exit(EXIT_ALIAS) from exc
+    except ControllerUnavailable as exc:
+        _exit_unavailable(exc, client.target)
+    except Exception as exc:
+        _exit_runtime(exc)
+    finally:
+        await client.close()
+    for warning in validation.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    for error in validation.errors:
+        print(f"error: {error}", file=sys.stderr)
+    if not validation.ok:
+        raise typer.Exit(EXIT_CONFIG)
+    print(f"schema '{name}' is valid (sha {validation.sha256[:12]})")
+
+
+@schema_app.command("put")
+def schema_put(name: str, file: str) -> None:
+    """Create or update a user schema (overriding a built-in is allowed)."""
+    _run(_schema_put(name, file))
+
+
+async def _schema_put(name: str, file: str) -> None:
+    _check_schema_name(name)
+    text = _read_schema_text(file)  # local validation first, no RPC on failure
+    settings = _load_settings()
+    client = ControllerClient(settings)
+    try:
+        response = await client.put_jev_schema(name, text)
+    except ControllerUnavailable as exc:
+        _exit_unavailable(exc, client.target)
+    except Exception as exc:
+        _exit_runtime(exc)
+    finally:
+        await client.close()
+    if response.error:
+        print(f"error: {response.error}", file=sys.stderr)
+        raise typer.Exit(EXIT_CONFIG)
+    for warning in response.validation.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    for error in response.validation.errors:
+        print(f"error: {error}", file=sys.stderr)
+    if not response.validation.ok:
+        raise typer.Exit(EXIT_CONFIG)
+    print(
+        f"stored schema '{name}' (sha {response.validation.sha256[:12]}, "
+        f"{_fmt_size(response.validation.size_bytes)})"
+    )
+
+
+@schema_app.command("rm")
+def schema_rm(name: str) -> None:
+    """Delete a user schema (or remove an override of a built-in)."""
+    _run(_schema_rm(name))
+
+
+async def _schema_rm(name: str) -> None:
+    _check_schema_name(name)
+    settings = _load_settings()
+    client = ControllerClient(settings)
+    was_active = False
+    try:
+        try:
+            active = await client.get_active_jev()
+            was_active = active.HasField("info") and active.info.schema_name == name
+        except ControllerUnavailable as exc:
+            _exit_unavailable(exc, client.target)
+        except Exception as exc:
+            _exit_runtime(exc)
+        try:
+            response = await client.delete_jev_schema(name)
+        except JevReadOnly as exc:
+            # JEV-04.9: built-in-only names are read-only — exit 1.
+            print(f"error: {exc}", file=sys.stderr)
+            raise typer.Exit(EXIT_RUNTIME) from exc
+        except JevSchemaNotFound as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise typer.Exit(EXIT_ALIAS) from exc
+        except ControllerUnavailable as exc:
+            _exit_unavailable(exc, client.target)
+        except Exception as exc:
+            _exit_runtime(exc)
+    finally:
+        await client.close()
+    if not response.ok:
+        print(f"error: {response.error or 'delete failed'}", file=sys.stderr)
+        raise typer.Exit(EXIT_RUNTIME)
+    if response.reverted_to:
+        print(f"deleted override of '{name}' — reverted to built-in")
+    else:
+        print(f"deleted schema '{name}'")
+    if was_active:
+        # JEV-04.9: deleting the active schema is allowed; the running model
+        # keeps its own copy of the body.
+        print(
+            f"note: '{name}' is currently active — the running model keeps "
+            "its copy until a new schema is attached"
+        )
+
+
+@schema_app.command("export")
+def schema_export(
+    name: str,
+    output: str | None = typer.Option(
+        None, "-o", "--output", help="Write to FILE instead of stdout."
+    ),
+) -> None:
+    """Write a stored schema's JSON to stdout or a file."""
+    _run(_schema_export(name, output))
+
+
+async def _schema_export(name: str, output: str | None) -> None:
+    _check_schema_name(name)
+    settings = _load_settings()
+    client = ControllerClient(settings)
+    try:
+        schema = await client.get_jev_schema(name)
+    except JevSchemaNotFound as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise typer.Exit(EXIT_ALIAS) from exc
+    except ControllerUnavailable as exc:
+        _exit_unavailable(exc, client.target)
+    except Exception as exc:
+        _exit_runtime(exc)
+    finally:
+        await client.close()
+    if output is not None:
+        try:
+            Path(output).write_text(schema.schema_json, encoding="utf-8")
+        except OSError as exc:
+            print(f"error: cannot write {output}: {exc}", file=sys.stderr)
+            raise typer.Exit(EXIT_RUNTIME) from exc
+        print(f"exported '{name}' to {output}")
+        return
+    sys.stdout.write(schema.schema_json)
+    if not schema.schema_json.endswith("\n"):
+        sys.stdout.write("\n")
 
 
 @app.command()
