@@ -1,6 +1,6 @@
 # 02 — Controller: Proto, Jev State, Jobs
 
-**Priority:** P1 · **Depends:** 01 · **Status:** Planned · **Phase:** J1
+**Priority:** P1 · **Depends:** 01 · **Status:** Implemented · **Phase:** J1
 
 ## Summary
 
@@ -76,16 +76,16 @@ schema store over gRPC. This is the only phase that changes `control.proto`; doc
 
 ## Task breakdown
 
-- [ ] Proto edits (JEV-02.1–02.8); `make proto`; commit regenerated `src/vibe/gen/**`; run pyright.
-- [ ] `ControllerClient`: `load(..., jev_mode, jev)`, `get_active_jev()`, schema CRUD/validate wrappers; map
+- [x] Proto edits (JEV-02.1–02.8); `make proto`; commit regenerated `src/vibe/gen/**`; run pyright.
+- [x] `ControllerClient`: `load(..., jev_mode, jev)`, `get_active_jev()`, schema CRUD/validate wrappers; map
       `NOT_FOUND`/`FAILED_PRECONDITION` to typed Python errors (`JevSchemaNotFound`, `StoreError`).
-- [ ] `controller/jev.py`: `JevState`, `resolve_jev`, `probe_jev`; persistence + reconcile on startup.
-- [ ] `JobRunner.load` branches (a)–(e); `unload` clears; plumb `JobEvent.error_code` through `jobs.py`
+- [x] `controller/jev.py`: `JevState`, `resolve_jev`, `probe_jev`; persistence + reconcile on startup.
+- [x] `JobRunner.load` branches (a)–(e); `unload` clears; plumb `JobEvent.error_code` through `jobs.py`
       dataclass and `_pump_job`/`_event_to_proto`.
-- [ ] Servicer: `LoadModel` passes Jev args; `GetStatus` fills `jev`; new RPC handlers; message-size options in
+- [x] Servicer: `LoadModel` passes Jev args; `GetStatus` fills `jev`; new RPC handlers; message-size options in
       `controller/server.py`.
-- [ ] `ModelSpec.jev_schema` / `jev` fields + registry tests; `vibe validate` prints store-missing warning.
-- [ ] Tests (doc 06 §B).
+- [x] `ModelSpec.jev_schema` / `jev` fields + registry tests; `vibe validate` prints store-missing warning.
+- [x] Tests (doc 06 §B).
 
 ## Acceptance criteria
 

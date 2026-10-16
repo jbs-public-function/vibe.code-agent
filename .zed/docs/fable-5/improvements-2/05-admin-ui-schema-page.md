@@ -1,6 +1,6 @@
 # 05 — Admin UI: Jev Schema Page
 
-**Priority:** P1 · **Depends:** 02 (03 to observe effect) · **Status:** Planned · **Phase:** J4
+**Priority:** P1 · **Depends:** 02 (03 to observe effect) · **Status:** Implemented · **Phase:** J4
 
 ## Summary
 
@@ -65,14 +65,15 @@ the user's exact text preserved in the `<textarea>`, and an error list — never
 
 ## Task breakdown
 
-- [ ] `admin/routes/jev.py` + register router in `admin/app.py`; `path_for` names.
-- [ ] Templates: `jev.html` (list + launch + active panel), `jev_edit.html`, `jev_delete_confirm.html`; nav link.
-- [ ] `vibe.css` additions (textarea, badges) — keep file free of `@import`/`url()`.
-- [ ] Body-cap helper for `/jev*` POSTs.
-- [ ] `vibe.jev.builder` + `/jev/build` (P2).
-- [ ] Dashboard/models/job template tweaks.
-- [ ] Optimistic-concurrency hidden field (P2, JEV-05.17).
-- [ ] Tests (doc 06 §D): route happy/sad paths with a fake controller client, escaping, 413, 403 cross-origin,
+- [x] `admin/routes/jev.py` + register router in `admin/app.py`; `path_for` names.
+- [x] Templates: `jev.html` (list + launch + active panel), `jev_edit.html`, `jev_delete_confirm.html`; nav link.
+- [x] `vibe.css` additions (textarea, badges) — keep file free of `@import`/`url()`.
+- [x] Body-cap helper for `/jev*` POSTs.
+- [x] Quick builder + `/jev/build` (P2) — implemented as `admin/jev_builder.py` (same output, tested as E11);
+      moving it to `vibe.jev.builder` is a non-blocking cleanup.
+- [x] Dashboard/models/job template tweaks.
+- [x] Optimistic-concurrency hidden field (P2, JEV-05.17).
+- [x] Tests (doc 06 §D): route happy/sad paths with a fake controller client, escaping, 413, 403 cross-origin,
       HEAD, controller-down degradation.
 
 ## Acceptance criteria

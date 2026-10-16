@@ -1,6 +1,6 @@
 # 04 — CLI: `vibe load --jev` and `vibe jev …`
 
-**Priority:** P1 · **Depends:** 02 (01 for offline validation) · **Status:** Planned · **Phase:** J3
+**Priority:** P1 · **Depends:** 02 (01 for offline validation) · **Status:** Implemented · **Phase:** J3
 
 ## Summary
 
@@ -62,13 +62,13 @@ vibe jev schema export NAME [-o FILE]           # write stored JSON to a file (e
 
 ## Task breakdown
 
-- [ ] `cli.py`: new options on `load`; `jev_app = typer.Typer()` group registered via `app.add_typer`; helper
+- [x] `cli.py`: new options on `load`; `jev_app = typer.Typer()` group registered via `app.add_typer`; helper
       `_read_schema_arg(include)`; `_load` plumbs `jev_mode`/`JevSpec`.
-- [ ] `errors.py`: no new constants unless a distinct code is wanted (plan: reuse 1/2/3).
-- [ ] `status` JSON/text additions; `_print_proto_event` tweaks.
-- [ ] `schema list/show/validate/put/rm/export` commands.
-- [ ] Makefile target + README section + `.env.example` (`VIBE_JEV_DIR`).
-- [ ] Tests (doc 06 §C): option conflicts, exit codes, stdin handling, size cap, offline validate, JSON output shape.
+- [x] `errors.py`: no new constants unless a distinct code is wanted (plan: reuse 1/2/3).
+- [x] `status` JSON/text additions; `_print_proto_event` tweaks.
+- [x] `schema list/show/validate/put/rm/export` commands.
+- [x] Makefile target + README section + `.env.example` (`VIBE_JEV_DIR`).
+- [x] Tests (doc 06 §C): option conflicts, exit codes, stdin handling, size cap, offline validate, JSON output shape.
 
 ## Acceptance criteria
 

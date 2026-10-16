@@ -1,6 +1,6 @@
 # 01 — Jev Schema Model, Default, Validation, and Store
 
-**Priority:** P1 · **Depends:** — · **Status:** Planned · **Phase:** J0
+**Priority:** P1 · **Depends:** — · **Status:** Implemented · **Phase:** J0
 
 ## Summary
 
@@ -126,15 +126,15 @@ Presets cost nothing (JSON files) and make the admin page useful before anyone w
 
 ## Task breakdown
 
-- [ ] Add `jsonschema` dep, `uv lock`, verify torch-free (`uv sync --dry-run --offline`).
-- [ ] Create `src/vibe/jev/{__init__,schema,store,errors}.py` + `builtin/{default,yes-no,yes-no-unsure}.json`.
-- [ ] Implement `validate_schema_text` + limits + warnings constants.
-- [ ] Implement `canonical_hash`, `wire_schema`, `schema_name_for_openai`.
-- [ ] Implement `SchemaStore` with atomic writes, shadowing, name rules.
-- [ ] `Settings.vibe_jev_dir`; `.env.example`; README `.env` row; `.gitignore`; `jev/.gitkeep`.
-- [ ] Tests (see doc 06 §A): every error and warning path, hash stability, store round-trip, shadow/revert,
+- [x] Add `jsonschema` dep, `uv lock`, verify torch-free (`uv sync --dry-run --offline`).
+- [x] Create `src/vibe/jev/{__init__,schema,store,errors}.py` + `builtin/{default,yes-no,yes-no-unsure}.json`.
+- [x] Implement `validate_schema_text` + limits + warnings constants.
+- [x] Implement `canonical_hash`, `wire_schema`, `schema_name_for_openai`.
+- [x] Implement `SchemaStore` with atomic writes, shadowing, name rules.
+- [x] `Settings.vibe_jev_dir`; `.env.example`; README `.env` row; `.gitignore`; `jev/.gitkeep`.
+- [x] Tests (see doc 06 §A): every error and warning path, hash stability, store round-trip, shadow/revert,
       path-traversal names, atomic-write (simulated crash leaves old file).
-- [ ] Verify wheel contains `builtin/*.json` (`uv build --wheel` then list, or `importlib.resources` test that
+- [x] Verify wheel contains `builtin/*.json` (`uv build --wheel` then list, or `importlib.resources` test that
       runs from an installed copy).
 
 ## Acceptance criteria

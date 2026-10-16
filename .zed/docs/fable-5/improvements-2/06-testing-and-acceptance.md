@@ -1,6 +1,6 @@
 # 06 — Jev Testing Plan and GPU Acceptance Runbook
 
-**Priority:** P1 · **Depends:** 01–05 · **Status:** Planned · **Phase:** J5
+**Priority:** P1 · **Depends:** 01–05 · **Status:** Implemented (Part 1) — Part 2 GPU runbook pending · **Phase:** J5
 
 Baseline before starting: `uv run --offline pytest -q` → 475 passed, 1 skipped; `uv run pyright` clean;
 `make check` green. Always `export UV_CACHE_DIR=/home/jamesb/projects/vibe.code-agent/.uv-cache`

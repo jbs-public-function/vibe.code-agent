@@ -1,6 +1,6 @@
 # 03 — Gateway: Jev Enforcement
 
-**Priority:** P1 · **Depends:** 02 · **Status:** Planned · **Phase:** J2
+**Priority:** P1 · **Depends:** 02 · **Status:** Implemented · **Phase:** J2
 
 ## Summary
 
@@ -74,13 +74,13 @@ tests can tell which schema produced the output. The header is added **only** in
 
 ## Task breakdown
 
-- [ ] `gateway/jev.py` pure helpers + tests.
-- [ ] `ControllerClient.get_active_jev()` consumer; cache-by-sha in `_SnapshotCache`; fail-closed path.
-- [ ] `post_endpoint` wiring; compatibility checks; completions rejection.
-- [ ] `stream_proxy`: drop inbound `content-length`; `extra_headers`.
-- [ ] `/v1/models` + `/health` markers; update existing payload tests (`vibe_jev: null` everywhere).
-- [ ] Logging.
-- [ ] Docs: `features/03-openai-gateway.md` gets a "Jev mode" pointer; README Troubleshooting row for
+- [x] `gateway/jev.py` pure helpers + tests.
+- [x] `ControllerClient.get_active_jev()` consumer; cache-by-sha in `_SnapshotCache`; fail-closed path.
+- [x] `post_endpoint` wiring; compatibility checks; completions rejection.
+- [x] `stream_proxy`: drop inbound `content-length`; `extra_headers`.
+- [x] `/v1/models` + `/health` markers; update existing payload tests (`vibe_jev: null` everywhere).
+- [x] Logging.
+- [x] Docs: `features/03-openai-gateway.md` gets a "Jev mode" pointer; README Troubleshooting row for
       `jev_incompatible_request`.
 
 ## Acceptance criteria
