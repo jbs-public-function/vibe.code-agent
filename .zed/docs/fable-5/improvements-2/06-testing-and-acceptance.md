@@ -1,6 +1,6 @@
 # 06 — Jev Testing Plan and GPU Acceptance Runbook
 
-**Priority:** P1 · **Depends:** 01–05 · **Status:** Implemented (Part 1) — Part 2 GPU runbook pending · **Phase:** J5
+**Priority:** P1 · **Depends:** 01–05 · **Status:** Implemented — Part 1 + Part 2 GPU runbook complete (2026-10-17) · **Phase:** J5
 
 Baseline before starting: `uv run --offline pytest -q` → 475 passed, 1 skipped; `uv run pyright` clean;
 `make check` green. Always `export UV_CACHE_DIR=/home/jamesb/projects/vibe.code-agent/.uv-cache`
@@ -159,12 +159,91 @@ second terminal. Use `qwen2.5-coder-7b` unless noted.
 Record outcomes (cold start, fast-path latency, B2 validity rate, any backend rejections) in the Status line of
 docs 01–05 and fold any `RISKY_KEYWORDS` findings back into doc 01.
 
+## Part 2 — recorded outcomes (2026-10-17, RTX 4070 Ti SUPER 16 GB, vLLM `v0.11.2`)
+
+### Pre-flight (decided before J2 merged)
+
+| # | Outcome |
+| --- | --- |
+| P1 | `--guided-decoding-backend` is **deprecated** in v0.11.2; the modern knob is `--structured-outputs-config` (default `backend='auto', disable_fallback=False`). We pass neither; default `auto` works. |
+| P2 | Root-level `oneOf` default **accepted** (HTTP 200, valid JSON) → **keep** the built-in `default`. |
+| P3 | The user's original `anyOf` schema accepted. |
+| P4 | `$schema` present is tolerated by the backend; `wire_schema` stripping kept (harmless). |
+| P5 | `if/then` accepted **but the conditional is NOT enforced** (model returned `result:"yes"` against enum `YES/NO`) → **keep** `if/then` in `RISKY_KEYWORDS`. |
+
+### A. Launch paths — all pass
+
+| # | Outcome |
+| --- | --- |
+| A1 | Cold `--jev` load: **55.6 s** (≈52 s model + ≈3 s probe), exit 0. |
+| A2 | `status --json` has `jev` populated (snake_case, int64); one container `127.0.0.1:8030->8000`. |
+| A3 | Fast path `--include-json`: **3.5 s**, same container id, new sha. |
+| A4 | Invalid JSON: exit 2 with line/col, container untouched. |
+| A5 | Backend-rejected schema (look-around regex in `pattern` → `Grammar error: look-around … not supported`): exit 1 `jev_probe_failed`; model stays READY **and Jev is unset** (found + fixed the fast-path attach bug: previous attachment not cleared on probe failure — see Findings). |
+| A6 | `jev off` ×2: both exit 0, idempotent, container untouched. |
+| A7 | `load llama-3.1-8b --jev --schema yes-no`: 59 s, single container throughout, Jev bound to llama. |
+| A8 | `unload` clears Jev. |
+| A9 | Jev survives controller kill/restart while the container runs; cleared after `docker rm -f` + restart. |
+
+### B. Data-plane correctness — all pass (B2/B9 numbers below)
+
+| # | Outcome |
+| --- | --- |
+| B1 | Default Jev: `message.content` parses + validates against the stored schema; `X-Vibe-Jev: default; sha=0fc705cd3f6c` present. |
+| B2 | 50 prompts × default schema: **50/50 schema-valid**, 0 `finish_reason=length`, p50 **2.63 s** (vs plain `:8030` p50 11.56 s — plain rambles to the 128-token cap, 34/50 length finishes). |
+| B3 | `stream:true`: concatenated deltas parse and validate; `finish_reason=stop`. |
+| B4 | Client `response_format` + `guided_json` removed and overridden; `X-Vibe-Jev-Overrode: response_format, guided_json`. |
+| B5 | `tools` → 400 `jev_incompatible_request`, upstream not called. |
+| B6 | `/v1/completions` → 400 `jev_incompatible_request`. |
+| B7 | `jev off` → plain free text, no `X-Vibe-Jev`, identical to `:8030`. |
+| B8 | `deepseek-r1-14b` + Jev: warn event emitted; schema-valid output; quality note below. |
+| B9 | qwen, 10 clear YES/NO questions: **10/10 valid, 9/10 sensible** (one miss: moon-cheese → `score 0.95`). |
+| B10 | VRAM during B2 vs plain: same peak (13922 MiB), grammar compile costs no meaningful VRAM. |
+
+**B8/B9 quality notes:** deepseek-r1 (reasoning) with Jev is 100 % schema-valid but answers
+degrade: 2/10 wrong on easy counterfactuals ("earth flat?"→YES, "moon cheese?"→YES), 3/10 truncated
+at 64 max_tokens, and the model jumps between choice/score/boolean branches unpredictably. Both models
+exhibit branch instability — downstream consumers should read `decision_type` before interpreting `result`.
+This is evidence for follow-up JEV-FU.1 (steering instructions) and JEV-FU.2 (truncation headers).
+
+### C. Admin UI — all pass via zero-JS HTTP client (JS disabled by construction)
+
+All C1–C10 checks passed with `curl`-equivalent form posts (the same requests a JS-disabled browser
+makes): routes render, built-in/override/stale/active badges, save/validate/save_launch/launch_unsaved
+actions, delete-confirm + revert-to-builtin, detach, quick builder end-to-end, and zero-JS/CSP
+(`default-src 'self'; script-src 'none'; …`) on every `/jev*` response. A real-browser visual pass
+was not performed; the HTTP-level flows are the JS-disabled contract. **C5 exposed and fixed a real
+bug** (see Findings).
+
+### Findings fixed during the runbook
+
+| # | Finding | Fix |
+| --- | --- | --- |
+| F1 | **A5**: fast-path attach left the *previous* attachment in place when the backend rejected the new schema (spec JEV-02.15: "model stays loaded in plain mode, Jev not set"). | `self.jev_state.clear()` in the `except JevError` path of the fast-path attach (`src/vibe/jobs.py`); regression test `test_fast_path_probe_failure_detaches_previous` (committed in `ef55e51`). |
+| F2 | **B8**: `deepseek-r1-14b` container crashed at startup — `torch.bfloat16 is not supported for quantization method awq`. The checkpoint declares `torch_dtype: bfloat16`; vLLM ≥0.11 resolves dtype from `config.json` when `--quantization awq` is forced. | `models.yaml`: `extra_args: ["--dtype", "float16"]` on the deepseek entry (registry stays the single source of truth; no code change). Cold load now 74 s. |
+| F3 | **C5**: "Launch without saving" was unusable on `/jev/new` with an empty name — the name gate ran before the action dispatch ("enter a schema name"). | Gate now applies only to `save`/`save_launch` (`src/vibe/admin/routes/jev.py`); regression tests `test_launch_unsaved_empty_name_on_new_flow`, `test_validate_empty_name_on_new_flow`. |
+
+### Notes / follow-ups (no code change)
+
+- **N1**: vLLM ≥0.11 rejects look-around regexes inside `pattern` with a `Grammar error` at probe time.
+  Validation cannot catch this statically (it's valid JSON Schema); the probe + A5 fix make it safe
+  (exit 1, Jev unset). Folded into doc 01 troubleshooting.
+- **N2**: Deleting the *active* named schema from the store leaves the attachment enforcing the old
+  schema with `stale: false` (JEV-02.18 computes stale only when the named schema still exists).
+  Enforcement continuing is the safe choice; consider a "schema deleted" hint in a later iteration.
+- **N3**: `--structured-outputs-config` is the only modern structured-output backend knob worth
+  documenting (P1); `--guided-decoding-backend` is deprecated.
+- **N4**: The slow cold-load `[DEBUG] waiting for the job to make progress` heartbeat is the known
+  improvements-plan-08 item; cold loads are 55–74 s regardless.
+
 ## Definition of done for the whole feature
 
-- Part 1 green with `make check`; Part 2 pre-flight decisions recorded; A1–A9, B1–B7, C1–C10 pass.
-- README: "Jev" section; `.env.example`: `VIBE_JEV_DIR`; `features/03-openai-gateway.md` and
+**Status (2026-10-17): DONE.** All items below verified during Part 2:
+
+- [x] Part 1 green with `make check`; Part 2 pre-flight decisions recorded; A1–A9, B1–B10, C1–C10 pass.
+- [x] README: "Jev" section; `.env.example`: `VIBE_JEV_DIR`; `features/03-openai-gateway.md` and
   `features/01-admin-ui.md` link to these docs.
-- No change to plain-mode behaviour (B7, C1 of the gateway tests).
+- [x] No change to plain-mode behaviour (B7 live-verified; C1 of the gateway tests).
 
 ## Follow-ups (not in scope)
 

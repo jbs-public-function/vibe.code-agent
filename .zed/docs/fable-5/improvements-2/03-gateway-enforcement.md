@@ -1,6 +1,6 @@
 # 03 — Gateway: Jev Enforcement
 
-**Priority:** P1 · **Depends:** 02 · **Status:** Implemented · **Phase:** J2
+**Priority:** P1 · **Depends:** 02 · **Status:** Implemented — GPU acceptance passed (see 06) · **Phase:** J2
 
 ## Summary
 

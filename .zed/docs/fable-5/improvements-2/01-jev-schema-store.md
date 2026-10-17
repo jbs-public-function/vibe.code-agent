@@ -1,6 +1,6 @@
 # 01 — Jev Schema Model, Default, Validation, and Store
 
-**Priority:** P1 · **Depends:** — · **Status:** Implemented · **Phase:** J0
+**Priority:** P1 · **Depends:** — · **Status:** Implemented — GPU acceptance passed (see 06) · **Phase:** J0
 
 ## Summary
 
@@ -156,3 +156,14 @@ Presets cost nothing (JSON files) and make the admin page useful before anyone w
 | Root-level `oneOf` rejected by the pinned vLLM backend | Fallback shape noted above; runbook C2 decides before J2 ships |
 | `RISKY_KEYWORDS` list is partly guesswork | Treat as warnings only; refine from runbook evidence |
 | `rpds-py` is a compiled wheel | Pure wheels exist for linux x86_64 cp312; confirmed by `uv lock` resolution |
+
+## Runbook evidence (folded back from 06, 2026-10-17)
+
+- Root-level `oneOf` accepted by vLLM `v0.11.2` → the built-in `default` stays as-is (P2).
+- `if/then` accepted but **not enforced** by the backend → `if/then/else` stays in `RISKY_KEYWORDS` (P5).
+- Look-around regexes **inside `pattern`** (e.g. `"(?<=a)b"`) are rejected by the backend at probe time
+  (`Grammar error: look-around … not supported`). Static validation cannot catch this — it is valid JSON
+  Schema — so the probe (JEV-02.14) is the enforcement point, and the A5 fix guarantees the model stays
+  plain and Jev-unset on rejection. Avoid look-around in `pattern` when targeting xgrammar backends.
+- `$schema` present is tolerated by the backend; `wire_schema` still strips it (harmless, keeps the wire
+  payload minimal).

@@ -1,6 +1,6 @@
 # 04 — CLI: `vibe load --jev` and `vibe jev …`
 
-**Priority:** P1 · **Depends:** 02 (01 for offline validation) · **Status:** Implemented · **Phase:** J3
+**Priority:** P1 · **Depends:** 02 (01 for offline validation) · **Status:** Implemented — GPU acceptance passed (see 06) · **Phase:** J3
 
 ## Summary
 

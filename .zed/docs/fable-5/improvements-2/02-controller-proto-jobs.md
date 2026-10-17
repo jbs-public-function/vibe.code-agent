@@ -1,6 +1,6 @@
 # 02 — Controller: Proto, Jev State, Jobs
 
-**Priority:** P1 · **Depends:** 01 · **Status:** Implemented · **Phase:** J1
+**Priority:** P1 · **Depends:** 01 · **Status:** Implemented — GPU acceptance passed (see 06) · **Phase:** J1
 
 ## Summary
 

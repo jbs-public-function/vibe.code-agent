@@ -7,6 +7,11 @@ conforming to a JSON Schema (decision / judge / classifier output), with a built
 These documents are **plans only** — no code accompanies them. They follow the conventions of
 [`../improvements/`](../improvements/README.md): requirement IDs `JEV-<doc>.<n>`, severity, task checklists.
 
+**Status (2026-10-17):** J0–J5 implemented and accepted — unit suites green (`make check`), and the
+Part 2 GPU/Docker runbook in [`06-testing-and-acceptance.md`](06-testing-and-acceptance.md) passed
+A1–A9, B1–B10, C1–C10. The runbook fixed three defects (F1 fast-path detach, F2 deepseek dtype,
+F3 admin name gate); details are recorded in doc 06.
+
 ## Assumptions to confirm (read first)
 
 The request did not define "Jev" precisely. This plan assumes:

@@ -1,6 +1,6 @@
 # 05 — Admin UI: Jev Schema Page
 
-**Priority:** P1 · **Depends:** 02 (03 to observe effect) · **Status:** Implemented · **Phase:** J4
+**Priority:** P1 · **Depends:** 02 (03 to observe effect) · **Status:** Implemented — GPU acceptance passed (see 06; C5 fix F3 landed) · **Phase:** J4
 
 ## Summary
 
