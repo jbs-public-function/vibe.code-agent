@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import time
 from collections.abc import AsyncIterator, Coroutine, Sequence
 from contextlib import suppress
 from typing import Any, cast
@@ -188,6 +189,7 @@ def _chat_stream(
     path_for = request.app.url_path_for
 
     async def generate() -> AsyncIterator[bytes]:
+        started = time.monotonic()
         header = templates.get_template("chat_stream.html").render(
             request=request,
             phase="header",
@@ -259,12 +261,14 @@ def _chat_stream(
             if reply_parts:
                 session.append({"role": "assistant", "content": "".join(reply_parts)})
                 store.touch(session)
+        elapsed = f"{time.monotonic() - started:.2f} s"
         footer = templates.get_template("chat_stream.html").render(
             request=request,
             phase="footer",
             page="chat",
             active_alias=alias,
             error=stream_error,
+            elapsed=elapsed,
             omitted=omitted,
             temperature=temperature,
             max_tokens=max_tokens,

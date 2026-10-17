@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import time
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import suppress
 from typing import Any, cast
@@ -182,6 +183,7 @@ def _jev_chat_stream(
     path_for = request.app.url_path_for
 
     async def generate() -> AsyncIterator[bytes]:
+        started = time.monotonic()
         header = templates.get_template("jev_chat_stream.html").render(
             request=request,
             phase="header",
@@ -285,6 +287,9 @@ def _jev_chat_stream(
                 session.append({"role": "assistant", "content": "".join(reply_parts)})
                 store.touch(session)
 
+        # Time until the last token arrived (validation below is negligible).
+        elapsed = f"{time.monotonic() - started:.2f} s"
+
         # -- inspected result (JEV-07.4) ------------------------------------
         reply = "".join(reply_parts)
         parsed, parse_error = _extract_json(reply)
@@ -320,6 +325,7 @@ def _jev_chat_stream(
             page="jev_chat",
             active_alias=alias,
             error=stream_error,
+            elapsed=elapsed,
             omitted=omitted,
             temperature=temperature,
             max_tokens=max_tokens,

@@ -34,6 +34,7 @@
         <div class="role">assistant</div>
         <pre id="stream"><!-- Firefox needs ~1 KiB before the first paint; this comment pads the initial flush (NFR-01.6). {{ "x" * 1024 }} -->{% endif %}
 {% if phase == "footer" %}</pre>
+      <p class="dim">reply took {{ elapsed }}</p>
       </div>
     </section>
     {% if error %}<div class="flash" role="alert">{{ error }}</div>{% endif %}

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any, cast, override
 
@@ -287,6 +288,7 @@ async def test_stream_assembles_valid_json_and_renders_verdict() -> None:
     assert "schema-valid" in text
     assert "stop" in text
     assert "prompt 12" in text and "completion 8" in text
+    assert re.search(r"Elapsed</dt><dd>\d+\.\d{2} s</dd>", text)
     assert f"default; sha={SHA_A[:12]}" in text
     # Payload: through the gateway, no response_format (the gateway injects).
     assert len(calls) == 1

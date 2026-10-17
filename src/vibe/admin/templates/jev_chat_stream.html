@@ -52,6 +52,7 @@
         </dd>
         <dt>finish_reason</dt><dd><code>{{ finish_reason or "—" }}</code></dd>
         <dt>Tokens</dt><dd>{% if prompt_tokens or completion_tokens %}prompt {{ prompt_tokens }} · completion {{ completion_tokens }}{% else %}—{% endif %}</dd>
+        <dt>Elapsed</dt><dd>{{ elapsed }}</dd>
         <dt>Enforced by</dt><dd>{% if jev_header %}<code>{{ jev_header }}</code>{% else %}— (no X-Vibe-Jev header){% endif %}</dd>
       </dl>
       {% if verdict_errors %}

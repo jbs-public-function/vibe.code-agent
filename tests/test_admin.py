@@ -886,6 +886,7 @@ async def test_chat_stream_escapes_and_flushes_header_first() -> None:
     assert b"hello " not in chunks[0]
     assert b"hello " in body
     assert b"</pre>" in body
+    assert re.search(rb"reply took \d+\.\d{2} s", body)
     # Form fields parsed manually from the urlencoded body.
     call = fake.chat_calls[0]
     assert call["temperature"] == 0.5
@@ -917,6 +918,7 @@ async def test_chat_stream_appends_error_block_when_controller_dies_midstream() 
     assert b"partial" in body
     assert b"controller unreachable" in body
     assert b"</pre>" in body
+    assert re.search(rb"reply took \d+\.\d{2} s", body)  # elapsed renders even on failure
 
 
 async def test_chat_runtime_error_midstream_renders_message() -> None:
