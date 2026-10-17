@@ -40,8 +40,8 @@ help:
 	@echo "  make chat        - Stream a test chat through the gateway (8080)"
 	@echo "  make tls         - Optional TLS front; requires Docker"
 	@echo "  make tls-stop    - Stop the optional TLS front"
-	@echo "  make proto       - Regenerate committed gRPC code from proto/vibe/v1/control.proto
-	  make jev         - Load a model in Jev mode: make jev ALIAS=… [SCHEMA=file.json] (P2, JEV-04.10)"
+	@echo "  make proto       - Regenerate committed gRPC code from proto/vibe/v1/control.proto"
+	@echo "  make jev         - Load a model in Jev mode: make jev ALIAS=… [SCHEMA=file.json] (P2, JEV-04.10)"
 	@echo "  make typecheck   - Run pyright over src/ and tests/"
 	@echo "  make check       - Full pre-commit gate: lock, tests, pyright, torch-free sync"
 	@echo "  make lab         - Open a shell in the laboratory container (torch + CUDA)"
