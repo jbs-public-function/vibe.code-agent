@@ -717,6 +717,46 @@ async def test_launch_unsaved_missing_alias_inline_error() -> None:
     assert fake.load_calls == []
 
 
+async def test_launch_unsaved_empty_name_on_new_flow() -> None:
+    # Regression (runbook C5): the name gate must not block the
+    # name-less "Launch without saving" action on /jev/new.
+    fake = populated_fake()
+    fake.load_script = [make_event("j-10", message="jev: probing")]
+    transport = make_transport(fake)
+    response = await post(
+        transport,
+        "/jev/new",
+        {
+            "action": "launch_unsaved",
+            "schema_json": VALID_SCHEMA,
+            "alias": "qwen2.5-coder-7b",
+        },
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/jobs/j-10"
+    _, _, jev_mode, spec = fake.load_calls[0]
+    assert spec is not None
+    assert jev_mode == control_pb2.JEV_ON
+    assert spec.schema_name == ""
+    assert spec.schema_json == VALID_SCHEMA
+    assert fake.put_calls == []
+
+
+async def test_validate_empty_name_on_new_flow() -> None:
+    # Regression (runbook C2/C4): validating pasted text must not
+    # require a name first.
+    fake = populated_fake()
+    transport = make_transport(fake)
+    response = await post(
+        transport,
+        "/jev/new",
+        {"action": "validate", "schema_json": VALID_SCHEMA},
+    )
+    assert response.status_code == 200
+    assert "valid (sha" in response.text
+    assert "enter a schema name" not in response.text
+
+
 # -- E5: escaping ------------------------------------------------------------
 
 

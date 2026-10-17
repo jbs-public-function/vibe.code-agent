@@ -293,7 +293,9 @@ async def _editor_post(
             source="",
         )
 
-    if name_editable:
+    if name_editable and action in ("save", "save_launch"):
+        # A name is only required when the schema will be stored.
+        # `validate` and `launch_unsaved` act on the text alone.
         problem = _name_error(name) if name else "enter a schema name"
         if problem:
             return await rerender([problem])

@@ -33,6 +33,8 @@ models:
     gpu_memory_utilization: 0.85
     container_name: vibe-deepseek-r1-14b
     host_port: 8010
-    extra_args: []
+    # vLLM 0.11.x resolves dtype from config.json (bfloat16 here); AWQ kernels
+    # require float16, so pin it explicitly (B8 finding, runbook 06).
+    extra_args: ["--dtype", "float16"]
     use_case: Deep reasoning, logic problems
     tags: [reasoning]
