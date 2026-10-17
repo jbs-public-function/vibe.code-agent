@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "YesNo",
+  "description": "Jev preset: a binary YES/NO choice with a confidence. Forces a yes-or-no answer.",
+  "type": "object",
+  "properties": {
+    "decision_type": { "const": "choice" },
+    "result": { "type": "string", "enum": ["YES", "NO"], "description": "The chosen action." },
+    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+  },
+  "required": ["decision_type", "result", "confidence"],
+  "additionalProperties": false
+}

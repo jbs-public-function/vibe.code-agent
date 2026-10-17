@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Jev{% endblock title %}
+{% block content %}
+<h1>Jev</h1>
+<p class="dim">Jev forces every chat completion of the active model to emit JSON conforming to a JSON Schema (vLLM structured outputs).</p>
+
+<section class="card">
+  <h2>Jev chat</h2>
+  <p>Send prompts under the active schema and inspect the validated JSON output. <a href="{{ path_for('jev_chat') }}">Open the Jev chat panel →</a></p>
+</section>
+
+{% if active %}
+<section class="card">
+  <h2>Active Jev</h2>
+  <dl class="inline-dl">
+    <dt>Schema</dt><dd><a href="{{ path_for('jev_edit', name=active.name) }}"><code>{{ active.name }}</code></a></dd>
+    <dt>Source</dt><dd><span class="badge badge-{{ active.source }}">{{ active.source }}</span></dd>
+    <dt>SHA</dt><dd><code>{{ active.sha12 }}</code></dd>
+    <dt>Applied</dt><dd>{{ active.applied_label }}</dd>
+  </dl>
+  {% if active.stale %}<span class="badge badge-stale">stale</span>{% endif %}
+  {% if not controller_down %}
+  <form method="post" action="{{ path_for('jev_detach') }}" class="inline">
+    <button type="submit">Detach</button>
+  </form>
+  {% endif %}
+</section>
+{% else %}
+<section class="card">
+  <h2>Active Jev</h2>
+  <p class="dim">No schema attached — completions are unconstrained.</p>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Schemas</h2>
+  <table>
+    <caption>Jev schemas — built-ins are read-only; a user schema with a built-in name overrides it.</caption>
+    <thead>
+      <tr><th>Name</th><th>Source</th><th>SHA</th><th>Size</th><th>Modified</th><th>Status</th><th>Actions</th></tr>
+    </thead>
+    <tbody>
+    {% for row in schema_rows %}
+      <tr>
+        <td><a href="{{ path_for('jev_edit', name=row.name) }}"><code>{{ row.name }}</code></a></td>
+        <td><span class="badge badge-{{ row.source }}">{{ row.source_label }}</span></td>
+        <td><code>{{ row.sha12 }}</code></td>
+        <td>{{ row.size_bytes|thousands }} bytes</td>
+        <td>{{ row.mtime_label }}</td>
+        <td>{% if row.active %}<span class="badge badge-ready">active</span>{% endif %}</td>
+        <td>
+          <a href="{{ path_for('jev_edit', name=row.name) }}">Edit</a>
+          {% if row.source != 'builtin' %} · <a href="{{ path_for('jev_delete_confirm', name=row.name) }}">Delete</a>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p><a href="{{ path_for('jev_new') }}">New schema</a></p>
+</section>
+
+<section class="card">
+  <h2>Launch with a schema</h2>
+  <form method="post" action="{{ path_for('jev_launch') }}">
+    <div class="inline">
+      <label for="alias">Model</label>
+      <select name="alias" id="alias" {% if controller_down %}disabled{% endif %}>
+        {% for info in infos %}
+        <option value="{{ info.alias }}" {% if info.alias == active_alias %}selected{% endif %}>{{ info.alias }}</option>
+        {% endfor %}
+      </select>
+      <label for="schema_name">Schema</label>
+      <select name="schema_name" id="schema_name" {% if controller_down %}disabled{% endif %}>
+        {% for row in schema_rows %}
+        <option value="{{ row.name }}">{{ row.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <label><input type="checkbox" name="force" value="on" {% if controller_down %}disabled{% endif %}> Force reload <span class="dim">(restarts the container, 30–120 s)</span></label>
+    <div class="inline">
+      <button type="submit" {% if controller_down %}disabled{% endif %}>Launch</button>
+    </div>
+  </form>
+  {% if reasoning_models %}
+  <p class="warn">Note: {{ reasoning_models|join(", ") }} tagged 'reasoning' — structured output suppresses thinking tokens; quality may drop.</p>
+  {% endif %}
+</section>
+{% endblock content %}

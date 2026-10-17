@@ -1,0 +1,8 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "exclude": [
+    "src/vibe/gen",
+    ".venv"
+  ]
+}

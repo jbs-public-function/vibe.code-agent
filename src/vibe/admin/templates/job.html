@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Job {{ job_id }}{% endblock title %}
+{% block head %}
+  {% if refresh %}<meta http-equiv="refresh" content="2">{% endif %}
+{% endblock head %}
+{% block content %}
+{% if not_found %}
+<h1>Job not found</h1>
+<p>No job with id <code>{{ job_id }}</code> on the controller — it may have been purged from its history.</p>
+<p><a href="{{ path_for('models') }}">Back to models</a> · <a href="{{ path_for('dashboard') }}">Dashboard</a></p>
+{% else %}
+<h1>Job <code>{{ job_id }}</code></h1>
+<dl class="inline-dl">
+  <dt>Kind</dt><dd>{{ kind }}</dd>
+  <dt>Alias</dt><dd><code>{{ alias or "—" }}</code></dd>
+  <dt>Elapsed</dt><dd>{{ elapsed_s|uptime }}</dd>
+  <dt>State</dt><dd><span class="badge badge-{{ latest_state|lower }}">{{ latest_state }}</span></dd>
+</dl>
+
+{% if outcome_unknown %}
+<div class="flash" role="status">This job is no longer running but never reached a final state — its outcome is unknown (the controller may have restarted).</div>
+{% endif %}
+
+{% if terminal %}
+  {% if error_view %}
+<div class="flash" role="alert">Job failed. Last container log lines:</div>
+<pre class="logs">{{ log_lines|join("\n") }}</pre>
+  {% else %}
+<p>Job finished successfully.</p>
+  {% endif %}
+{% endif %}
+
+<h2>Events</h2>
+<ul class="events">
+{% for event in events %}
+  <li>
+    <span class="ts">{{ event.ts_unix_ms|ts }}</span>
+    <span class="level">{{ event.level }}</span>
+    <span class="badge badge-{{ event.state|statename|lower }}">{{ event.state|statename }}</span>
+    {% if event.error_code %}<span class="badge badge-error">{{ event.error_code }}</span>{% endif %}
+    {% if event.progress %}<span class="dim">{{ "%.0f%%"|format(event.progress * 100) }}</span>{% endif %}
+    {{ event.message }}
+  </li>
+{% endfor %}
+</ul>
+<p><a href="{{ path_for('models') }}">Back to models</a> · <a href="{{ path_for('dashboard') }}">Dashboard</a></p>
+{% endif %}
+{% endblock content %}

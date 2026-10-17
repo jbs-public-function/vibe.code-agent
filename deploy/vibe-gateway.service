@@ -1,0 +1,27 @@
+# vibe OpenAI-compatible gateway (HTTP) — systemd USER unit.
+#
+# Talks to the controller over gRPC at 127.0.0.1:50051; `Wants=` starts the
+# controller with this unit so the dependency is pulled in, not just ordered.
+#
+# Install and start with:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vibe-gateway
+#
+# Follow logs with:   journalctl --user -u vibe-gateway -f
+# Check status with:  systemctl --user status vibe-gateway
+
+[Unit]
+Description=vibe gateway (OpenAI API)
+After=vibe-controller.service
+Wants=vibe-controller.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/vibe.code-agent
+EnvironmentFile=%h/projects/vibe.code-agent/.env
+ExecStart=%h/projects/vibe.code-agent/.venv/bin/vibe serve --only gateway
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

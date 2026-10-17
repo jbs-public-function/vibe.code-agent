@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock title %}
+{% block head %}<meta http-equiv="refresh" content="5">{% endblock head %}
+{% block content %}
+<h1>Dashboard</h1>
+
+<section class="grid">
+  <div class="card">
+    <h2>Active model</h2>
+    <dl>
+      <dt>Alias</dt><dd><code>{{ active_alias or "none" }}</code></dd>
+      {% if jev %}
+      <dt>Jev</dt><dd><span class="badge badge-ready">Jev: {{ jev.schema_name }} ({{ jev.sha256[:12] }})</span>{% if jev.stale %} <span class="badge badge-stale">stale</span>{% endif %}</dd>
+      {% endif %}
+      <dt>State</dt><dd><span class="badge badge-{{ state|lower }}">{{ state }}</span></dd>
+      <dt>Port</dt><dd>{{ host_port or "—" }}</dd>
+      <dt>Container</dt><dd><code>{{ container_id }}</code></dd>
+      <dt>Uptime</dt><dd>{{ uptime_s|uptime }}</dd>
+    </dl>
+    {% if last_error %}<p class="error">last error: {{ last_error }}</p>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>GPU</h2>
+    <dl>
+      <dt>Memory</dt><dd>{{ gpu.used_mib|thousands }} / {{ gpu.total_mib|thousands }} MiB</dd>
+      <dt>Utilization</dt><dd>{{ util_pct }}%</dd>
+    </dl>
+    <div class="bar" role="progressbar" aria-label="memory" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ mem_pct }}" title="memory {{ mem_pct }}%"><div class="fill {{ bar_class }}"></div></div>
+    <p class="dim">memory {{ mem_pct }}%</p>
+    <h3>Compute processes</h3>
+    {% if gpu.processes %}
+    <table>
+      <thead><tr><th>PID</th><th>Name</th><th>MiB</th></tr></thead>
+      <tbody>
+      {% for process in gpu.processes %}
+        <tr><td>{{ process.pid }}</td><td>{{ process.name }}</td><td>{{ process.used_mib|thousands }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="dim">no compute processes</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Health</h2>
+    <dl>
+      <dt>Controller</dt><dd>{{ "down" if controller_down else "ok" }}</dd>
+      <dt>Gateway</dt><dd>{{ "down" if not gateway_ok else "ok" }}</dd>
+    </dl>
+    {% if current_job.id %}
+    <h2>Current job</h2>
+    <p><a href="{{ path_for('job', job_id=current_job.id) }}">{{ current_job.id }}</a>
+       · {{ current_job.kind|jobkind }} · <code>{{ current_job.alias }}</code></p>
+    {% endif %}
+  </div>
+</section>
+{% endblock content %}

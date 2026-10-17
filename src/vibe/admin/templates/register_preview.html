@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Register model{% endblock title %}
+{% block content %}
+<h1>Register model</h1>
+
+{% if errors %}
+<div class="flash" role="alert">
+  {% for error in errors %}<p>{{ error }}</p>{% endfor %}
+</div>
+<form method="post" action="{{ path_for('developer_reload') }}" class="inline">
+  <button type="submit">Reload registry</button>
+</form>
+{% endif %}
+{% for warning in warnings %}<p class="warn">warning: {{ warning }}</p>{% endfor %}
+
+{% if preview %}
+<section class="card">
+  <h2>Proposed models.yaml entry</h2>
+  <pre class="logs">{{ preview }}</pre>
+  <form method="post" action="{{ path_for('developer_register_confirm') }}" class="inline">
+    {% for name, value in confirm.items() %}
+    <input type="hidden" name="{{ name }}" value="{{ value }}">
+    {% endfor %}
+    <button type="submit">Confirm and reload registry</button>
+  </form>
+  <p class="dim">This is the exact entry the controller will write.</p>
+</section>
+{% else %}
+<section class="card">
+  <h2>New models.yaml entry</h2>
+  <form method="post" action="{{ path_for('developer_register') }}">
+    <div class="inline">
+      <label for="repo">HF repo</label>
+      <input name="repo" id="repo" value="{{ form.get('repo', '') }}" required>
+      <label for="alias">Alias</label>
+      <input name="alias" id="alias" value="{{ form.get('alias', '') }}" required>
+    </div>
+    <div class="inline">
+      <label for="quantization">Quantization</label>
+      <select name="quantization" id="quantization">
+        {% for option in quantization_options %}
+        <option value="{{ option }}" {% if form.get('quantization') == option %}selected{% endif %}>{{ option }}</option>
+        {% endfor %}
+      </select>
+      <label for="tool_parser">Tool parser</label>
+      <select name="tool_parser" id="tool_parser">
+        {% for option in tool_parser_options %}
+        <option value="{{ option }}" {% if form.get('tool_parser') == option %}selected{% endif %}>{{ option }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="inline">
+      <label for="max_model_len">Max model len</label>
+      <input name="max_model_len" id="max_model_len" value="{{ form.get('max_model_len', '') }}" placeholder="auto">
+      <label for="gpu_mem">GPU mem fraction</label>
+      <input name="gpu_mem" id="gpu_mem" value="{{ form.get('gpu_mem', '') }}" placeholder="auto">
+      <label for="port">Port</label>
+      <input name="port" id="port" value="{{ form.get('port', '') }}" placeholder="auto">
+    </div>
+    <label for="use_case">Use case</label>
+    <textarea name="use_case" id="use_case" rows="2">{{ form.get('use_case', '') }}</textarea>
+    <label for="tags">Tags (comma-separated)</label>
+    <input name="tags" id="tags" value="{{ form.get('tags', '') }}">
+    <div class="inline">
+      <button type="submit">Preview</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+{% endblock content %}

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Delete Jev schema{% endblock title %}
+{% block content %}
+<h1>Delete Jev schema</h1>
+<section class="card">
+{% if builtin %}
+  <p><code>{{ name }}</code> is a built-in schema — built-ins cannot be deleted.</p>
+  <p><a href="{{ path_for('jev') }}">Back to Jev</a></p>
+{% else %}
+  <p>Delete <code>{{ name }}</code>?
+  {% if source == 'override' %}
+  This is an override of a built-in — deleting it reverts to the built-in schema.
+  {% else %}
+  The user schema is removed from the store.
+  {% endif %}</p>
+  <form method="post" action="{{ path_for('jev_delete', name=name) }}" class="inline">
+    <button type="submit">Delete {{ name }}</button>
+    <a href="{{ path_for('jev_edit', name=name) }}">Cancel</a>
+  </form>
+{% endif %}
+</section>
+{% endblock content %}

@@ -1,0 +1,27 @@
+# vibe admin UI (HTTP) — systemd USER unit.
+#
+# Talks to the controller over gRPC at 127.0.0.1:50051; `Wants=` starts the
+# controller with this unit so the dependency is pulled in, not just ordered.
+#
+# Install and start with:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vibe-admin
+#
+# Follow logs with:   journalctl --user -u vibe-admin -f
+# Check status with:  systemctl --user status vibe-admin
+
+[Unit]
+Description=vibe admin UI (HTTP)
+After=vibe-controller.service
+Wants=vibe-controller.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/vibe.code-agent
+EnvironmentFile=%h/projects/vibe.code-agent/.env
+ExecStart=%h/projects/vibe.code-agent/.venv/bin/vibe serve --only admin
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

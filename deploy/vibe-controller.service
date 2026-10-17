@@ -1,0 +1,26 @@
+# vibe model controller (gRPC) — systemd USER unit.
+#
+# Install and start with:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vibe-controller
+#
+# The unit is portable: `%h` expands to the running user's home directory, so
+# the repo does not need to live at /home/jamesb. For long-running sessions
+# without a login, enable lingering once: `loginctl enable-linger $USER`.
+#
+# Follow logs with:   journalctl --user -u vibe-controller -f
+# Check status with:  systemctl --user status vibe-controller
+
+[Unit]
+Description=vibe model controller (gRPC)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/vibe.code-agent
+EnvironmentFile=%h/projects/vibe.code-agent/.env
+ExecStart=%h/projects/vibe.code-agent/.venv/bin/vibe serve --only controller
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

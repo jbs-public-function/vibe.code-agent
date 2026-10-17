@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Jev chat{% endblock title %}
+{% block content %}
+<h1>Jev chat</h1>
+<p class="dim">Sends the prompt through the gateway, so the active Jev schema is enforced exactly as for any OpenAI-compatible client. After each reply the panel validates the output against the schema.</p>
+
+{% if active_jev %}
+<section class="card">
+  <h2>Active Jev</h2>
+  <dl class="inline-dl">
+    <dt>Schema</dt><dd><a href="{{ path_for('jev_edit', name=active_jev.schema_name) }}"><code>{{ active_jev.schema_name }}</code></a></dd>
+    <dt>Source</dt><dd><span class="badge badge-{{ active_jev.source }}">{{ active_source_label }}</span></dd>
+    <dt>SHA</dt><dd><code>{{ active_jev.sha256[:12] }}</code></dd>
+    <dt>Applied</dt><dd>{{ (active_jev.applied_at_unix_ms / 1000) | ts }}</dd>
+  </dl>
+  {% if active_jev.stale %}<span class="badge badge-stale">stale</span>{% endif %}
+</section>
+{% else %}
+<section class="card">
+  <h2>Active Jev</h2>
+  <p class="dim">No schema attached — replies are unconstrained and not validated. <a href="{{ path_for('jev') }}">Attach one on the Jev page</a>.</p>
+</section>
+{% endif %}
+
+{% if not controller_down %}
+  {% if ready and gateway_ok %}
+<section class="card">
+  <h2>Send</h2>
+  <form method="post" action="{{ path_for('jev_chat_send') }}">
+    <label for="message">Prompt</label>
+    <textarea id="message" name="message" rows="4" required autofocus></textarea>
+    <div class="inline">
+      <label for="temperature">temperature</label>
+      <input id="temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="{{ temperature }}">
+      <label for="max_tokens">max_tokens</label>
+      <input id="max_tokens" name="max_tokens" type="number" min="1" step="1" {% if max_model_len %}max="{{ max_model_len }}"{% endif %} value="{{ max_tokens }}">
+      <button type="submit">Send</button>
+    </div>
+  </form>
+  <form method="post" action="{{ path_for('jev_chat_reset') }}" class="inline">
+    <button type="submit">Reset conversation</button>
+  </form>
+</section>
+  {% elif ready and not gateway_ok %}
+<section class="card">
+  <p class="warn">Gateway unreachable — the Jev chat panel sends its requests through the gateway (<code>vibe serve</code>), which is not answering right now.</p>
+</section>
+  {% else %}
+<section class="card">
+  <p>No model loaded. <a href="{{ path_for('models') }}">Load a model first</a>, then attach a schema on the <a href="{{ path_for('jev') }}">Jev page</a>.</p>
+</section>
+  {% endif %}
+{% endif %}
+
+{% if warn %}
+<div class="flash" role="status">History is large (~{{ total_tokens }} tokens vs {{ max_model_len }} context) — consider resetting the conversation.</div>
+{% endif %}
+
+<section class="card">
+  <h2>Conversation <span class="dim">(~{{ total_tokens }} tokens)</span></h2>
+  {% if session.messages %}
+    {% for message in session.messages %}
+    <div class="turn turn-{{ message.role }}">
+      <div class="role">{{ message.role }} <span class="dim">~{{ (message.content|length) // 4 }} tok</span></div>
+      <pre>{{ message.content }}</pre>
+    </div>
+    {% endfor %}
+  {% else %}
+  <p class="dim">No messages yet.</p>
+  {% endif %}
+</section>
+{% endblock content %}

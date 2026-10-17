@@ -1,0 +1,18 @@
+# Optional TLS front for VIBE_BIND widened beyond loopback (ADR-4). Off by
+# default; see `make tls` / `make tls-stop`.
+#
+# Site addresses are bare ports, not `localhost:…`, so a widened VIBE_BIND
+# actually serves remote hosts. `tls internal` mints a local CA stored in the
+# `vibe-caddy-data` volume; trust it once with `caddy trust` on the host.
+#
+# Caddy must forward X-Forwarded-Proto/Host for the admin UI's root-relative
+# links and Host validation (IMP-04.26/04.1): the reverse_proxy defaults do
+# this automatically when VIBE_BIND is 127.0.0.1.
+:8443 {
+	tls internal
+	reverse_proxy 127.0.0.1:8080
+}
+:8444 {
+	tls internal
+	reverse_proxy 127.0.0.1:8081
+}

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Remove cached repo{% endblock title %}
+{% block content %}
+<h1>Remove cached repo</h1>
+<section class="card">
+  <p>Remove <code>{{ repo }}</code> from the HF cache? Its files under
+     <code>HF_HOME/hub</code> are deleted; a later download starts fresh.</p>
+  <form method="post" action="{{ path_for('developer_cache_remove', repo=repo) }}" class="inline">
+    <button type="submit">Remove {{ repo }}</button>
+    <a href="{{ path_for('developer') }}">Cancel</a>
+  </form>
+</section>
+{% endblock content %}

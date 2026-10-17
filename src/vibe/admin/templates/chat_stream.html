@@ -1,0 +1,71 @@
+{% if phase == "header" %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat · vibe</title>
+  <link rel="stylesheet" href="{{ path_for('static', path='vibe.css') }}">
+</head>
+<body>
+  <nav class="nav" aria-label="site">
+    <span class="brand">vibe</span>
+    <a href="{{ path_for('dashboard') }}">Dashboard</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('models') }}">Models</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('jev') }}">Jev</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('jev_chat') }}">Jev chat</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('chat') }}" class="active">Chat</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('logs') }}">Logs</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('developer') }}">Developer</a>
+  </nav>
+  <main>
+    <h1>Chat</h1>
+    <section class="card">
+      <h2>Conversation</h2>
+      {% for message in session.messages %}
+      <div class="turn turn-{{ message.role }}">
+        <div class="role">{{ message.role }}</div>
+        <pre>{{ message.content }}</pre>
+      </div>
+      {% endfor %}
+      <div class="turn turn-assistant">
+        <div class="role">assistant</div>
+        <pre id="stream"><!-- Firefox needs ~1 KiB before the first paint; this comment pads the initial flush (NFR-01.6). {{ "x" * 1024 }} -->{% endif %}
+{% if phase == "footer" %}</pre>
+      <p class="dim">reply took {{ elapsed }}</p>
+      </div>
+    </section>
+    {% if error %}<div class="flash" role="alert">{{ error }}</div>{% endif %}
+    {% if omitted %}<p class="warn">{{ omitted }} older turns omitted — the history exceeded the 75&nbsp;% context limit and was truncated server-side.</p>{% endif %}
+    <section class="card">
+      <h2>Send</h2>
+      <form method="post" action="{{ path_for('chat_send') }}">
+        <label for="message">Message</label>
+        <textarea id="message" name="message" rows="4" required autofocus></textarea>
+        <div class="inline">
+          <label for="temperature">temperature</label>
+          <input id="temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="{{ temperature }}">
+          <label for="max_tokens">max_tokens</label>
+          <input id="max_tokens" name="max_tokens" type="number" min="1" step="1" {% if max_model_len %}max="{{ max_model_len }}"{% endif %} value="{{ max_tokens }}">
+          <button type="submit">Send</button>
+        </div>
+      </form>
+      <form method="post" action="{{ path_for('chat_reset') }}" class="inline">
+        <button type="submit">Reset conversation</button>
+      </form>
+    </section>
+  </main>
+  <footer>
+    <span>gateway <code>http://localhost:{{ gateway_port }}/v1</code></span>
+    <span aria-hidden="true">·</span>
+    <span>active <code>{{ active_alias or "none" }}</code></span>
+  </footer>
+</body>
+</html>
+{% endif %}

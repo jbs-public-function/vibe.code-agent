@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Download {{ download_id }}{% endblock title %}
+{% block head %}
+  {% if refresh %}<meta http-equiv="refresh" content="2">{% endif %}
+{% endblock head %}
+{% block content %}
+{% if not_found %}
+<h1>Download not found</h1>
+<p>No download with id <code>{{ download_id }}</code> on the controller — it may have been purged from the recent list.</p>
+<p><a href="{{ path_for('developer') }}">Back to developer</a></p>
+{% else %}
+<h1>Download <code>{{ info.id }}</code></h1>
+<dl class="inline-dl">
+  <dt>Repo</dt><dd><code>{{ info.hf_repo }}</code></dd>
+  <dt>Elapsed</dt><dd>{{ elapsed_s|uptime if elapsed_s is not none else "—" }}</dd>
+</dl>
+<div class="bar" role="progressbar" aria-label="download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ progress_pct }}" title="{{ progress_pct }}%"><div class="fill {{ progress_class }}"></div></div>
+<p>{{ bytes_done_label }} / {{ bytes_total_label }} ({{ progress_pct }}%)</p>
+{% if current_file %}<p>current file: <code>{{ current_file }}</code></p>{% endif %}
+{% if info.done and info.ok %}
+<p>Download finished successfully.</p>
+{% elif info.done %}
+<div class="flash" role="alert">download failed{% if info.error %}: {{ info.error }}{% endif %}</div>
+{% endif %}
+{% if refresh %}
+<form method="post" action="{{ path_for('developer_download_cancel', download_id=info.id) }}">
+  <button type="submit" aria-label="Cancel download {{ download_id }}">Cancel</button>
+</form>
+{% endif %}
+<p><a href="{{ path_for('developer') }}">Back to developer</a></p>
+{% endif %}
+{% endblock content %}

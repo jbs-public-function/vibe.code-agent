@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Schema not found{% endblock title %}
+{% block content %}
+<h1>Schema not found</h1>
+<p>No Jev schema with name <code>{{ name }}</code> — it may have been deleted, or the name is invalid.</p>
+<p><a href="{{ path_for('jev') }}">Back to Jev</a></p>
+{% endblock content %}
