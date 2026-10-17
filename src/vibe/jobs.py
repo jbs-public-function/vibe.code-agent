@@ -258,6 +258,10 @@ class JobRunner:
                         try:
                             await probe_jev(spec.host_port, alias, resolved.schema)
                         except JevError as exc:
+                            # JEV-02.15: a backend-rejected schema leaves the
+                            # model in plain mode — detach any previous
+                            # attachment too (acceptance: "Jev unset").
+                            self.jev_state.clear()
                             yield JobEvent(
                                 _now(),
                                 "error",

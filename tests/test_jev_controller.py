@@ -350,6 +350,48 @@ async def test_probe_failure_keeps_model_ready(
     assert runner.jev_state.current() is None
 
 
+async def test_fast_path_probe_failure_detaches_previous(
+    settings: Settings, registry: Registry, fake_docker, monkeypatch: pytest.MonkeyPatch
+):
+    """JEV-02.15: a backend-rejected schema on the fast path leaves the
+    model in plain mode — the previous attachment is detached too."""
+    container = managed_container()
+    fake_docker.managed = [container]
+    fake_docker.info_by_name[container.name] = info_for(container, "qwen2.5-coder-7b")
+    purges = purge_spy(monkeypatch, fake_docker)
+    install_probe(monkeypatch, ok_probe)
+    runner = JobRunner(settings, registry, docker=fake_docker)
+
+    # attach 'default' first (fast path)
+    await drain(
+        runner.load(
+            "qwen2.5-coder-7b",
+            jev_mode="on",
+            jev=JevLoadSpec(schema_name="default"),
+        )
+    )
+    assert runner.jev_state.current() is not None
+
+    # a different schema that the backend rejects must clear the attachment
+    async def failing_probe(host_port, alias, schema):
+        raise JevError("jev_probe_failed", "vLLM rejected the schema (HTTP 400)")
+
+    install_probe(monkeypatch, failing_probe)
+    events = await drain(
+        runner.load(
+            "qwen2.5-coder-7b",
+            jev_mode="on",
+            jev=JevLoadSpec(schema_name="yes-no"),
+        )
+    )
+    assert purges == []  # fast path: the container is never touched
+    assert fake_docker.started == []
+    assert events[-1].state == JobState.READY
+    assert events[-1].level == "error"
+    assert events[-1].error_code == "jev_probe_failed"
+    assert runner.jev_state.current() is None
+
+
 async def test_save_as_persists_only_after_successful_probe(
     settings: Settings, registry: Registry, fake_docker, monkeypatch: pytest.MonkeyPatch
 ):
