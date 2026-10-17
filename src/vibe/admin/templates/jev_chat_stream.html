@@ -1,0 +1,92 @@
+{% if phase == "header" %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jev chat · vibe</title>
+  <link rel="stylesheet" href="{{ path_for('static', path='vibe.css') }}">
+</head>
+<body>
+  <nav class="nav" aria-label="site">
+    <span class="brand">vibe</span>
+    <a href="{{ path_for('dashboard') }}">Dashboard</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('models') }}">Models</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('jev') }}">Jev</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('jev_chat') }}" class="active">Jev chat</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('chat') }}">Chat</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('logs') }}">Logs</a>
+    <span aria-hidden="true">·</span>
+    <a href="{{ path_for('developer') }}">Developer</a>
+  </nav>
+  <main>
+    <h1>Jev chat</h1>
+    <section class="card">
+      <h2>Conversation <span class="dim">{% if schema_name %}schema <code>{{ schema_name }}</code>{% else %}unconstrained{% endif %}</span></h2>
+      {% for message in session.messages %}
+      <div class="turn turn-{{ message.role }}">
+        <div class="role">{{ message.role }}</div>
+        <pre>{{ message.content }}</pre>
+      </div>
+      {% endfor %}
+      <div class="turn turn-assistant">
+        <div class="role">assistant</div>
+        <pre id="stream"><!-- Firefox needs ~1 KiB before the first paint; this comment pads the initial flush (NFR-01.6). {{ "x" * 1024 }} -->{% endif %}
+{% if phase == "footer" %}</pre>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Result</h2>
+      <dl class="inline-dl">
+        <dt>Validity</dt>
+        <dd>
+          {% if verdict_valid == true %}<span class="badge badge-ready">schema-valid</span>
+          {% elif verdict_valid == false %}<span class="badge badge-error">invalid</span>
+          {% elif schema_name %}<span class="badge">not checked</span>
+          {% else %}<span class="badge">no schema — unchecked</span>{% endif %}
+        </dd>
+        <dt>finish_reason</dt><dd><code>{{ finish_reason or "—" }}</code></dd>
+        <dt>Tokens</dt><dd>{% if prompt_tokens or completion_tokens %}prompt {{ prompt_tokens }} · completion {{ completion_tokens }}{% else %}—{% endif %}</dd>
+        <dt>Enforced by</dt><dd>{% if jev_header %}<code>{{ jev_header }}</code>{% else %}— (no X-Vibe-Jev header){% endif %}</dd>
+      </dl>
+      {% if verdict_errors %}
+      <p class="warn">Schema errors: {% for message in verdict_errors %}<code>{{ message }}</code>{% if not loop.last %} · {% endif %}{% endfor %}</p>
+      {% endif %}
+      {% if finish_reason == "length" %}
+      <p class="warn">Output was truncated at max_tokens — the JSON may be incomplete. Raise max_tokens and resend.</p>
+      {% endif %}
+      {% if error %}<div class="flash" role="alert">{{ error }}</div>{% endif %}
+      <pre>{{ reply_pretty }}</pre>
+    </section>
+    {% if omitted %}<p class="warn">{{ omitted }} older turns omitted — the history exceeded the 75&nbsp;% context limit and was truncated server-side.</p>{% endif %}
+    <section class="card">
+      <h2>Send</h2>
+      <form method="post" action="{{ path_for('jev_chat_send') }}">
+        <label for="message">Prompt</label>
+        <textarea id="message" name="message" rows="4" required autofocus></textarea>
+        <div class="inline">
+          <label for="temperature">temperature</label>
+          <input id="temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="{{ temperature }}">
+          <label for="max_tokens">max_tokens</label>
+          <input id="max_tokens" name="max_tokens" type="number" min="1" step="1" {% if max_model_len %}max="{{ max_model_len }}"{% endif %} value="{{ max_tokens }}">
+          <button type="submit">Send</button>
+        </div>
+      </form>
+      <form method="post" action="{{ path_for('jev_chat_reset') }}" class="inline">
+        <button type="submit">Reset conversation</button>
+      </form>
+    </section>
+  </main>
+  <footer>
+    <span>gateway <code>http://localhost:{{ gateway_port }}/v1</code></span>
+    <span aria-hidden="true">·</span>
+    <span>active <code>{{ active_alias or "none" }}</code></span>
+  </footer>
+</body>
+</html>
+{% endif %}

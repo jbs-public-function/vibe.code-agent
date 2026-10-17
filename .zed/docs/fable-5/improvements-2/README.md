@@ -10,7 +10,8 @@ These documents are **plans only** — no code accompanies them. They follow the
 **Status (2026-10-17):** J0–J5 implemented and accepted — unit suites green (`make check`), and the
 Part 2 GPU/Docker runbook in [`06-testing-and-acceptance.md`](06-testing-and-acceptance.md) passed
 A1–A9, B1–B10, C1–C10. The runbook fixed three defects (F1 fast-path detach, F2 deepseek dtype,
-F3 admin name gate); details are recorded in doc 06.
+F3 admin name gate); details are recorded in doc 06. J6 (the Jev chat panel, doc 07) is implemented
+and tested — see [`07-jev-chat-panel.md`](07-jev-chat-panel.md).
 
 ## Assumptions to confirm (read first)
 
@@ -86,6 +87,7 @@ flowchart TD
 | J3 | [`04-cli.md`](04-cli.md) | `vibe load --jev/--include-json/--schema`, `vibe jev …` group, exit codes | J1 (J0 for offline `validate`) |
 | J4 | [`05-admin-ui-schema-page.md`](05-admin-ui-schema-page.md) | `/jev` list/edit/validate/delete/launch pages, quick builder, dashboard badge | J1 (J2 to see effect) |
 | J5 | [`06-testing-and-acceptance.md`](06-testing-and-acceptance.md) | Unit-test plan + GPU runbook (real vLLM returns schema-valid JSON) | all |
+| J6 | [`07-jev-chat-panel.md`](07-jev-chat-panel.md) | `/jev/chat` zero-JS panel: prompt the active model through the gateway, stream the JSON, inspect validity/truncation | J2, J4 |
 
 J2, J3, J4 touch disjoint files and can proceed **in parallel** once J1's proto lands.
 
